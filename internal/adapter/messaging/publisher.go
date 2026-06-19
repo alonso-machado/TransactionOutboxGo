@@ -23,7 +23,7 @@ func (p *AMQPPublisher) Publish(ctx context.Context, msg *domain.OutboxMessage) 
 	if err != nil {
 		return fmt.Errorf("open channel: %w", err)
 	}
-	defer ch.Close()
+	defer func() { _ = ch.Close() }()
 
 	if err := ch.Confirm(false); err != nil {
 		return fmt.Errorf("enable confirms: %w", err)

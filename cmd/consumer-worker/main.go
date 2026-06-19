@@ -33,7 +33,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("rabbitmq: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	ch, err := conn.Channel()
 	if err != nil {
@@ -42,7 +42,9 @@ func main() {
 	if err := rmq.DeclareTopology(ch); err != nil {
 		log.Fatalf("rabbitmq topology: %v", err)
 	}
-	ch.Close()
+	if err := ch.Close(); err != nil {
+		log.Printf("close topology channel: %v", err)
+	}
 
 	uow := persistence.NewUnitOfWork(db)
 	inboxRepo := persistence.NewInboxRepository(db)

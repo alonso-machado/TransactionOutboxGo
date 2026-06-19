@@ -25,7 +25,7 @@ func (c *AMQPConsumer) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer ch.Close()
+	defer func() { _ = ch.Close() }()
 
 	if err := ch.Qos(c.prefetch, 0, false); err != nil {
 		return err

@@ -1,6 +1,8 @@
 module github.com/alonsomachado/transaction-outbox-go
 
-go 1.25
+go 1.26
+
+toolchain go1.26.4
 
 require (
 	github.com/gin-gonic/gin v1.10.0

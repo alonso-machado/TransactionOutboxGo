@@ -1,6 +1,7 @@
 SHELL        := /bin/bash
 COMPOSE_FILE := deployments/docker-compose.yml
-COMPOSE      := docker compose -f $(COMPOSE_FILE)
+COMPOSE      := podman compose -f $(COMPOSE_FILE)
+GO           := podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine
 
 .PHONY: up down logs build test tidy seed lint
 
@@ -18,16 +19,16 @@ logs:
 ## ── Local Go ──────────────────────────────────────────────────────────────────
 
 build:
-	go build ./...
+	$(GO) go build ./...
 
 test:
-	go test -race ./...
+	$(GO) go test -race ./...
 
 tidy:
-	go mod tidy
+	$(GO) go mod tidy
 
 lint:
-	golangci-lint run ./...
+	podman run --rm -v "$(CURDIR):/app" -w /app golangci/golangci-lint:latest golangci-lint run ./...
 
 ## ── Dev helpers ───────────────────────────────────────────────────────────────
 

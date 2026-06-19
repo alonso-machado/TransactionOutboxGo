@@ -94,22 +94,34 @@ Go version: **1.26** (`go 1.26`, toolchain `go1.26.4`)
 
 ## Build / run commands
 
+Go is **not installed on the host machine** — all Go tooling runs inside Podman
+containers via `make` targets. Never run `go` directly on the host.
+
 ```bash
-# Local (requires Go 1.26+)
-go build ./...
-go test -race ./...
-go mod tidy
+# Build, test, lint — all run inside golang:1.26-alpine via Podman
+make build    # go build ./...
+make test     # go test -race ./...
+make tidy     # go mod tidy
+make lint     # golangci-lint run ./...  (golangci/golangci-lint:latest image)
 
-# Docker Compose — starts Postgres + RabbitMQ + both services
-make up       # docker compose up --build -d
+# Podman Compose — starts Postgres + RabbitMQ + both services
+make up       # podman compose up --build -d
 make logs     # tail logs from all services
-make down     # docker compose down -v (removes volumes)
+make down     # podman compose down -v (removes volumes)
 make seed     # curl a sample POST to the ingestion-api
-
-# Build a specific service binary
-go build -o bin/ingestion-api  ./cmd/ingestion-api
-go build -o bin/consumer-worker ./cmd/consumer-worker
 ```
+
+## Linting rules
+
+**Always run `make lint` after any code change.** The linter (`golangci-lint`
+running inside Podman) must report zero issues before a change is considered
+done. Key rules enforced:
+
+- **`errcheck`** — every error return must be checked. For `Close()` calls
+  inside `defer` where the error is unactionable, use `defer func() { _ = x.Close() }()`.
+  For `Close()` calls in `main` before the server starts, log the error.
+- All default golangci-lint linters apply — do not add `.golangci.yml` overrides
+  to silence findings; fix the code instead.
 
 ---
 
