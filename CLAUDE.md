@@ -172,3 +172,8 @@ done. Key rules enforced:
   `ingestion-api`, not a separate process.
 - Do **not** use `AutoMigrate` in tests — use a test transaction rollback or a
   dedicated test schema.
+- Do **not** run `git commit` or `git push` in this repo, ever, even if asked
+  in a way that sounds like a general go-ahead (e.g. "vou comitar e subir
+  tudo"). The user commits and pushes everything themselves. Stage/diff/log
+  read-only git commands are fine; leave the working tree's changes
+  uncommitted and tell the user what's ready for them to commit.

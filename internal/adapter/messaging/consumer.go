@@ -3,7 +3,9 @@ package messaging
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"time"
 
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain/pii"
 	rmq "github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/rabbitmq"
@@ -14,6 +16,11 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// retryCountHeader tracks delivery attempts ourselves rather than relying on
+// the broker's redelivery bookkeeping — see DeclareTopology's doc comment
+// for why.
+const retryCountHeader = "x-retry-count"
 
 type AMQPConsumer struct {
 	conn          *amqp.Connection
@@ -57,32 +64,93 @@ func (c *AMQPConsumer) Run(ctx context.Context) error {
 
 func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 	ctx = otel.GetTextMapPropagator().Extract(ctx, amqpHeaderCarrier(d.Headers))
+	retryCount := retryCountFromHeaders(d.Headers)
 	ctx, span := tracer.Start(ctx, "rabbitmq.consume", trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(
 			attribute.String("message_id", d.MessageId),
 			attribute.Bool("redelivered", d.Redelivered),
+			attribute.Int("retry_count", retryCount),
 		),
 	)
 	defer span.End()
 
-	xDeath, _ := d.Headers["x-death"].([]interface{})
-	if len(xDeath) > 0 {
-		if table, ok := xDeath[0].(amqp.Table); ok {
-			if count, ok := table["count"].(int64); ok && int(count) >= c.maxDeliveries {
-				log.Printf("poison message %s after %d deliveries — rejecting to DLQ", d.MessageId, count)
-				span.SetAttributes(attribute.String("outcome", "poison_dlq"))
-				_ = d.Reject(false)
-				return
-			}
-		}
-	}
-
 	if err := c.processMsg.Execute(ctx, d.MessageId, d.Body); err != nil {
-		log.Printf("process message %s error: %s — requeuing", d.MessageId, pii.Redact(err.Error()))
+		log.Printf("process message %s error: %s — attempt %d", d.MessageId, pii.Redact(err.Error()), retryCount+1)
 		span.RecordError(errors.New(pii.Redact(err.Error())))
 		span.SetStatus(codes.Error, pii.Redact(err.Error()))
-		_ = d.Nack(false, true)
+
+		if retryCount+1 >= c.maxDeliveries {
+			log.Printf("poison message %s after %d attempts — rejecting to DLQ", d.MessageId, retryCount+1)
+			span.SetAttributes(attribute.String("outcome", "poison_dlq"))
+			_ = d.Reject(false)
+			return
+		}
+
+		if reErr := c.requeueWithRetryCount(d, retryCount+1); reErr != nil {
+			log.Printf("requeue message %s error: %v — falling back to broker requeue", d.MessageId, reErr)
+			_ = d.Nack(false, true)
+			return
+		}
+		_ = d.Ack(false)
 		return
 	}
 	_ = d.Ack(false)
+}
+
+func retryCountFromHeaders(h amqp.Table) int {
+	switch v := h[retryCountHeader].(type) {
+	case int32:
+		return int(v)
+	case int64:
+		return int(v)
+	case int:
+		return int(v)
+	default:
+		return 0
+	}
+}
+
+// requeueWithRetryCount republishes the delivery to the same queue with its
+// retry count incremented, then the caller Acks the original delivery — a
+// plain Nack(requeue=true) can't carry an updated header, so the retry has
+// to be a fresh publish.
+func (c *AMQPConsumer) requeueWithRetryCount(d amqp.Delivery, retryCount int) error {
+	ch, err := c.conn.Channel()
+	if err != nil {
+		return fmt.Errorf("open channel: %w", err)
+	}
+	defer func() { _ = ch.Close() }()
+
+	if err := ch.Confirm(false); err != nil {
+		return fmt.Errorf("enable confirms: %w", err)
+	}
+	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+
+	headers := amqp.Table{}
+	for k, v := range d.Headers {
+		headers[k] = v
+	}
+	headers[retryCountHeader] = int32(retryCount)
+
+	err = ch.PublishWithContext(context.Background(), rmq.Exchange, rmq.RoutingKey, false, false, amqp.Publishing{
+		ContentType:  d.ContentType,
+		DeliveryMode: amqp.Persistent,
+		MessageId:    d.MessageId,
+		Timestamp:    time.Now().UTC(),
+		Body:         d.Body,
+		Headers:      headers,
+	})
+	if err != nil {
+		return fmt.Errorf("publish retry: %w", err)
+	}
+
+	select {
+	case confirm := <-confirms:
+		if !confirm.Ack {
+			return fmt.Errorf("broker nacked retry publish for %s", d.MessageId)
+		}
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("retry publish confirm timeout for %s", d.MessageId)
+	}
+	return nil
 }

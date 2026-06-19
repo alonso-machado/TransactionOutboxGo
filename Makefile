@@ -3,7 +3,7 @@ COMPOSE_FILE := deployments/docker-compose.yml
 COMPOSE      := podman compose -f $(COMPOSE_FILE)
 GO           := podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine
 
-.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer lint swag
+.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer lint swag test-unit test-integration coverage
 
 ## ── Docker Compose ────────────────────────────────────────────────────────────
 
@@ -23,6 +23,34 @@ build:
 
 test:
 	$(GO) go test -race ./...
+
+test-unit:
+	$(GO) go test -race -coverprofile=coverage.out ./internal/...
+
+# testcontainers-go needs to launch sibling Postgres/RabbitMQ containers from
+# inside this golang:1.26-alpine container — mount the Podman machine's own
+# socket (Docker-API-compatible) so testcontainers can talk to it, disable
+# Ryuk (its reaper sidecar doesn't get along with Podman), and run with
+# --network host so this container can reach the sibling containers'
+# 127.0.0.1:<mapped-port> addresses (they're mapped on the Podman VM's host
+# network, not on this container's own isolated network namespace).
+# -race needs cgo, which golang:1.26-alpine lacks a C toolchain for by
+# default — install one before running.
+test-integration:
+	podman run --rm \
+		--network host \
+		-v "$(CURDIR):/app" -w /app \
+		-v /run/podman/podman.sock:/var/run/docker.sock \
+		-e DOCKER_HOST=unix:///var/run/docker.sock \
+		-e TESTCONTAINERS_RYUK_DISABLED=true \
+		golang:1.26-alpine sh -c "apk add --no-cache gcc musl-dev >/dev/null && \
+			go test -tags=integration -race -timeout=300s \
+				-coverprofile=coverage.out \
+				-coverpkg=./internal/... \
+				./tests/integration/..."
+
+coverage:
+	$(GO) sh -c "go tool cover -html=coverage.out -o coverage.html && go tool cover -func=coverage.out | grep total"
 
 tidy:
 	$(GO) go mod tidy

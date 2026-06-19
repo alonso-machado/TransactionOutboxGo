@@ -40,3 +40,6 @@ dist/
 
 # Go coverage
 coverage.out
+
+# Claude Code agent worktrees (transient, per-session)
+.claude/worktrees/
