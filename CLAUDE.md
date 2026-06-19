@@ -13,7 +13,8 @@ A Go monorepo implementing the **Transactional Outbox + Inbox** pattern:
 - **`consumer-worker`** — consumes from RabbitMQ, dedupes via an inbox table,
   persists the business entity exactly once.
 
-Full design: [`.claude/plan.md`](.claude/plan.md)
+Full design (Phase 1 — core system): [`.claude/plan.md`](.claude/plan.md)
+Phase 2 plan (OTel · Swagger · TestContainers · K8s+KEDA): [`.claude/plan-phase2.md`](.claude/plan-phase2.md)
 User-facing docs: [`README.md`](README.md)
 
 ---
