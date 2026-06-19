@@ -12,6 +12,10 @@ type Config struct {
 	PruneAfterHours   int    `envconfig:"PRUNE_AFTER_HOURS" default:"24"`
 	PrefetchCount     int    `envconfig:"PREFETCH_COUNT" default:"10"`
 	MaxDeliveries     int    `envconfig:"MAX_DELIVERIES" default:"5"`
+	OtelServiceName   string `envconfig:"OTEL_SERVICE_NAME" default:"transaction-outbox-go"`
+	OtelEndpoint      string `envconfig:"OTEL_EXPORTER_OTLP_ENDPOINT" default:"localhost:4318"`
+	MetricsPort       string `envconfig:"METRICS_PORT" default:"9090"`
+	SwaggerEnabled    bool   `envconfig:"SWAGGER_ENABLED" default:"false"`
 }
 
 func Load() (*Config, error) {

@@ -1,3 +1,10 @@
+// Package main is the composition root for ingestion-api.
+//
+//	@title			Transaction Outbox — Ingestion API
+//	@version		1.0
+//	@description	Accepts payment-provider webhook-shaped events and durably stores them in the
+//	@description	transactional outbox for asynchronous relay to RabbitMQ.
+//	@BasePath		/
 package main
 
 import (
@@ -15,6 +22,7 @@ import (
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/config"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/database"
 	rmq "github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/rabbitmq"
+	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/telemetry"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ingest"
 	outboxuc "github.com/alonsomachado/transaction-outbox-go/internal/usecase/outbox"
 )
@@ -24,6 +32,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+
+	telemetryShutdown, err := telemetry.Setup(context.Background(), cfg.OtelServiceName, cfg.OtelEndpoint, cfg.MetricsPort)
+	if err != nil {
+		log.Fatalf("telemetry: %v", err)
+	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := telemetryShutdown(shutdownCtx); err != nil {
+			log.Printf("telemetry shutdown: %v", err)
+		}
+	}()
 
 	db, err := database.Connect(cfg.DatabaseURL)
 	if err != nil {
@@ -65,7 +85,7 @@ func main() {
 	)
 
 	paymentHandler := handler.NewPaymentHandler(ingestUC)
-	router := handler.NewRouter(paymentHandler)
+	router := handler.NewRouter(paymentHandler, cfg.OtelServiceName, cfg.SwaggerEnabled)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

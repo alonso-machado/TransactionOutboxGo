@@ -8,7 +8,32 @@ import (
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	rmq "github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/rabbitmq"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var tracer = otel.Tracer("rabbitmq")
+
+type amqpHeaderCarrier amqp.Table
+
+func (c amqpHeaderCarrier) Get(key string) string {
+	v, _ := c[key].(string)
+	return v
+}
+
+func (c amqpHeaderCarrier) Set(key, value string) {
+	c[key] = value
+}
+
+func (c amqpHeaderCarrier) Keys() []string {
+	keys := make([]string, 0, len(c))
+	for k := range c {
+		keys = append(keys, k)
+	}
+	return keys
+}
 
 type AMQPPublisher struct {
 	conn *amqp.Connection
@@ -19,13 +44,20 @@ func NewPublisher(conn *amqp.Connection) *AMQPPublisher {
 }
 
 func (p *AMQPPublisher) Publish(ctx context.Context, msg *domain.OutboxMessage) error {
+	ctx, span := tracer.Start(ctx, "rabbitmq.publish", trace.WithSpanKind(trace.SpanKindProducer))
+	defer span.End()
+
 	ch, err := p.conn.Channel()
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("open channel: %w", err)
 	}
 	defer func() { _ = ch.Close() }()
 
 	if err := ch.Confirm(false); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("enable confirms: %w", err)
 	}
 
@@ -35,6 +67,9 @@ func (p *AMQPPublisher) Publish(ctx context.Context, msg *domain.OutboxMessage) 
 	for k, v := range msg.Headers {
 		headers[k] = v
 	}
+	otel.GetTextMapPropagator().Inject(ctx, amqpHeaderCarrier(headers))
+
+	span.SetAttributes(attribute.String("message_id", msg.IdempotencyKey))
 
 	err = ch.PublishWithContext(ctx, rmq.Exchange, rmq.RoutingKey, false, false, amqp.Publishing{
 		ContentType:  "application/json",
@@ -45,17 +80,28 @@ func (p *AMQPPublisher) Publish(ctx context.Context, msg *domain.OutboxMessage) 
 		Headers:      headers,
 	})
 	if err != nil {
-		return fmt.Errorf("publish: %w", err)
+		err = fmt.Errorf("publish: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	select {
 	case confirm := <-confirms:
 		if !confirm.Ack {
-			return fmt.Errorf("broker nacked message %s", msg.IdempotencyKey)
+			err := fmt.Errorf("broker nacked message %s", msg.IdempotencyKey)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return err
 		}
 	case <-time.After(5 * time.Second):
-		return fmt.Errorf("confirm timeout for message %s", msg.IdempotencyKey)
+		err := fmt.Errorf("confirm timeout for message %s", msg.IdempotencyKey)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	case <-ctx.Done():
+		span.RecordError(ctx.Err())
+		span.SetStatus(codes.Error, ctx.Err().Error())
 		return ctx.Err()
 	}
 	return nil

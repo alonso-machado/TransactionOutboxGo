@@ -3,7 +3,7 @@ COMPOSE_FILE := deployments/docker-compose.yml
 COMPOSE      := podman compose -f $(COMPOSE_FILE)
 GO           := podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine
 
-.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer lint
+.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer lint swag
 
 ## ── Docker Compose ────────────────────────────────────────────────────────────
 
@@ -29,6 +29,10 @@ tidy:
 
 lint:
 	podman run --rm -v "$(CURDIR):/app" -w /app golangci/golangci-lint:latest golangci-lint run ./...
+
+# Regenerate docs/swagger.json, docs/swagger.yaml, docs/docs.go from swaggo annotations.
+swag:
+	$(GO) sh -c "go run github.com/swaggo/swag/cmd/swag init -g cmd/ingestion-api/main.go -o docs --parseDependency"
 
 ## ── Dev helpers ───────────────────────────────────────────────────────────────
 

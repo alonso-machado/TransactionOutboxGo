@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/alonsomachado/transaction-outbox-go/internal/domain/pii"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ingest"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -20,6 +21,24 @@ func NewPaymentHandler(ingest *ingest.IngestPayment) *PaymentHandler {
 	return &PaymentHandler{ingest: ingest}
 }
 
+// Handle ingests a payment event.
+//
+//	@Summary		Ingest a payment event
+//	@Description	Accepts a payment-provider webhook-shaped event (PIX, BOLETO, TRANSFER, or any other method)
+//	@Description	and durably stores it in the outbox for asynchronous relay to RabbitMQ. Idempotent on the
+//	@Description	derived idempotency key (provider.name + eventId + optional Idempotency-Key header).
+//	@Tags			payments
+//	@Accept			json
+//	@Produce		json
+//	@Param			Idempotency-Key	header		string				false	"Optional client-supplied idempotency key"
+//	@Param			id				path		string				false	"Payment ID (PUT/PATCH only)"
+//	@Param			payment			body		PaymentRequest		true	"Payment event payload"
+//	@Success		201				{object}	PaymentResponse
+//	@Failure		400				{object}	ErrorResponse
+//	@Failure		500				{object}	ErrorResponse
+//	@Router			/api/v1/payments [post]
+//	@Router			/api/v1/payments/{id} [put]
+//	@Router			/api/v1/payments/{id} [patch]
 func (h *PaymentHandler) Handle(c *gin.Context) {
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil || len(body) == 0 {
@@ -29,11 +48,11 @@ func (h *PaymentHandler) Handle(c *gin.Context) {
 
 	var dto PaymentEventRequestDTO
 	if err := json.Unmarshal(body, &dto); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": pii.Redact(err.Error())})
 		return
 	}
 	if err := dto.Validate(); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": pii.Redact(err.Error())})
 		return
 	}
 
@@ -44,7 +63,7 @@ func (h *PaymentHandler) Handle(c *gin.Context) {
 	_ = json.Unmarshal(body, &raw)
 
 	if err := dto.ValidateMethod(raw); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": pii.Redact(err.Error())})
 		return
 	}
 
@@ -84,7 +103,7 @@ func (h *PaymentHandler) Handle(c *gin.Context) {
 		IdempotencyKey:    c.GetHeader("Idempotency-Key"),
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": pii.Redact(err.Error())})
 		return
 	}
 

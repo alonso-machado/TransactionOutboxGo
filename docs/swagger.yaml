@@ -1,0 +1,196 @@
+basePath: /
+definitions:
+  internal_adapter_http.ErrorResponse:
+    properties:
+      detail:
+        type: string
+      error:
+        type: string
+    type: object
+  internal_adapter_http.PaymentDataDTO:
+    properties:
+      amount:
+        type: number
+      currency:
+        type: string
+      method:
+        type: string
+      payerId:
+        type: string
+      paymentId:
+        type: string
+      recipientId:
+        type: string
+    type: object
+  internal_adapter_http.PaymentRequest:
+    description: 'Inbound payment event. Mirrors a payment-provider webhook: a generic
+      envelope (eventId, provider, payment, occurredAt) plus a method-specific sibling
+      object (e.g. "pix" or "boleto") named after payment.method lowercased.'
+    properties:
+      eventId:
+        type: string
+      occurredAt:
+        type: string
+      payment:
+        $ref: '#/definitions/internal_adapter_http.PaymentDataDTO'
+      provider:
+        $ref: '#/definitions/internal_adapter_http.ProviderDTO'
+    type: object
+  internal_adapter_http.PaymentResponse:
+    properties:
+      idempotencyKey:
+        type: string
+      paymentId:
+        type: string
+      status:
+        description: '"accepted" | "duplicate"'
+        type: string
+    type: object
+  internal_adapter_http.ProviderDTO:
+    properties:
+      name:
+        type: string
+      providerPaymentId:
+        type: string
+    type: object
+info:
+  contact: {}
+  description: |-
+    Accepts payment-provider webhook-shaped events and durably stores them in the
+    transactional outbox for asynchronous relay to RabbitMQ.
+  title: Transaction Outbox — Ingestion API
+  version: "1.0"
+paths:
+  /api/v1/payments:
+    post:
+      consumes:
+      - application/json
+      description: |-
+        Accepts a payment-provider webhook-shaped event (PIX, BOLETO, TRANSFER, or any other method)
+        and durably stores it in the outbox for asynchronous relay to RabbitMQ. Idempotent on the
+        derived idempotency key (provider.name + eventId + optional Idempotency-Key header).
+      parameters:
+      - description: Optional client-supplied idempotency key
+        in: header
+        name: Idempotency-Key
+        type: string
+      - description: Payment event payload
+        in: body
+        name: payment
+        required: true
+        schema:
+          $ref: '#/definitions/internal_adapter_http.PaymentRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/internal_adapter_http.PaymentResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_adapter_http.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/internal_adapter_http.ErrorResponse'
+      summary: Ingest a payment event
+      tags:
+      - payments
+  /api/v1/payments/{id}:
+    patch:
+      consumes:
+      - application/json
+      description: |-
+        Accepts a payment-provider webhook-shaped event (PIX, BOLETO, TRANSFER, or any other method)
+        and durably stores it in the outbox for asynchronous relay to RabbitMQ. Idempotent on the
+        derived idempotency key (provider.name + eventId + optional Idempotency-Key header).
+      parameters:
+      - description: Optional client-supplied idempotency key
+        in: header
+        name: Idempotency-Key
+        type: string
+      - description: Payment ID (PUT/PATCH only)
+        in: path
+        name: id
+        type: string
+      - description: Payment event payload
+        in: body
+        name: payment
+        required: true
+        schema:
+          $ref: '#/definitions/internal_adapter_http.PaymentRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/internal_adapter_http.PaymentResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_adapter_http.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/internal_adapter_http.ErrorResponse'
+      summary: Ingest a payment event
+      tags:
+      - payments
+    put:
+      consumes:
+      - application/json
+      description: |-
+        Accepts a payment-provider webhook-shaped event (PIX, BOLETO, TRANSFER, or any other method)
+        and durably stores it in the outbox for asynchronous relay to RabbitMQ. Idempotent on the
+        derived idempotency key (provider.name + eventId + optional Idempotency-Key header).
+      parameters:
+      - description: Optional client-supplied idempotency key
+        in: header
+        name: Idempotency-Key
+        type: string
+      - description: Payment ID (PUT/PATCH only)
+        in: path
+        name: id
+        type: string
+      - description: Payment event payload
+        in: body
+        name: payment
+        required: true
+        schema:
+          $ref: '#/definitions/internal_adapter_http.PaymentRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/internal_adapter_http.PaymentResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_adapter_http.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/internal_adapter_http.ErrorResponse'
+      summary: Ingest a payment event
+      tags:
+      - payments
+  /healthz:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Health check
+      tags:
+      - health
+swagger: "2.0"

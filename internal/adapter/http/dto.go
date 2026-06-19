@@ -149,3 +149,25 @@ type PaymentResponseDTO struct {
 	IdempotencyKey string `json:"idempotencyKey"`
 	Status         string `json:"status"` // "accepted" | "duplicate"
 }
+
+// ErrorResponseDTO is the standard error body returned on 4xx/5xx responses.
+type ErrorResponseDTO struct {
+	Error  string `json:"error"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// PaymentRequest is the swagger-facing alias for the inbound payment event
+// body documented by PaymentEventRequestDTO (eventId, provider, payment,
+// occurredAt, plus a method-specific sibling object such as "pix" or
+// "boleto" — see PixDetailsDTO / BoletoDetailsDTO).
+//
+//	@Description	Inbound payment event. Mirrors a payment-provider webhook: a generic envelope
+//	@Description	(eventId, provider, payment, occurredAt) plus a method-specific sibling object
+//	@Description	(e.g. "pix" or "boleto") named after payment.method lowercased.
+type PaymentRequest = PaymentEventRequestDTO
+
+// PaymentResponse is the swagger-facing alias for PaymentResponseDTO.
+type PaymentResponse = PaymentResponseDTO
+
+// ErrorResponse is the swagger-facing alias for ErrorResponseDTO.
+type ErrorResponse = ErrorResponseDTO

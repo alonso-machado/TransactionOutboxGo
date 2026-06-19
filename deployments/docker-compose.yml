@@ -38,6 +38,14 @@ services:
     networks:
       - outbox
 
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"   # UI
+      - "4318:4318"     # OTLP HTTP receiver
+    networks:
+      - outbox
+
   # ── Application services ────────────────────────────────────────────────────
 
   ingestion-api:
@@ -54,13 +62,19 @@ services:
       DISPATCH_BATCH_SIZE: "${OUTBOX_BATCH_SIZE:-50}"
       MAX_RETRIES: "${OUTBOX_MAX_RETRIES:-5}"
       PRUNE_AFTER_HOURS: "${OUTBOX_PRUNE_AFTER_HOURS:-24}"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-ingestion-api}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-jaeger:4318}"
+      METRICS_PORT: "${METRICS_PORT:-9090}"
     ports:
       - "${APP_PORT:-8080}:8080"
+      - "${METRICS_PORT:-9090}:9090"
     depends_on:
       postgres:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     networks:
       - outbox
     restart: unless-stopped
@@ -76,11 +90,18 @@ services:
       RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
       PREFETCH_COUNT: "${CONSUMER_PREFETCH:-10}"
       MAX_DELIVERIES: "${RABBITMQ_MAX_REDELIVERIES:-5}"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-consumer-worker}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-jaeger:4318}"
+      METRICS_PORT: "${CONSUMER_METRICS_PORT:-9091}"
+    ports:
+      - "${CONSUMER_METRICS_PORT:-9091}:9091"
     depends_on:
       postgres:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     networks:
       - outbox
     restart: unless-stopped

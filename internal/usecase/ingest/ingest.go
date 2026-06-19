@@ -10,7 +10,13 @@ import (
 
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var tracer = otel.Tracer("usecase/ingest")
 
 type IngestPayment struct {
 	outboxRepo domain.OutboxRepository
@@ -64,9 +70,17 @@ type outboxPayload struct {
 }
 
 func (uc *IngestPayment) Execute(ctx context.Context, req Request) (*Response, error) {
+	ctx, span := tracer.Start(ctx, "ingest.payment", trace.WithAttributes(
+		attribute.String("http_method", req.HTTPMethod),
+	))
+	defer span.End()
+
 	paymentID, err := uuid.NewV7()
 	if err != nil {
-		return nil, fmt.Errorf("generate payment id: %w", err)
+		err = fmt.Errorf("generate payment id: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
 	}
 
 	payload, err := json.Marshal(outboxPayload{
@@ -84,7 +98,10 @@ func (uc *IngestPayment) Execute(ctx context.Context, req Request) (*Response, e
 		OccurredAt:        req.OccurredAt,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("marshal payload: %w", err)
+		err = fmt.Errorf("marshal payload: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
 	}
 
 	// The idempotency key is derived from the provider's own event identity
@@ -93,6 +110,7 @@ func (uc *IngestPayment) Execute(ctx context.Context, req Request) (*Response, e
 	// boundary for provider-sourced events.
 	keySource := req.ProviderName + ":" + req.EventID
 	key := computeKey(req.HTTPMethod, []byte(keySource), req.IdempotencyKey)
+	span.SetAttributes(attribute.String("idempotency_key", key))
 
 	msg := &domain.OutboxMessage{
 		ID:             paymentID,
@@ -112,8 +130,12 @@ func (uc *IngestPayment) Execute(ctx context.Context, req Request) (*Response, e
 		created, err = uc.outboxRepo.Enqueue(ctx, uc.uow, msg)
 		return err
 	}); err != nil {
-		return nil, fmt.Errorf("enqueue outbox: %w", err)
+		err = fmt.Errorf("enqueue outbox: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
 	}
+	span.SetAttributes(attribute.Bool("dedup_hit", !created))
 
 	return &Response{PaymentID: paymentID, IdempotencyKey: key, Created: created}, nil
 }
