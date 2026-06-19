@@ -61,7 +61,7 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 		}
 	}
 
-	if err := c.processMsg.Execute(ctx, d.MessageId, d.Body, d.Headers); err != nil {
+	if err := c.processMsg.Execute(ctx, d.MessageId, d.Body); err != nil {
 		log.Printf("process message %s error: %v — requeuing", d.MessageId, err)
 		_ = d.Nack(false, true)
 		return

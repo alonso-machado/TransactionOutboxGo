@@ -3,7 +3,7 @@ COMPOSE_FILE := deployments/docker-compose.yml
 COMPOSE      := podman compose -f $(COMPOSE_FILE)
 GO           := podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine
 
-.PHONY: up down logs build test tidy seed lint
+.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer lint
 
 ## ── Docker Compose ────────────────────────────────────────────────────────────
 
@@ -32,12 +32,27 @@ lint:
 
 ## ── Dev helpers ───────────────────────────────────────────────────────────────
 
-# Send a sample POST to the ingestion-api (requires the stack to be running)
-seed:
-	curl -i -X POST http://localhost:8080/api/v1/records \
+# Send sample POSTs to the ingestion-api (requires the stack to be running).
+# `seed` defaults to the PIX sample; seed-boleto/seed-transfer cover the other methods.
+seed: seed-pix
+
+seed-pix:
+	curl -i -X POST http://localhost:8080/api/v1/payments \
 		-H "Content-Type: application/json" \
-		-H "Idempotency-Key: seed-$(shell date +%s)" \
-		-d '{"type":"order.created","amount":4200}'
+		-H "Idempotency-Key: seed-pix-$(shell date +%s)" \
+		-d '{"eventId":"evt_seed_pix_1","provider":{"name":"MERCADO_PAGO","providerPaymentId":"987654321"},"payment":{"paymentId":"pay_123","amount":100.50,"currency":"BRL","method":"PIX"},"pix":{"endToEndId":"E123456789ABCDEF","txid":"ORDER123"},"occurredAt":"2026-06-19T18:30:00Z"}'
+
+seed-boleto:
+	curl -i -X POST http://localhost:8080/api/v1/payments \
+		-H "Content-Type: application/json" \
+		-H "Idempotency-Key: seed-boleto-$(shell date +%s)" \
+		-d '{"eventId":"evt_seed_boleto_1","provider":{"name":"BOLETO_BANCARIO","providerPaymentId":"555000111"},"payment":{"paymentId":"pay_456","amount":250.00,"currency":"BRL","method":"BOLETO"},"boleto":{"barcode":"34191790010104351004791020150008291070026000","dueDate":"2026-07-01","payerDocument":"12345678900"},"occurredAt":"2026-06-19T18:30:00Z"}'
+
+seed-transfer:
+	curl -i -X POST http://localhost:8080/api/v1/payments \
+		-H "Content-Type: application/json" \
+		-H "Idempotency-Key: seed-transfer-$(shell date +%s)" \
+		-d '{"eventId":"evt_seed_transfer_1","provider":{"name":"INTERNAL","providerPaymentId":"internal-1"},"payment":{"paymentId":"pay_789","amount":75.00,"currency":"USD","method":"TRANSFER","payerId":"018f7f9e-6e8b-7c3a-8f2a-000000000001","recipientId":"018f7f9e-6e8b-7c3a-8f2a-000000000002"},"occurredAt":"2026-06-19T18:30:00Z"}'
 
 # Tail a single service: make service=ingestion-api tail
 tail:

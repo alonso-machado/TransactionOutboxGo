@@ -47,12 +47,12 @@ structured logs and counter/gauge metrics.
 | Component | What to instrument |
 |---|---|
 | `adapter/http` | `otelgin` middleware — auto-spans every HTTP request with method, path, status |
-| `usecase/ingest` | Span: `ingest.record` — attributes: `idempotency_key`, `http_method`, dedup hit/miss |
-| `usecase/outbox` (`DispatchOutbox`) | Span per poll cycle: `outbox.dispatch` — attributes: `batch_size`, `published_count`, `failed_count`; counter metric `outbox.published_total`, gauge `outbox.pending_count` |
+| `usecase/ingest` | Span: `ingest.payment` — attributes: `idempotency_key`, `http_method`, dedup hit/miss |
+| `usecase/outbox` (`DispatchOutbox`) | Span per poll cycle: `outbox.dispatch` — attributes: `batch_size`, `published_count`, `retrying_count`, `dead_letter_count`; counter metric `outbox.published_total`, gauge `outbox.pending_count` |
 | `adapter/persistence` (GORM) | `otelgorm` plugin — auto-spans every DB query |
 | `adapter/messaging` (publisher) | Span: `rabbitmq.publish` — inject TraceContext into message headers |
 | `adapter/messaging` (consumer) | Span: `rabbitmq.consume` — extract TraceContext from message headers; attributes: `message_id`, `redelivered`, dedup hit/miss |
-| `usecase/consume` (`ProcessMessage`) | Child span: `process.message` — attributes: `record_id`, outcome |
+| `usecase/consume` (`ProcessMessage`) | Child span: `process.message` — attributes: `payment_id`, outcome |
 
 ### New dependencies
 ```
@@ -118,14 +118,15 @@ generated from Go annotations on the Gin handlers. No manual YAML maintenance.
 
 | Handler | Annotations |
 |---|---|
-| `POST /api/v1/records` | Request body schema, `202` response with `{message_id}`, `409` for idempotent duplicate (same key, already processed), `400` for invalid body |
-| `PUT /api/v1/records` | Same as POST |
-| `PATCH /api/v1/records` | Same as POST |
+| `POST /api/v1/payments` | Request body schema, `201` response with `{paymentId, idempotencyKey, status}`, `400` for invalid body |
+| `PUT /api/v1/payments` | Same as POST |
+| `PATCH /api/v1/payments` | Same as POST |
 | `GET /healthz` | `200 {"status":"ok"}` |
 
 **Shared schemas to define:**
-- `RecordRequest` — `type` (string), `payload` (object, free-form JSON)
-- `IngestResponse` — `message_id` (string, UUID), `idempotency_key` (string),
+- `PaymentRequest` — `payerId` (UUID), `recipientId` (UUID), `amount` (int64,
+  minor units), `currency` (string, ISO 4217, optional — defaults to `USD`)
+- `PaymentResponse` — `paymentId` (string, UUID), `idempotencyKey` (string),
   `status` (string: `"accepted"` | `"duplicate"`)
 - `ErrorResponse` — `error` (string), `detail` (string)
 
@@ -153,8 +154,8 @@ swag:
 ### Verification
 1. `make swag && make up`.
 2. Open `http://localhost:8080/swagger/index.html`.
-3. Execute `POST /api/v1/records` from the UI → verify `202` with `message_id`.
-4. Execute the same request again → verify dedup response.
+3. Execute `POST /api/v1/payments` from the UI → verify `201` with `paymentId`.
+4. Execute the same request again → verify `status: "duplicate"` in the response.
 
 ---
 
@@ -175,24 +176,24 @@ cannot be containerised (e.g. time, UUID generation).
 - **Container lifecycle:** one shared Postgres + RabbitMQ per test suite (not per
   test), started via `TestMain`. Truncate tables between tests for isolation —
   do not restart containers.
-- **No repository mocks:** repositories, the outbox, the inbox, and the publisher
-  are all tested against real containers. Only pure-logic helpers (hash computation,
-  key derivation) use unit tests.
+- **No repository mocks:** the outbox repository, the payments repository, and
+  the publisher are all tested against real containers. Only pure-logic
+  helpers (hash computation, key derivation) use unit tests.
 
 ### Main paths to cover (>75% target)
 
 | # | Path | What to assert |
 |---|---|---|
-| 1 | **Happy path E2E** | `POST /api/v1/records` → outbox row created (pending) → `DispatchOutbox` publishes → consumer inserts `record` + `inbox` row → status `published` |
-| 2 | **Idempotent duplicate at ingest** | Same body + no `Idempotency-Key` sent twice → second request returns same `message_id`, only one outbox row |
+| 1 | **Happy path E2E** | `POST /api/v1/payments` → outbox row created (`NEW`) → `DispatchOutbox` publishes → consumer inserts `payments` row → outbox status `PUBLISHED` |
+| 2 | **Idempotent duplicate at ingest** | Same business fields + no `Idempotency-Key` sent twice → second request returns `status: "duplicate"`, only one outbox row |
 | 3 | **Idempotency-Key header dedup** | Two different bodies with same `Idempotency-Key` → second insert is no-op, same row |
 | 4 | **Distinct keys no dedup** | Same body with different `Idempotency-Key` values → two separate outbox rows |
-| 5 | **DispatchOutbox: publish confirm** | Mock RabbitMQ broker drop (stop container) → outbox stays `pending`; restart → eventually `published` |
-| 6 | **DispatchOutbox: max retries → failed** | Simulate N consecutive publish errors → row transitions to `failed` after `OUTBOX_MAX_RETRIES` |
-| 7 | **Consumer inbox dedup** | Deliver same message twice (requeue) → only one `record` row, one `inbox` row |
-| 8 | **Consumer poison message → DLQ** | Deliver a malformed/unprocessable message `RABBITMQ_MAX_REDELIVERIES` times → message lands in `outbox.dlq`, consumer ACKs and continues |
-| 9 | **Outbox pruning** | Insert `published` rows older than `OUTBOX_PRUNE_AFTER_HOURS` → prune ticker removes them; recent rows stay |
-| 10 | **Concurrent ingestion** | 50 concurrent POSTs with unique bodies → 50 outbox rows, all eventually published and persisted exactly once |
+| 5 | **DispatchOutbox: publish confirm** | Mock RabbitMQ broker drop (stop container) → outbox stays `NEW`; restart → eventually `PUBLISHED` |
+| 6 | **DispatchOutbox: max retries → dead letter** | Simulate N consecutive publish errors → row transitions `NEW → RETRYING → DEAD_LETTER` after `MAX_RETRIES` |
+| 7 | **Consumer dedup via UNIQUE constraint** | Deliver same message twice (requeue) → only one `payments` row (`ON CONFLICT (source_message_id) DO NOTHING`) |
+| 8 | **Consumer poison message → DLQ** | Deliver a malformed/unprocessable message `RABBITMQ_MAX_REDELIVERIES` times → message lands in `payments.dlq`, consumer ACKs and continues |
+| 9 | **Outbox pruning** | Insert `PUBLISHED` rows older than `OUTBOX_PRUNE_AFTER_HOURS` → prune ticker removes them; recent rows stay |
+| 10 | **Concurrent ingestion** | 50 concurrent POSTs with unique bodies → 50 outbox rows, all eventually `PUBLISHED` and persisted exactly once |
 
 ### Test package structure
 ```
@@ -216,19 +217,23 @@ github.com/stretchr/testify
 ```
 
 ### Makefile targets
+Go is not installed on the host — these run inside `golang:1.26-alpine` via
+Podman, same convention as `make build`/`make lint`:
 ```makefile
 test-unit:
-	go test -race -coverprofile=coverage.out ./internal/...
+	podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine \
+		go test -race -coverprofile=coverage.out ./internal/...
 
 test-integration:
-	go test -tags=integration -race -timeout=300s \
-		-coverprofile=coverage.out \
-		-coverpkg=./internal/... \
-		./tests/integration/...
+	podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine \
+		go test -tags=integration -race -timeout=300s \
+			-coverprofile=coverage.out \
+			-coverpkg=./internal/... \
+			./tests/integration/...
 
 coverage:
-	go tool cover -html=coverage.out -o coverage.html
-	@go tool cover -func=coverage.out | grep total
+	podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine sh -c \
+		"go tool cover -html=coverage.out -o coverage.html && go tool cover -func=coverage.out | grep total"
 ```
 
 ### Coverage measurement
@@ -300,7 +305,7 @@ spec:
     - type: rabbitmq
       metadata:
         protocol: http
-        queueName: outbox.queue
+        queueName: payments.queue
         mode: QueueLength
         value: "100"          # 1 replica per 100 messages
         hostFromEnv: RABBITMQ_MANAGEMENT_URL

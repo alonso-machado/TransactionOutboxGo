@@ -64,8 +64,8 @@ func main() {
 		time.Duration(cfg.PruneAfterHours)*time.Hour,
 	)
 
-	recordHandler := handler.NewRecordHandler(ingestUC)
-	router := handler.NewRouter(recordHandler)
+	paymentHandler := handler.NewPaymentHandler(ingestUC)
+	router := handler.NewRouter(paymentHandler)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

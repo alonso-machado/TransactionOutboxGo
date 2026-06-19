@@ -47,10 +47,9 @@ func main() {
 	}
 
 	uow := persistence.NewUnitOfWork(db)
-	inboxRepo := persistence.NewInboxRepository(db)
-	recordRepo := persistence.NewRecordRepository(db)
+	paymentRepo := persistence.NewPaymentRepository(db)
 
-	processUC := consume.New(inboxRepo, recordRepo, uow)
+	processUC := consume.New(paymentRepo, uow)
 	consumer := messaging.NewConsumer(conn, processUC, cfg.PrefetchCount, cfg.MaxDeliveries)
 
 	ctx, cancel := context.WithCancel(context.Background())

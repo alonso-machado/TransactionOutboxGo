@@ -6,7 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func NewRouter(recordHandler *RecordHandler) *gin.Engine {
+func NewRouter(paymentHandler *PaymentHandler) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(gin.Logger())
@@ -17,9 +17,9 @@ func NewRouter(recordHandler *RecordHandler) *gin.Engine {
 
 	v1 := r.Group("/api/v1")
 	{
-		v1.POST("/records", recordHandler.Handle)
-		v1.PUT("/records/:id", recordHandler.Handle)
-		v1.PATCH("/records/:id", recordHandler.Handle)
+		v1.POST("/payments", paymentHandler.Handle)
+		v1.PUT("/payments/:id", paymentHandler.Handle)
+		v1.PATCH("/payments/:id", paymentHandler.Handle)
 	}
 
 	return r

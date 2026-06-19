@@ -10,9 +10,10 @@ import (
 type OutboxStatus string
 
 const (
-	OutboxStatusPending   OutboxStatus = "pending"
-	OutboxStatusPublished OutboxStatus = "published"
-	OutboxStatusFailed    OutboxStatus = "failed"
+	OutboxStatusNew        OutboxStatus = "NEW"
+	OutboxStatusPublished  OutboxStatus = "PUBLISHED"
+	OutboxStatusRetrying   OutboxStatus = "RETRYING"
+	OutboxStatusDeadLetter OutboxStatus = "DEAD_LETTER"
 )
 
 type OutboxMessage struct {
@@ -30,12 +31,16 @@ type OutboxMessage struct {
 	PublishedAt    *time.Time
 }
 
+// OutboxRepository is the port for the Outbox table. Enqueue reports
+// whether the row was newly created (false means a duplicate idempotency
+// key already existed) so the caller can respond "duplicate" instead of
+// "accepted".
 type OutboxRepository interface {
-	Enqueue(ctx context.Context, uow UnitOfWork, msg *OutboxMessage) error
-	FetchPending(ctx context.Context, limit int) ([]*OutboxMessage, error)
+	Enqueue(ctx context.Context, uow UnitOfWork, msg *OutboxMessage) (created bool, err error)
+	FetchPending(ctx context.Context, limit int) ([]*OutboxMessage, error) // status IN (NEW, RETRYING)
 	MarkPublished(ctx context.Context, id uuid.UUID, publishedAt time.Time) error
-	MarkFailed(ctx context.Context, id uuid.UUID, lastError string) error
-	IncrementRetry(ctx context.Context, id uuid.UUID, lastError string) error
+	MarkRetrying(ctx context.Context, id uuid.UUID, lastError string) error
+	MarkDeadLetter(ctx context.Context, id uuid.UUID, lastError string) error
 	DeleteOldPublished(ctx context.Context, olderThan time.Duration) error
 }
 

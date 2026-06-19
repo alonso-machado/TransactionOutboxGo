@@ -31,10 +31,7 @@ func (p *AMQPPublisher) Publish(ctx context.Context, msg *domain.OutboxMessage) 
 
 	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
 
-	headers := amqp.Table{
-		"http_method": msg.HTTPMethod,
-		"route":       msg.Route,
-	}
+	headers := amqp.Table{}
 	for k, v := range msg.Headers {
 		headers[k] = v
 	}

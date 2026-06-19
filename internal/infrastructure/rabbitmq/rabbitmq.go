@@ -7,12 +7,12 @@ import (
 )
 
 const (
-	Exchange      = "outbox.exchange"
-	Queue         = "outbox.queue"
-	DLX           = "outbox.dlx"
-	DLQ           = "outbox.dlq"
-	RoutingKey    = "record.created"
-	DLXRoutingKey = "record.dead"
+	Exchange      = "payments.exchange"
+	Queue         = "payments.queue"
+	DLX           = "payments.dlx"
+	DLQ           = "payments.dlq"
+	RoutingKey    = "payment.created"
+	DLXRoutingKey = "payment.dead"
 )
 
 func Connect(url string) (*amqp.Connection, error) {

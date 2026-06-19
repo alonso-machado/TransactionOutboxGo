@@ -64,12 +64,12 @@ func (d *DispatchOutbox) dispatch(ctx context.Context) {
 		if err := d.publisher.Publish(ctx, msg); err != nil {
 			log.Printf("outbox publish error for %s: %v", msg.IdempotencyKey, err)
 			if msg.RetryCount+1 >= d.maxRetries {
-				if markErr := d.outboxRepo.MarkFailed(ctx, msg.ID, err.Error()); markErr != nil {
-					log.Printf("outbox mark failed error: %v", markErr)
+				if markErr := d.outboxRepo.MarkDeadLetter(ctx, msg.ID, err.Error()); markErr != nil {
+					log.Printf("outbox mark dead-letter error: %v", markErr)
 				}
 			} else {
-				if retryErr := d.outboxRepo.IncrementRetry(ctx, msg.ID, err.Error()); retryErr != nil {
-					log.Printf("outbox increment retry error: %v", retryErr)
+				if retryErr := d.outboxRepo.MarkRetrying(ctx, msg.ID, err.Error()); retryErr != nil {
+					log.Printf("outbox mark retrying error: %v", retryErr)
 				}
 			}
 			continue

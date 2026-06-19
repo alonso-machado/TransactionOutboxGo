@@ -2,58 +2,91 @@ package consume
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/google/uuid"
-	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type ProcessMessage struct {
-	inboxRepo  domain.InboxRepository
-	recordRepo domain.RecordRepository
-	uow        domain.UnitOfWork
+	paymentRepo domain.PaymentRepository
+	uow         domain.UnitOfWork
 }
 
-func New(inboxRepo domain.InboxRepository, recordRepo domain.RecordRepository, uow domain.UnitOfWork) *ProcessMessage {
-	return &ProcessMessage{inboxRepo: inboxRepo, recordRepo: recordRepo, uow: uow}
+func New(paymentRepo domain.PaymentRepository, uow domain.UnitOfWork) *ProcessMessage {
+	return &ProcessMessage{paymentRepo: paymentRepo, uow: uow}
 }
 
-func (uc *ProcessMessage) Execute(ctx context.Context, messageID string, body []byte, headers amqp.Table) error {
+type payloadDTO struct {
+	PaymentID         string          `json:"paymentId"`
+	EventID           string          `json:"eventId"`
+	ProviderName      string          `json:"providerName"`
+	ProviderPaymentID string          `json:"providerPaymentId"`
+	ExternalPaymentID string          `json:"externalPaymentId"`
+	PayerID           *string         `json:"payerId,omitempty"`
+	RecipientID       *string         `json:"recipientId,omitempty"`
+	Amount            int64           `json:"amount"`
+	Currency          string          `json:"currency"`
+	Method            string          `json:"method"`
+	MethodDetails     json.RawMessage `json:"methodDetails,omitempty"`
+	OccurredAt        time.Time       `json:"occurredAt"`
+}
+
+// Execute is idempotent: PaymentRepository.Save uses ON CONFLICT (source_message_id)
+// DO NOTHING, so redelivering the same RabbitMQ message is a safe no-op.
+func (uc *ProcessMessage) Execute(ctx context.Context, messageID string, body []byte) error {
+	var dto payloadDTO
+	if err := json.Unmarshal(body, &dto); err != nil {
+		return fmt.Errorf("unmarshal payload: %w", err)
+	}
+
+	paymentID, err := uuid.Parse(dto.PaymentID)
+	if err != nil {
+		return fmt.Errorf("parse paymentId: %w", err)
+	}
+
+	payerID, err := parseOptionalUUID(dto.PayerID)
+	if err != nil {
+		return fmt.Errorf("parse payerId: %w", err)
+	}
+	recipientID, err := parseOptionalUUID(dto.RecipientID)
+	if err != nil {
+		return fmt.Errorf("parse recipientId: %w", err)
+	}
+
+	now := time.Now().UTC()
+	payment := &domain.Payment{
+		ID:                paymentID,
+		SourceMessageID:   messageID,
+		EventID:           dto.EventID,
+		ProviderName:      dto.ProviderName,
+		ProviderPaymentID: dto.ProviderPaymentID,
+		ExternalPaymentID: dto.ExternalPaymentID,
+		PayerID:           payerID,
+		RecipientID:       recipientID,
+		Amount:            dto.Amount,
+		Currency:          dto.Currency,
+		Method:            dto.Method,
+		MethodDetails:     dto.MethodDetails,
+		OccurredAt:        dto.OccurredAt,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+
 	return uc.uow.Execute(ctx, func(ctx context.Context) error {
-		exists, err := uc.inboxRepo.Exists(ctx, uc.uow, messageID)
-		if err != nil {
-			return fmt.Errorf("inbox check: %w", err)
-		}
-		if exists {
-			return nil
-		}
-
-		id, err := uuid.NewV7()
-		if err != nil {
-			return fmt.Errorf("generate id: %w", err)
-		}
-
-		method, _ := headers["http_method"].(string)
-		route, _ := headers["route"].(string)
-
-		record := &domain.Record{
-			ID:              id,
-			SourceMessageID: messageID,
-			Method:          method,
-			Route:           route,
-			Payload:         body,
-			CreatedAt:       time.Now().UTC(),
-		}
-		if err := uc.recordRepo.Save(ctx, uc.uow, record); err != nil {
-			return fmt.Errorf("save record: %w", err)
-		}
-
-		return uc.inboxRepo.Insert(ctx, uc.uow, &domain.InboxMessage{
-			MessageID:   messageID,
-			Status:      "processed",
-			ProcessedAt: time.Now().UTC(),
-		})
+		return uc.paymentRepo.Save(ctx, uc.uow, payment)
 	})
+}
+
+func parseOptionalUUID(s *string) (*uuid.UUID, error) {
+	if s == nil || *s == "" {
+		return nil, nil
+	}
+	id, err := uuid.Parse(*s)
+	if err != nil {
+		return nil, err
+	}
+	return &id, nil
 }

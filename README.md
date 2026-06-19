@@ -1,12 +1,9 @@
 # Transaction Outbox (Go Monorepo)
 
-A reliable ingestion pipeline that accepts REST writes (`POST` / `PUT` / `PATCH`),
-guarantees **no message loss**, and persists each message **exactly once** —
-implemented with the **Transactional Outbox** + **Inbox (dedup)** patterns over
-RabbitMQ and Postgres.
-
-> Status: 📝 design & documentation phase. Code is being built incrementally per
-> [`.claude/plan.md`](.claude/plan.md).
+A reliable payments ingestion pipeline that accepts REST writes (`POST` / `PUT` /
+`PATCH`), guarantees **no message loss**, and persists each payment **exactly
+once** — implemented with the **Transactional Outbox** pattern over RabbitMQ and
+Postgres.
 
 ---
 
@@ -20,9 +17,9 @@ acknowledges the client, and a separate relay reliably forwards it to the broker
 
 | Concern | How it's solved |
 |---|---|
-| **No message loss** | Request is durably written to a Postgres `outbox` table before the client gets `202`. `DispatchOutbox` publishes to RabbitMQ with **publisher confirms**. |
-| **Idempotency / no duplicates** | Deterministic dedup key (`sha256(method + payload + optional Idempotency-Key)`) used as a unique constraint at the outbox **and** as the consumer's `inbox` primary key. |
-| **Poison messages** | Dead-letter exchange/queue (`outbox.dlx` → `outbox.dlq`) after N redeliveries. |
+| **No message loss** | Request is durably written to a Postgres `outbox_messages` table before the client gets `201`. `DispatchOutbox` publishes to RabbitMQ with **publisher confirms**. |
+| **Idempotency / no duplicates** | Deterministic dedup key (`sha256(method + provider.name:eventId + optional Idempotency-Key)`) is the outbox `UNIQUE` constraint **and** the RabbitMQ `MessageId` — a webhook redelivery carries the same `eventId`, the natural dedup boundary. The consumer also dedupes on `payments.source_message_id` (UNIQUE) — a redelivered message is a safe no-op insert. |
+| **Poison messages** | Dead-letter exchange/queue (`payments.dlx` → `payments.dlq`) after N redeliveries. |
 | **Horizontal scaling** | `DispatchOutbox` polls with `FOR UPDATE SKIP LOCKED`; consumer uses prefetch + manual ack. |
 
 ---
@@ -38,7 +35,10 @@ acknowledges the client, and a separate relay reliably forwards it to the broker
 | Database | PostgreSQL | **17** |
 | AMQP client | `github.com/rabbitmq/amqp091-go` | latest |
 | Config | `github.com/kelseyhightower/envconfig` | latest |
-| Local orchestration | Docker Compose | — |
+| Local orchestration | Podman Compose | — |
+
+> **Go is not installed on the host.** All `go build`/`test`/`lint` commands run
+> inside containers via `make` targets — see [Build / run commands](#build--run-commands-local-dev).
 
 ---
 
@@ -47,6 +47,7 @@ acknowledges the client, and a separate relay reliably forwards it to the broker
 Two binaries. The **`DispatchOutbox`** use case runs as a background goroutine
 inside `ingestion-api` (not a third process), so the API both serves HTTP and
 dispatches the outbox — handling the full Transactional Outbox responsibility.
+The API **never writes to the `payments` table** — only `consumer-worker` does.
 
 ```mermaid
 flowchart LR
@@ -55,20 +56,19 @@ flowchart LR
     subgraph API["ingestion-api (process 1)"]
         direction TB
         H[Gin HTTP handler]
-        R[DispatchOutbox goroutine<br/>poll · dedup · publish]
+        R[DispatchOutbox goroutine<br/>poll · publish · mark]
         H -. "in-process" .- R
     end
 
     subgraph DB[(PostgreSQL 17)]
         OBX[[outbox_messages]]
-        INB[[inbox_messages]]
-        REC[[records]]
+        PAY[[payments]]
     end
 
     subgraph MQ["RabbitMQ 4.3 (quorum)"]
-        EX{{outbox.exchange}}
-        Q[[outbox.queue]]
-        DLQ[[outbox.dlq]]
+        EX{{payments.exchange}}
+        Q[[payments.queue]]
+        DLQ[[payments.dlq]]
         EX --> Q
         Q -. "redelivery limit" .-> DLQ
     end
@@ -77,15 +77,14 @@ flowchart LR
         C[Consumer<br/>manual ack + prefetch]
     end
 
-    Client -- "POST/PUT/PATCH" --> H
-    H -- "tx: INSERT (idempotency_key UNIQUE)" --> OBX
-    H -- "202 Accepted" --> Client
-    R -- "SELECT ... FOR UPDATE SKIP LOCKED" --> OBX
+    Client -- "POST/PUT/PATCH /api/v1/payments" --> H
+    H -- "tx: INSERT (idempotency_key UNIQUE, status=NEW)" --> OBX
+    H -- "201 Created" --> Client
+    R -- "SELECT status IN (NEW, RETRYING) FOR UPDATE SKIP LOCKED" --> OBX
     R -- "publish (confirm, persistent)" --> EX
-    R -- "mark published" --> OBX
+    R -- "mark PUBLISHED" --> OBX
     Q -- "deliver" --> C
-    C -- "tx: dedup check + persist + mark processed" --> INB
-    C -- "same tx: INSERT business row" --> REC
+    C -- "INSERT ... ON CONFLICT (source_message_id) DO NOTHING" --> PAY
 ```
 
 ### End-to-end flow
@@ -100,26 +99,36 @@ sequenceDiagram
     participant MQ as RabbitMQ
     participant CW as consumer-worker
 
-    Cl->>API: POST /api/v1/records (+ optional Idempotency-Key)
-    API->>API: key = sha256(method + payload + key?)
-    API->>PG: BEGIN; INSERT outbox ON CONFLICT DO NOTHING; COMMIT
-    API-->>Cl: 202 Accepted { message_id }
+    Cl->>API: POST /api/v1/payments (+ optional Idempotency-Key)
+    API->>API: paymentId = uuid.NewV7()
+    API->>API: key = sha256(method + provider.name:eventId + key?)
+    API->>PG: BEGIN; INSERT outbox (status=NEW) ON CONFLICT DO NOTHING; COMMIT
+    API-->>Cl: 201 Created { paymentId, idempotencyKey, status }
     loop DispatchOutbox poll (Transactional Outbox)
-        RL->>PG: SELECT pending FOR UPDATE SKIP LOCKED
+        RL->>PG: SELECT status IN (NEW, RETRYING) FOR UPDATE SKIP LOCKED
         RL->>MQ: publish (persistent, MessageId=key, confirms)
         MQ-->>RL: confirm ACK
-        RL->>PG: UPDATE status = published
+        RL->>PG: UPDATE status = PUBLISHED
     end
     MQ->>CW: deliver (manual ack)
-    CW->>PG: BEGIN
-    alt message_id already in inbox
-        CW->>PG: COMMIT (no-op)
-        CW->>MQ: ack (duplicate ignored)
-    else new message
-        CW->>PG: INSERT record + INSERT inbox; COMMIT
-        CW->>MQ: ack
-    end
+    CW->>PG: INSERT payments ON CONFLICT (source_message_id) DO NOTHING
+    CW->>MQ: ack
 ```
+
+### Outbox status state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> NEW
+    NEW --> PUBLISHED
+    NEW --> RETRYING
+    RETRYING --> PUBLISHED
+    RETRYING --> DEAD_LETTER
+```
+
+`RETRYING` increments `retry_count` on every failed publish attempt; once
+`retry_count` reaches `MAX_RETRIES` the row moves to `DEAD_LETTER` and
+`DispatchOutbox` stops retrying it.
 
 ---
 
@@ -136,10 +145,10 @@ flowchart TB
         subgraph ADAPT["adapter — interface adapters"]
             subgraph UC["usecase — application rules"]
                 subgraph DOM["domain — entities + ports"]
-                    E["Entities: OutboxMessage,<br/>InboxMessage, Record"]
-                    P["Ports: OutboxRepo, InboxRepo,<br/>RecordRepo, Publisher, UnitOfWork"]
+                    E["Entities: OutboxMessage, Payment"]
+                    P["Ports: OutboxRepository,<br/>PaymentRepository, Publisher, UnitOfWork"]
                 end
-                U1[IngestRecord]
+                U1[IngestPayment]
                 U2["DispatchOutbox (Transactional Outbox core)"]
                 U3[ProcessMessage]
             end
@@ -160,7 +169,7 @@ flowchart TB
 | Layer | Responsibility | May import |
 |---|---|---|
 | `domain` | Entities + port interfaces | nothing external |
-| `usecase` | Application flows (`IngestRecord`, `DispatchOutbox`, `ProcessMessage`) | `domain` only |
+| `usecase` | Application flows (`IngestPayment`, `DispatchOutbox`, `ProcessMessage`) | `domain` only |
 | `adapter` | Gin handlers, GORM repositories, RabbitMQ pub/consumer | `domain`, `usecase` |
 | `infrastructure` | Config, DB/MQ bootstrap, `main` wiring (DI) | all of the above |
 
@@ -171,33 +180,109 @@ flowchart TB
 
 ## Components
 
-- **`ingestion-api`** — Gin HTTP server exposing `POST/PUT/PATCH /api/v1/records`
-  and `/healthz`. Computes the idempotency key, writes the request to the outbox
-  table inside a transaction, returns `202 Accepted`. Also hosts the
-  **`DispatchOutbox` goroutine** — the Transactional Outbox core: polls pending
-  outbox rows (deduped via `FOR UPDATE SKIP LOCKED`), publishes to RabbitMQ with
-  publisher confirms, marks rows `published`, and prunes old rows.
-- **`consumer-worker`** — RabbitMQ consumer with prefetch + manual ack. Dedupes
-  via the `inbox_messages` table, then persists the business `record` and the
-  inbox row in a single transaction. Poison messages route to the DLQ.
-- **PostgreSQL** — stores `outbox_messages`, `inbox_messages`, and `records`.
-- **RabbitMQ** — durable topic exchange + quorum queue + dead-letter queue.
+- **`ingestion-api`** — Gin HTTP server exposing `POST/PUT/PATCH /api/v1/payments`
+  and `/healthz`. Pre-generates the Payment UUID, computes the idempotency key from
+  the business fields, writes **only** to the outbox table inside a transaction
+  (status `NEW`), returns `201 Created`. Also hosts the **`DispatchOutbox`
+  goroutine** — the Transactional Outbox core: polls `NEW`/`RETRYING` rows
+  (deduped via `FOR UPDATE SKIP LOCKED`), publishes to RabbitMQ with publisher
+  confirms, marks rows `PUBLISHED` (or `RETRYING`/`DEAD_LETTER` on failure), and
+  prunes old published rows.
+- **`consumer-worker`** — RabbitMQ consumer with prefetch + manual ack. The
+  **only writer** of the `payments` table — dedupes via the
+  `payments.source_message_id` `UNIQUE` constraint (`ON CONFLICT DO NOTHING`), so
+  a redelivered message is a safe no-op. No separate inbox table.
+- **PostgreSQL** — stores `outbox_messages` and `payments`.
+- **RabbitMQ** — durable topic exchange (`payments.exchange`) + quorum queue
+  (`payments.queue`) + dead-letter queue (`payments.dlq`).
 
 ---
+
+## Payment wire format
+
+The request body mirrors a payment-provider webhook (e.g. **Mercado Pago PIX**):
+a generic envelope plus a method-specific sibling object named after
+`payment.method` lowercased:
+
+```json
+{
+  "eventId": "evt_123456",
+  "provider": {
+    "name": "MERCADO_PAGO",
+    "providerPaymentId": "987654321"
+  },
+  "payment": {
+    "paymentId": "pay_123",
+    "amount": 100.50,
+    "currency": "BRL",
+    "method": "PIX",
+    "payerId": "018f7f9e-6e8b-7c3a-8f2a-000000000001",
+    "recipientId": "018f7f9e-6e8b-7c3a-8f2a-000000000002"
+  },
+  "pix": {
+    "endToEndId": "E123456789ABCDEF",
+    "txid": "ORDER123"
+  },
+  "occurredAt": "2026-06-19T18:30:00Z"
+}
+```
+
+- `payerId`/`recipientId` are **optional** — a provider webhook describes a
+  payment the provider already tracked, not necessarily two parties known to
+  our own ledger.
+- `amount` is a decimal float in currency units on the wire; the handler
+  converts it to `int64` minor units (cents) immediately — domain and
+  persistence code never see a float.
+- The method-specific object (here `"pix"`) is extracted generically by
+  lowercasing `payment.method` and looking up that key in the raw JSON body,
+  then stored opaquely as `MethodDetails` (JSONB). Adding a new method
+  (`CARD`, `BOLETO`, ...) needs no DTO change.
+- `paymentId` (the provider's own reference, e.g. `"pay_123"`) is stored as
+  `ExternalPaymentID`, distinct from our server-generated `Payment.ID` (UUID
+  v7) and from `provider.providerPaymentId`.
+
+### Supported payment methods
+
+| Method | Sibling object | Required fields |
+|---|---|---|
+| `PIX` | `pix` | `endToEndId`, `txid` |
+| `BOLETO` | `boleto` | `barcode`, `dueDate`, `payerDocument` |
+| `TRANSFER` | *(none — internal)* | `payment.payerId` and `payment.recipientId` |
+
+`TRANSFER` is the one method **we** originate rather than a provider — there's
+no external webhook driving it, so instead of a sibling details object it
+requires both parties (`payerId`, `recipientId`) to be present. Any other
+`method` value is accepted without first-class validation (the polymorphic
+`MethodDetails` design tolerates unknown methods); see `ValidateMethod` in
+[`internal/adapter/http/dto.go`](internal/adapter/http/dto.go) to add
+validation for a new one.
+
+```bash
+make seed-pix       # PIX sample
+make seed-boleto    # BOLETO sample
+make seed-transfer  # TRANSFER sample (payerId -> recipientId)
+```
 
 ## Idempotency / dedup key
 
 ```
-key = sha256( http_method + payload_hash + Idempotency-Key? )
+key = sha256( http_method + sha256(provider.name:eventId) + Idempotency-Key? )
 ```
 
-- **No `Idempotency-Key` header** → `sha256(method + payload)`: byte-identical
-  retries collapse into a single message.
-- **With `Idempotency-Key` header** → the header is folded into the hash, so two
-  genuinely distinct requests carrying different keys are never wrongly merged.
+- The hash is computed from the **provider's own event identity**
+  (`provider.name` + `eventId`) — never from the server-generated Payment
+  UUID, or every request would be unique and dedup would never trigger. A
+  webhook redelivery carries the same `eventId`, making it the natural dedup
+  boundary.
+- **No `Idempotency-Key` header** → redeliveries of the same `eventId`
+  collapse into a single outbox row.
+- **With `Idempotency-Key` header** → the header is folded into the hash, so
+  two genuinely distinct requests carrying different keys are never wrongly
+  merged.
 
-The same key is the outbox `UNIQUE` constraint, the RabbitMQ `MessageId`, and the
-consumer's `inbox` primary key — making dedup consistent across the whole pipeline.
+The same key is the outbox `UNIQUE` constraint and the RabbitMQ `MessageId`. The
+consumer's dedup is independent: the `payments.source_message_id` `UNIQUE`
+constraint absorbs redelivered messages.
 
 ---
 
@@ -211,10 +296,10 @@ TransactionOutboxGo/
 │   ├── ingestion-api/         # HTTP server + DispatchOutbox goroutine (composition root)
 │   └── consumer-worker/       # RabbitMQ consumer (composition root)
 ├── internal/
-│   ├── domain/                # entities + ports (no framework imports)
-│   ├── usecase/               # ingest / outbox (DispatchOutbox) / consume
-│   ├── adapter/               # http · persistence · messaging
-│   └── infrastructure/        # config · database · rabbitmq
+│   ├── domain/                # entities (OutboxMessage, Payment) + ports (no framework imports)
+│   ├── usecase/                # ingest (IngestPayment) / outbox (DispatchOutbox) / consume (ProcessMessage)
+│   ├── adapter/                # http · persistence · messaging
+│   └── infrastructure/         # config · database · rabbitmq
 ├── deployments/docker-compose.yml
 ├── build/Dockerfile
 └── Makefile
@@ -222,63 +307,55 @@ TransactionOutboxGo/
 
 ---
 
-## How to run (Docker Compose)
+## Build / run commands (local dev)
 
-> Requires Docker Desktop / Docker Engine with the Compose plugin.
+Go is **not installed on the host** — everything runs inside containers via
+Podman.
 
-1. **Copy the env template** (created during scaffolding):
+```bash
+# Build, test, lint — all run inside golang:1.26-alpine / golangci-lint via Podman
+make build    # go build ./...
+make test     # go test -race ./...
+make tidy     # go mod tidy
+make lint     # golangci-lint run ./...
 
-   ```bash
-   cp .env.example .env
-   ```
+# Podman Compose — starts Postgres + RabbitMQ + both services
+make up       # podman compose -f deployments/docker-compose.yml up --build -d
+make logs     # tail logs from all services
+make down     # podman compose -f deployments/docker-compose.yml down -v
+make seed     # curl a sample POST to the ingestion-api
+```
 
-2. **Start everything** — Postgres, RabbitMQ, and both Go services:
+### Endpoints once `make up` is healthy
 
-   ```bash
-   docker compose -f deployments/docker-compose.yml up --build
-   ```
+| Service | URL |
+|---|---|
+| Ingestion API | http://localhost:8080 |
+| API health | http://localhost:8080/healthz |
+| RabbitMQ management UI | http://localhost:15672 (user/pass from `.env`) |
+| Postgres | `localhost:5432` |
 
-   Or, once the `Makefile` exists:
+### Send a request
 
-   ```bash
-   make up
-   ```
+```bash
+curl -i -X POST http://localhost:8080/api/v1/payments \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: order-123" \
+  -d '{"eventId":"evt_123456","provider":{"name":"MERCADO_PAGO","providerPaymentId":"987654321"},"payment":{"paymentId":"pay_123","amount":100.50,"currency":"BRL","method":"PIX"},"pix":{"endToEndId":"E123456789ABCDEF","txid":"ORDER123"},"occurredAt":"2026-06-19T18:30:00Z"}'
+```
 
-3. **Wait for healthchecks** to pass. Endpoints:
-
-   | Service | URL |
-   |---|---|
-   | Ingestion API | http://localhost:8080 |
-   | API health | http://localhost:8080/healthz |
-   | RabbitMQ management UI | http://localhost:15672 (user/pass from `.env`) |
-   | Postgres | `localhost:5432` |
-
-4. **Send a request:**
-
-   ```bash
-   curl -i -X POST http://localhost:8080/api/v1/records \
-     -H "Content-Type: application/json" \
-     -H "Idempotency-Key: order-123" \
-     -d '{"type":"order.created","amount":4200}'
-   ```
-
-   Expect `202 Accepted` with a `message_id`.
-
-5. **Tail logs / shut down:**
-
-   ```bash
-   make logs      # or: docker compose -f deployments/docker-compose.yml logs -f
-   make down      # or: docker compose -f deployments/docker-compose.yml down -v
-   ```
+Expect `201 Created` with a `paymentId`, `idempotencyKey`, and `status: "accepted"`.
 
 ### Verifying it works
 
-- **Persistence:** the message moves `outbox_messages.status` `pending → published`,
-  flows through `outbox.queue` (visible in the RabbitMQ UI), and lands as one row
-  in `records` + `inbox_messages`.
-- **Idempotency:** repeat the same `curl` → still a single `records` row.
-- **Loss resistance:** `docker compose stop rabbitmq`, send a request (still
-  `202`, row stays `pending`), then restart RabbitMQ → `DispatchOutbox` drains it.
+- **Persistence:** the outbox row moves `NEW → PUBLISHED`, flows through
+  `payments.queue` (visible in the RabbitMQ UI), and lands as one row in
+  `payments`.
+- **Idempotency:** repeat the same `curl` → outbox response comes back
+  `status: "duplicate"`; still a single `payments` row.
+- **Loss resistance:** `podman compose -f deployments/docker-compose.yml stop rabbitmq`,
+  send a request (still `201`, outbox row stays `NEW`), then restart RabbitMQ →
+  `DispatchOutbox` drains the backlog and the consumer persists it.
 
 ---
 

@@ -19,7 +19,7 @@ func NewOutboxRepository(db *gorm.DB) *GORMOutboxRepository {
 	return &GORMOutboxRepository{db: db}
 }
 
-func (r *GORMOutboxRepository) Enqueue(ctx context.Context, uow domain.UnitOfWork, msg *domain.OutboxMessage) error {
+func (r *GORMOutboxRepository) Enqueue(ctx context.Context, uow domain.UnitOfWork, msg *domain.OutboxMessage) (bool, error) {
 	headersJSON, _ := json.Marshal(msg.Headers)
 	m := OutboxMessageModel{
 		ID:             msg.ID,
@@ -34,14 +34,18 @@ func (r *GORMOutboxRepository) Enqueue(ctx context.Context, uow domain.UnitOfWor
 		CreatedAt:      msg.CreatedAt,
 	}
 	db := TxFromContext(ctx, r.db)
-	return db.Clauses(clause.OnConflict{DoNothing: true}).Create(&m).Error
+	tx := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&m)
+	if tx.Error != nil {
+		return false, tx.Error
+	}
+	return tx.RowsAffected > 0, nil
 }
 
 func (r *GORMOutboxRepository) FetchPending(ctx context.Context, limit int) ([]*domain.OutboxMessage, error) {
 	var models []OutboxMessageModel
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		return tx.
-			Where("status = ?", "pending").
+			Where("status IN ?", []string{string(domain.OutboxStatusNew), string(domain.OutboxStatusRetrying)}).
 			Order("created_at ASC").
 			Limit(limit).
 			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
@@ -60,25 +64,29 @@ func (r *GORMOutboxRepository) FetchPending(ctx context.Context, limit int) ([]*
 func (r *GORMOutboxRepository) MarkPublished(ctx context.Context, id uuid.UUID, publishedAt time.Time) error {
 	return r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
 		Where("id = ?", id).
-		Updates(map[string]any{"status": "published", "published_at": publishedAt}).Error
+		Updates(map[string]any{"status": string(domain.OutboxStatusPublished), "published_at": publishedAt}).Error
 }
 
-func (r *GORMOutboxRepository) MarkFailed(ctx context.Context, id uuid.UUID, lastError string) error {
+func (r *GORMOutboxRepository) MarkRetrying(ctx context.Context, id uuid.UUID, lastError string) error {
 	return r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
 		Where("id = ?", id).
-		Updates(map[string]any{"status": "failed", "last_error": lastError}).Error
+		Updates(map[string]any{
+			"status":      string(domain.OutboxStatusRetrying),
+			"retry_count": gorm.Expr("retry_count + 1"),
+			"last_error":  lastError,
+		}).Error
 }
 
-func (r *GORMOutboxRepository) IncrementRetry(ctx context.Context, id uuid.UUID, lastError string) error {
+func (r *GORMOutboxRepository) MarkDeadLetter(ctx context.Context, id uuid.UUID, lastError string) error {
 	return r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
 		Where("id = ?", id).
-		Updates(map[string]any{"retry_count": gorm.Expr("retry_count + 1"), "last_error": lastError}).Error
+		Updates(map[string]any{"status": string(domain.OutboxStatusDeadLetter), "last_error": lastError}).Error
 }
 
 func (r *GORMOutboxRepository) DeleteOldPublished(ctx context.Context, olderThan time.Duration) error {
 	cutoff := time.Now().UTC().Add(-olderThan)
 	return r.db.WithContext(ctx).
-		Where("status = ? AND published_at < ?", "published", cutoff).
+		Where("status = ? AND published_at < ?", string(domain.OutboxStatusPublished), cutoff).
 		Delete(&OutboxMessageModel{}).Error
 }
 

@@ -5,13 +5,17 @@ effectively without re-deriving the same conclusions each session.
 
 ## What this project is
 
-A Go monorepo implementing the **Transactional Outbox + Inbox** pattern:
+A Go monorepo implementing the **Transactional Outbox** pattern for a
+Payments domain:
 
-- **`ingestion-api`** — accepts `POST`/`PUT`/`PATCH` REST writes, stores them
-  durably in Postgres (outbox table), relays to RabbitMQ via a background
-  goroutine, returns `202 Accepted`.
-- **`consumer-worker`** — consumes from RabbitMQ, dedupes via an inbox table,
-  persists the business entity exactly once.
+- **`ingestion-api`** — accepts `POST`/`PUT`/`PATCH` REST writes for
+  `/api/v1/payments`, stores them durably in Postgres (outbox table only —
+  it never writes to the `payments` table directly), pre-generates the
+  Payment UUID and embeds the full payment data in the outbox payload,
+  relays to RabbitMQ via a background goroutine, returns `201 Created`.
+- **`consumer-worker`** — consumes from RabbitMQ and is the **only writer**
+  of the `payments` table; dedupes via a `UNIQUE` constraint on the
+  `payments.source_message_id` column (no separate inbox table).
 
 Full design (Phase 1 — core system): [`.claude/plan.md`](.claude/plan.md)
 Phase 2 plan (OTel · Swagger · TestContainers · K8s+KEDA): [`.claude/plan-phase2.md`](.claude/plan-phase2.md)
@@ -26,7 +30,7 @@ User-facing docs: [`README.md`](README.md)
 ```
 infrastructure  (Gin · GORM · amqp091 · Postgres · config · main / DI)
   └── adapter   (http handlers/DTOs · GORM repos · RabbitMQ pub/consumer)
-        └── usecase   (IngestRecord · DispatchOutbox · ProcessMessage)
+        └── usecase   (IngestPayment · DispatchOutbox · ProcessMessage)
               └── domain   (entities + port interfaces) ← ZERO external imports
 ```
 
@@ -41,11 +45,11 @@ interfaces.
 
 | What | Path |
 |---|---|
-| Entities (`OutboxMessage`, `InboxMessage`, `Record`) | `internal/domain/` |
-| Port interfaces (`OutboxRepo`, `InboxRepo`, `RecordRepo`, `Publisher`, `UnitOfWork`) | `internal/domain/` |
-| `IngestRecord` use-case | `internal/usecase/ingest/` |
+| Entities (`OutboxMessage`, `Payment`) | `internal/domain/` |
+| Port interfaces (`OutboxRepository`, `PaymentRepository`, `Publisher`, `UnitOfWork`) | `internal/domain/` |
+| `IngestPayment` use-case | `internal/usecase/ingest/` |
 | `DispatchOutbox` use-case — Transactional Outbox core (poll → dedup → publish → mark) | `internal/usecase/outbox/` |
-| `ProcessMessage` use-case (inbox dedup + persist) | `internal/usecase/consume/` |
+| `ProcessMessage` use-case (parses payload, persists via `PaymentRepository`; dedup is the `payments.source_message_id` UNIQUE constraint) | `internal/usecase/consume/` |
 | Gin router, handlers, DTOs, middleware | `internal/adapter/http/` |
 | GORM DB models + repository implementations + UnitOfWork | `internal/adapter/persistence/` |
 | RabbitMQ publisher + consumer implementations | `internal/adapter/messaging/` |
@@ -68,15 +72,47 @@ interfaces.
 - **UnitOfWork** (`domain/uow.go`) abstracts DB transactions so `usecase` can
   compose multiple repo operations atomically without importing GORM.
 - **Idempotency key** formula:
-  `sha256(http_method + sha256(payload) + Idempotency-Key-header?)` — the header
-  is only included when the client sends it. Same key travels as the outbox
-  `UNIQUE` constraint, the RabbitMQ `MessageId`, and the inbox primary key.
+  `sha256(http_method + sha256(provider.name:eventId) + Idempotency-Key-header?)`
+  — computed from the provider's own event identity (`provider.name` +
+  `eventId`), never from the server-generated Payment UUID, or every request
+  would be unique and dedup would never trigger. A webhook redelivery carries
+  the same `eventId`, making it the natural dedup boundary. The
+  `Idempotency-Key` header is only folded in when the client sends it. Same
+  key travels as the outbox `UNIQUE` constraint and the RabbitMQ `MessageId`.
+- **Payment wire format** mirrors a payment-provider webhook (e.g. Mercado
+  Pago PIX): `{eventId, provider{name,providerPaymentId}, payment{paymentId,
+  amount,currency,method,payerId?,recipientId?}, <method-lowercased>{...},
+  occurredAt}`. The method-specific sub-object (e.g. `"pix"`) is a **top-level
+  sibling key named after `payment.method` lowercased** — the handler
+  extracts it generically via a raw `map[string]json.RawMessage`, so adding a
+  new method (`CARD`, `BOLETO`, ...) never requires a DTO change. It's stored
+  opaquely as `Payment.MethodDetails` (`[]byte` JSONB).
+- **Amount conversion at the boundary:** the wire format's `amount` is a
+  decimal float (currency units, e.g. `100.50`). `internal/adapter/http/handler.go`
+  converts it to `int64` minor units (`round(amount * 100)`) immediately —
+  domain and persistence code never see a float.
+- **`payerId`/`recipientId` are optional**, nested under `payment` in the
+  wire format, and stored as `*uuid.UUID` (nullable) in the `Payment` domain
+  entity and `payments` table — **except for `TRANSFER`**, see below.
+- **Three first-class methods, validated in `internal/adapter/http/dto.go`
+  (`ValidateMethod`)**:
+  - `PIX` — requires the `pix{endToEndId, txid}` sibling object.
+  - `BOLETO` — requires the `boleto{barcode, dueDate, payerDocument}` sibling object.
+  - `TRANSFER` — an **internally-originated** method (no external payment
+    provider drives it); requires both `payment.payerId` and
+    `payment.recipientId` to be present instead of a sibling object.
+  - Any other `method` value passes `ValidateMethod` unvalidated — that's
+    intentional: the polymorphic `MethodDetails` design means new methods
+    don't require a code change, only a new `case` in `ValidateMethod` if
+    first-class validation is wanted later.
+- **Outbox status state machine:** `NEW` → `PUBLISHED`, `NEW` → `RETRYING`,
+  `RETRYING` → `PUBLISHED`, `RETRYING` → `DEAD_LETTER` (after max retries).
 - **`DispatchOutbox`** (`usecase/outbox`) is the Transactional Outbox core: it runs
   as a goroutine started from `cmd/ingestion-api/main.go`, sharing the DB pool and
   RabbitMQ connection with the HTTP server. Use `context.Context` for graceful
   shutdown. Use `FOR UPDATE SKIP LOCKED` so multiple replicas never double-publish.
 - **Publisher confirms** must be enabled on the `DispatchOutbox` AMQP channel. Never
-  mark a row `published` before the confirm ACK arrives.
+  mark a row `PUBLISHED` before the confirm ACK arrives.
 - **Manual ack + prefetch** on the consumer. Only call `msg.Ack()` after the DB
   transaction commits successfully.
 
@@ -131,7 +167,7 @@ done. Key rules enforced:
   `internal/domain/` or `internal/usecase/`.
 - Do **not** put GORM struct tags on domain entities.
 - Do **not** ACK a RabbitMQ message before the DB transaction commits.
-- Do **not** mark an outbox row `published` before receiving a publisher confirm.
+- Do **not** mark an outbox row `PUBLISHED` before receiving a publisher confirm.
 - Do **not** add a third binary — `DispatchOutbox` is a goroutine inside
   `ingestion-api`, not a separate process.
 - Do **not** use `AutoMigrate` in tests — use a test transaction rollback or a
