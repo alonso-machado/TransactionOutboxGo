@@ -1,0 +1,127 @@
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-outbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-outbox}
+      POSTGRES_DB:       ${POSTGRES_DB:-outbox}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-outbox} -d ${POSTGRES_DB:-outbox}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - outbox
+
+  rabbitmq:
+    image: rabbitmq:4.3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "${RABBITMQ_AMQP_PORT:-5672}:5672"
+      - "${RABBITMQ_MGMT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - outbox
+
+  # ── Application services ────────────────────────────────────────────────────
+
+  ingestion-api:
+    build:
+      context: ..
+      dockerfile: build/Dockerfile
+      args:
+        SERVICE: ingestion-api
+    environment:
+      POSTGRES_HOST:          postgres
+      POSTGRES_PORT:          5432
+      POSTGRES_USER:          ${POSTGRES_USER:-outbox}
+      POSTGRES_PASSWORD:      ${POSTGRES_PASSWORD:-outbox}
+      POSTGRES_DB:            ${POSTGRES_DB:-outbox}
+      POSTGRES_MAX_OPEN_CONNS: ${POSTGRES_MAX_OPEN_CONNS:-20}
+      POSTGRES_MAX_IDLE_CONNS: ${POSTGRES_MAX_IDLE_CONNS:-5}
+      RABBITMQ_HOST:          rabbitmq
+      RABBITMQ_AMQP_PORT:     5672
+      RABBITMQ_USER:          ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD:      ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_VHOST:         ${RABBITMQ_VHOST:-/}
+      RABBITMQ_EXCHANGE:      ${RABBITMQ_EXCHANGE:-outbox.exchange}
+      RABBITMQ_QUEUE:         ${RABBITMQ_QUEUE:-outbox.queue}
+      RABBITMQ_ROUTING_KEY:   ${RABBITMQ_ROUTING_KEY:-record.created}
+      RABBITMQ_DLX:           ${RABBITMQ_DLX:-outbox.dlx}
+      RABBITMQ_DLQ:           ${RABBITMQ_DLQ:-outbox.dlq}
+      RABBITMQ_MAX_REDELIVERIES: ${RABBITMQ_MAX_REDELIVERIES:-5}
+      APP_PORT:               ${APP_PORT:-8080}
+      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-1000}
+      OUTBOX_BATCH_SIZE:       ${OUTBOX_BATCH_SIZE:-50}
+      OUTBOX_MAX_RETRIES:      ${OUTBOX_MAX_RETRIES:-5}
+      OUTBOX_PRUNE_AFTER_HOURS: ${OUTBOX_PRUNE_AFTER_HOURS:-72}
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - outbox
+    restart: unless-stopped
+
+  consumer-worker:
+    build:
+      context: ..
+      dockerfile: build/Dockerfile
+      args:
+        SERVICE: consumer-worker
+    environment:
+      POSTGRES_HOST:          postgres
+      POSTGRES_PORT:          5432
+      POSTGRES_USER:          ${POSTGRES_USER:-outbox}
+      POSTGRES_PASSWORD:      ${POSTGRES_PASSWORD:-outbox}
+      POSTGRES_DB:            ${POSTGRES_DB:-outbox}
+      POSTGRES_MAX_OPEN_CONNS: ${POSTGRES_MAX_OPEN_CONNS:-10}
+      POSTGRES_MAX_IDLE_CONNS: ${POSTGRES_MAX_IDLE_CONNS:-3}
+      RABBITMQ_HOST:          rabbitmq
+      RABBITMQ_AMQP_PORT:     5672
+      RABBITMQ_USER:          ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD:      ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_VHOST:         ${RABBITMQ_VHOST:-/}
+      RABBITMQ_EXCHANGE:      ${RABBITMQ_EXCHANGE:-outbox.exchange}
+      RABBITMQ_QUEUE:         ${RABBITMQ_QUEUE:-outbox.queue}
+      RABBITMQ_ROUTING_KEY:   ${RABBITMQ_ROUTING_KEY:-record.created}
+      RABBITMQ_DLX:           ${RABBITMQ_DLX:-outbox.dlx}
+      RABBITMQ_DLQ:           ${RABBITMQ_DLQ:-outbox.dlq}
+      RABBITMQ_MAX_REDELIVERIES: ${RABBITMQ_MAX_REDELIVERIES:-5}
+      CONSUMER_PREFETCH:      ${CONSUMER_PREFETCH:-10}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - outbox
+    restart: unless-stopped
+
+# ── Volumes & Networks ────────────────────────────────────────────────────────
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+
+networks:
+  outbox:
+    driver: bridge
