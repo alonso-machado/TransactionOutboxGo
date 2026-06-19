@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion-api
+  namespace: transaction-outbox
+  labels:
+    app: ingestion-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ingestion-api
+  template:
+    metadata:
+      labels:
+        app: ingestion-api
+    spec:
+      containers:
+        - name: ingestion-api
+          # CI tags images by git SHA (see build/Dockerfile ARG SERVICE=ingestion-api);
+          # :latest here is a placeholder for local/manual use.
+          image: transaction-outbox-go/ingestion-api:latest
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          envFrom:
+            - configMapRef:
+                name: transaction-outbox-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: DATABASE_URL
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: RABBITMQ_URL
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10

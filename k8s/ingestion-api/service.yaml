@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingestion-api
+  namespace: transaction-outbox
+  labels:
+    app: ingestion-api
+spec:
+  # ClusterIP by default. Swap to LoadBalancer, or add an Ingress resource,
+  # to expose this externally — not included here per the "no extra resources" scope.
+  type: ClusterIP
+  selector:
+    app: ingestion-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: metrics
+      port: 9090
+      targetPort: 9090

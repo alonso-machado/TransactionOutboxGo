@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consumer-worker
+  namespace: transaction-outbox
+  labels:
+    app: consumer-worker
+spec:
+  # Managed by the KEDA ScaledObject (scaledobject.yaml) — starts at 0 and
+  # scales on RabbitMQ queue depth. This `replicas` value is only the
+  # baseline before KEDA takes over.
+  replicas: 0
+  selector:
+    matchLabels:
+      app: consumer-worker
+  template:
+    metadata:
+      labels:
+        app: consumer-worker
+    spec:
+      containers:
+        - name: consumer-worker
+          # CI tags images by git SHA (see build/Dockerfile ARG SERVICE=consumer-worker);
+          # :latest here is a placeholder for local/manual use.
+          image: transaction-outbox-go/consumer-worker:latest
+          ports:
+            - name: metrics
+              containerPort: 9091
+          envFrom:
+            - configMapRef:
+                name: transaction-outbox-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: DATABASE_URL
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: RABBITMQ_URL
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          # consumer-worker has no main HTTP server, but it does expose a
+          # Prometheus /metrics endpoint on CONSUMER_METRICS_PORT (see
+          # internal/infrastructure/telemetry — wired in cmd/consumer-worker/main.go).
+          # That endpoint only comes up once the process has started its HTTP
+          # listener, so an httpGet probe against it is a real, working signal
+          # — unlike an exec/pgrep probe, which would need a shell that the
+          # distroless production image doesn't have. This still only proves
+          # the process is alive, not "connected to RabbitMQ and actively
+          # consuming" — a true readiness signal for that would need a Go
+          # code change (e.g. a health file written after a successful
+          # connection), out of scope for this manifest-only track.
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10

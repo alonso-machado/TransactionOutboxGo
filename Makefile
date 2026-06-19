@@ -61,3 +61,21 @@ seed-transfer:
 # Tail a single service: make service=ingestion-api tail
 tail:
 	$(COMPOSE) logs -f $(service)
+
+## ── Kubernetes (Track 4) ──────────────────────────────────────────────────────
+
+.PHONY: k8s-apply k8s-delete k8s-status
+
+k8s-apply:
+	kubectl apply -f k8s/namespace.yaml
+	kubectl apply -f k8s/configmap.yaml
+	kubectl apply -f k8s/secret.yaml
+	kubectl apply -f k8s/ingestion-api/
+	kubectl apply -f k8s/consumer-worker/
+
+k8s-delete:
+	kubectl delete -f k8s/ --recursive
+
+k8s-status:
+	kubectl get all -n transaction-outbox
+	kubectl get scaledobject -n transaction-outbox

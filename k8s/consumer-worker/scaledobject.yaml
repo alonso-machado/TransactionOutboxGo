@@ -1,0 +1,20 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: consumer-worker
+  namespace: transaction-outbox
+spec:
+  scaleTargetRef:
+    name: consumer-worker
+  minReplicaCount: 0 # scale to zero when idle
+  maxReplicaCount: 20
+  pollingInterval: 15 # seconds between queue checks
+  cooldownPeriod: 60 # seconds to wait before scaling down
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: http
+        queueName: payments.queue
+        mode: QueueLength
+        value: "100" # 1 replica per 100 messages
+        hostFromEnv: RABBITMQ_MANAGEMENT_URL

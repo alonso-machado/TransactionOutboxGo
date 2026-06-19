@@ -1,0 +1,32 @@
+# Non-sensitive configuration shared by ingestion-api and consumer-worker.
+# Passwords / connection strings with credentials live in secret.yaml instead.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: transaction-outbox-config
+  namespace: transaction-outbox
+data:
+  # ── ingestion-api ────────────────────────────────────────────────────────
+  HTTP_PORT: "8080"
+  DISPATCH_INTERVAL_MS: "500"
+  DISPATCH_BATCH_SIZE: "50"
+  MAX_RETRIES: "5"
+  PRUNE_AFTER_HOURS: "24"
+
+  # ── consumer-worker ──────────────────────────────────────────────────────
+  PREFETCH_COUNT: "10"
+  MAX_DELIVERIES: "5"
+
+  # ── Observability (Track 1 — OpenTelemetry) ─────────────────────────────
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+  OTEL_SERVICE_NAME: "transaction-outbox"
+  METRICS_PORT: "9090"
+  CONSUMER_METRICS_PORT: "9091"
+
+  # ── API docs (Track 2 — Swagger) ─────────────────────────────────────────
+  # Disabled in production; enable only in lower environments via override.
+  SWAGGER_ENABLED: "false"
+
+  # ── Messaging topology ───────────────────────────────────────────────────
+  RABBITMQ_QUEUE_NAME: "payments.queue"
+  RABBITMQ_MANAGEMENT_URL: "http://rabbitmq:15672"
