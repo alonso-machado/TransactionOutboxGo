@@ -47,29 +47,13 @@ services:
       args:
         SERVICE: ingestion-api
     environment:
-      POSTGRES_HOST:          postgres
-      POSTGRES_PORT:          5432
-      POSTGRES_USER:          ${POSTGRES_USER:-outbox}
-      POSTGRES_PASSWORD:      ${POSTGRES_PASSWORD:-outbox}
-      POSTGRES_DB:            ${POSTGRES_DB:-outbox}
-      POSTGRES_MAX_OPEN_CONNS: ${POSTGRES_MAX_OPEN_CONNS:-20}
-      POSTGRES_MAX_IDLE_CONNS: ${POSTGRES_MAX_IDLE_CONNS:-5}
-      RABBITMQ_HOST:          rabbitmq
-      RABBITMQ_AMQP_PORT:     5672
-      RABBITMQ_USER:          ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD:      ${RABBITMQ_PASSWORD:-guest}
-      RABBITMQ_VHOST:         ${RABBITMQ_VHOST:-/}
-      RABBITMQ_EXCHANGE:      ${RABBITMQ_EXCHANGE:-outbox.exchange}
-      RABBITMQ_QUEUE:         ${RABBITMQ_QUEUE:-outbox.queue}
-      RABBITMQ_ROUTING_KEY:   ${RABBITMQ_ROUTING_KEY:-record.created}
-      RABBITMQ_DLX:           ${RABBITMQ_DLX:-outbox.dlx}
-      RABBITMQ_DLQ:           ${RABBITMQ_DLQ:-outbox.dlq}
-      RABBITMQ_MAX_REDELIVERIES: ${RABBITMQ_MAX_REDELIVERIES:-5}
-      APP_PORT:               ${APP_PORT:-8080}
-      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-1000}
-      OUTBOX_BATCH_SIZE:       ${OUTBOX_BATCH_SIZE:-50}
-      OUTBOX_MAX_RETRIES:      ${OUTBOX_MAX_RETRIES:-5}
-      OUTBOX_PRUNE_AFTER_HOURS: ${OUTBOX_PRUNE_AFTER_HOURS:-72}
+      DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@postgres:5432/${POSTGRES_DB:-outbox}?sslmode=disable"
+      RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
+      HTTP_PORT: "${APP_PORT:-8080}"
+      DISPATCH_INTERVAL_MS: "${OUTBOX_POLL_INTERVAL_MS:-500}"
+      DISPATCH_BATCH_SIZE: "${OUTBOX_BATCH_SIZE:-50}"
+      MAX_RETRIES: "${OUTBOX_MAX_RETRIES:-5}"
+      PRUNE_AFTER_HOURS: "${OUTBOX_PRUNE_AFTER_HOURS:-24}"
     ports:
       - "${APP_PORT:-8080}:8080"
     depends_on:
@@ -88,25 +72,10 @@ services:
       args:
         SERVICE: consumer-worker
     environment:
-      POSTGRES_HOST:          postgres
-      POSTGRES_PORT:          5432
-      POSTGRES_USER:          ${POSTGRES_USER:-outbox}
-      POSTGRES_PASSWORD:      ${POSTGRES_PASSWORD:-outbox}
-      POSTGRES_DB:            ${POSTGRES_DB:-outbox}
-      POSTGRES_MAX_OPEN_CONNS: ${POSTGRES_MAX_OPEN_CONNS:-10}
-      POSTGRES_MAX_IDLE_CONNS: ${POSTGRES_MAX_IDLE_CONNS:-3}
-      RABBITMQ_HOST:          rabbitmq
-      RABBITMQ_AMQP_PORT:     5672
-      RABBITMQ_USER:          ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD:      ${RABBITMQ_PASSWORD:-guest}
-      RABBITMQ_VHOST:         ${RABBITMQ_VHOST:-/}
-      RABBITMQ_EXCHANGE:      ${RABBITMQ_EXCHANGE:-outbox.exchange}
-      RABBITMQ_QUEUE:         ${RABBITMQ_QUEUE:-outbox.queue}
-      RABBITMQ_ROUTING_KEY:   ${RABBITMQ_ROUTING_KEY:-record.created}
-      RABBITMQ_DLX:           ${RABBITMQ_DLX:-outbox.dlx}
-      RABBITMQ_DLQ:           ${RABBITMQ_DLQ:-outbox.dlq}
-      RABBITMQ_MAX_REDELIVERIES: ${RABBITMQ_MAX_REDELIVERIES:-5}
-      CONSUMER_PREFETCH:      ${CONSUMER_PREFETCH:-10}
+      DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@postgres:5432/${POSTGRES_DB:-outbox}?sslmode=disable"
+      RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
+      PREFETCH_COUNT: "${CONSUMER_PREFETCH:-10}"
+      MAX_DELIVERIES: "${RABBITMQ_MAX_REDELIVERIES:-5}"
     depends_on:
       postgres:
         condition: service_healthy
