@@ -32,6 +32,7 @@ func (r *GORMOutboxRepository) Enqueue(ctx context.Context, uow domain.UnitOfWor
 		Status:         string(msg.Status),
 		RetryCount:     msg.RetryCount,
 		CreatedAt:      msg.CreatedAt,
+		PaymentMethod:  msg.PaymentMethod,
 	}
 	db := TxFromContext(ctx, r.db)
 	tx := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&m)
@@ -106,5 +107,6 @@ func toDomainOutbox(m OutboxMessageModel) *domain.OutboxMessage {
 		LastError:      m.LastError,
 		CreatedAt:      m.CreatedAt,
 		PublishedAt:    m.PublishedAt,
+		PaymentMethod:  m.PaymentMethod,
 	}
 }

@@ -2,11 +2,12 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ingestion-api
-  namespace: transaction-outbox
+  namespace: {{ .Values.namespace }}
   labels:
     app: ingestion-api
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
 spec:
-  replicas: 2
+  replicas: {{ .Values.ingestionApi.replicas }}
   selector:
     matchLabels:
       app: ingestion-api
@@ -17,9 +18,9 @@ spec:
     spec:
       containers:
         - name: ingestion-api
-          # CI tags images by git SHA (see build/Dockerfile ARG SERVICE=ingestion-api);
-          # :latest here is a placeholder for local/manual use.
-          image: transaction-outbox-go/ingestion-api:latest
+          # CI tags images by git SHA (see Dockerfile ARG SERVICE=ingestion-api);
+          # the values.yaml default is a placeholder for local/manual use.
+          image: {{ .Values.image.ingestionApi }}
           ports:
             - name: http
               containerPort: 8080
@@ -40,12 +41,7 @@ spec:
                   name: transaction-outbox-secrets
                   key: RABBITMQ_URL
           resources:
-            requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
-              cpu: "500m"
-              memory: "256Mi"
+            {{- toYaml .Values.ingestionApi.resources | nindent 12 }}
           livenessProbe:
             httpGet:
               path: /healthz

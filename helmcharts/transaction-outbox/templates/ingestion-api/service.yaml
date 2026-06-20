@@ -2,9 +2,10 @@ apiVersion: v1
 kind: Service
 metadata:
   name: ingestion-api
-  namespace: transaction-outbox
+  namespace: {{ .Values.namespace }}
   labels:
     app: ingestion-api
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
 spec:
   # ClusterIP by default. Swap to LoadBalancer, or add an Ingress resource,
   # to expose this externally — not included here per the "no extra resources" scope.

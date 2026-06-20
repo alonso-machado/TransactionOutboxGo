@@ -1,0 +1,80 @@
+{{- range .Values.paymentMethods }}
+---
+# One Deployment per payment method (Phase 3 Track 1), rendered from this
+# single template via the paymentMethods list in values.yaml — adding a new
+# method needs no new template, just a new list entry.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consumer-{{ .name }}
+  namespace: {{ $.Values.namespace }}
+  labels:
+    app: consumer-{{ .name }}
+    {{- include "transaction-outbox.labels" $ | nindent 4 }}
+spec:
+  # Managed by this method's KEDA ScaledObject (scaledobject.yaml) — starts
+  # at 0 and scales on that method's RabbitMQ queue depth.
+  replicas: 0
+  selector:
+    matchLabels:
+      app: consumer-{{ .name }}
+  template:
+    metadata:
+      labels:
+        app: consumer-{{ .name }}
+    spec:
+      containers:
+        - name: consumer-worker
+          # CI tags images by git SHA (see Dockerfile ARG SERVICE=consumer-worker);
+          # the values.yaml default is a placeholder for local/manual use.
+          image: {{ $.Values.image.consumerWorker }}
+          ports:
+            - name: metrics
+              containerPort: {{ .metricsPort }}
+          envFrom:
+            - configMapRef:
+                name: transaction-outbox-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: DATABASE_URL
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: RABBITMQ_URL
+            - name: PAYMENT_QUEUE
+              value: {{ .queue }}
+            - name: METRICS_PORT
+              value: {{ .metricsPort | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: consumer-worker-{{ .name }}
+          resources:
+            {{- toYaml $.Values.consumerWorker.resources | nindent 12 }}
+          # consumer-worker has no main HTTP server, but it does expose a
+          # Prometheus /metrics endpoint (internal/infrastructure/telemetry).
+          # startupProbe gives a generous grace period for the initial DB +
+          # RabbitMQ connection before liveness starts enforcing its tighter
+          # threshold — every one of these Deployments scales from 0 via
+          # KEDA, so every pod start is a cold start. While startupProbe is
+          # failing, liveness/readiness are not evaluated, so they don't need
+          # their own initialDelaySeconds.
+          startupProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            failureThreshold: 30
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 10
+{{- end }}

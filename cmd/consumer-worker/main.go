@@ -43,28 +43,22 @@ func main() {
 		log.Fatalf("migrate: %v", err)
 	}
 
+	method, ok := rmq.MethodForQueue(cfg.PaymentQueue)
+	if !ok {
+		log.Fatalf("PAYMENT_QUEUE %q is not a known queue (expected one of: %v)", cfg.PaymentQueue, rmq.Methods)
+	}
+
 	conn, err := rmq.Connect(cfg.RabbitMQURL)
 	if err != nil {
 		log.Fatalf("rabbitmq: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
 
-	ch, err := conn.Channel()
-	if err != nil {
-		log.Fatalf("rabbitmq channel: %v", err)
-	}
-	if err := rmq.DeclareTopology(ch); err != nil {
-		log.Fatalf("rabbitmq topology: %v", err)
-	}
-	if err := ch.Close(); err != nil {
-		log.Printf("close topology channel: %v", err)
-	}
-
 	uow := persistence.NewUnitOfWork(db)
 	paymentRepo := persistence.NewPaymentRepository(db)
 
 	processUC := consume.New(paymentRepo, uow)
-	consumer := messaging.NewConsumer(conn, processUC, cfg.PrefetchCount, cfg.MaxDeliveries)
+	consumer := messaging.NewConsumer(conn, processUC, method, cfg.PrefetchCount, cfg.MaxDeliveries)
 
 	ctx, cancel := context.WithCancel(context.Background())
 

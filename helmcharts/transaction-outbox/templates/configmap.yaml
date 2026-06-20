@@ -1,0 +1,11 @@
+# Non-sensitive configuration shared by ingestion-api and consumer-worker.
+# Passwords / connection strings with credentials live in secret.yaml instead.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: transaction-outbox-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+data:
+  {{- toYaml .Values.configMap.data | nindent 2 }}

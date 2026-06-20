@@ -120,10 +120,22 @@ func TestValidateMethod_TRANSFER_RequiresBothParties(t *testing.T) {
 	}
 }
 
-func TestValidateMethod_UnknownMethod_PassesUnvalidated(t *testing.T) {
+func TestValidateMethod_UnknownMethod_Rejected(t *testing.T) {
 	dto := validDTO()
 	dto.Payment.Method = "CARD"
+	if err := dto.ValidateMethod(nil); err == nil {
+		t.Fatal("expected method outside rmq.Methods to be rejected")
+	}
+}
+
+func TestValidateMethod_KnownMethodsCaseInsensitive(t *testing.T) {
+	dto := validDTO()
+	dto.Payment.Method = "transfer"
+	payer := "018f7f9e-6e8b-7c3a-8f2a-000000000001"
+	recipient := "018f7f9e-6e8b-7c3a-8f2a-000000000002"
+	dto.Payment.PayerID = &payer
+	dto.Payment.RecipientID = &recipient
 	if err := dto.ValidateMethod(nil); err != nil {
-		t.Fatalf("expected unknown method to pass through unvalidated, got %v", err)
+		t.Fatalf("expected lowercase known method to validate, got %v", err)
 	}
 }

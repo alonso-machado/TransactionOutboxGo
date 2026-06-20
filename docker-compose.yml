@@ -1,3 +1,31 @@
+# Phase 3: shared shape for the per-method consumer-worker services below —
+# each binds via PAYMENT_QUEUE to exactly one RabbitMQ queue
+# (internal/infrastructure/rabbitmq.QueueFor), decoupling payment methods
+# from consumer scaling.
+x-consumer-worker-base: &consumer-worker-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      SERVICE: consumer-worker
+  depends_on:
+    postgres:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+    jaeger:
+      condition: service_started
+  networks:
+    - outbox
+  restart: unless-stopped
+
+x-consumer-worker-env: &consumer-worker-env
+  DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@postgres:5432/${POSTGRES_DB:-outbox}?sslmode=disable"
+  RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
+  PREFETCH_COUNT: "${CONSUMER_PREFETCH:-10}"
+  MAX_DELIVERIES: "${RABBITMQ_MAX_REDELIVERIES:-5}"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-jaeger:4318}"
+
 services:
 
   # ── Infrastructure ──────────────────────────────────────────────────────────
@@ -50,18 +78,19 @@ services:
 
   ingestion-api:
     build:
-      context: ..
-      dockerfile: build/Dockerfile
+      context: .
+      dockerfile: Dockerfile
       args:
         SERVICE: ingestion-api
     environment:
       DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@postgres:5432/${POSTGRES_DB:-outbox}?sslmode=disable"
       RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
       HTTP_PORT: "${APP_PORT:-8080}"
+      SWAGGER_ENABLED: "${SWAGGER_ENABLED:-true}"
       DISPATCH_INTERVAL_MS: "${OUTBOX_POLL_INTERVAL_MS:-500}"
       DISPATCH_BATCH_SIZE: "${OUTBOX_BATCH_SIZE:-50}"
       MAX_RETRIES: "${OUTBOX_MAX_RETRIES:-5}"
-      PRUNE_AFTER_HOURS: "${OUTBOX_PRUNE_AFTER_HOURS:-24}"
+      PRUNE_AFTER_HOURS: "${OUTBOX_PRUNE_AFTER_HOURS:-48}"
       OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-ingestion-api}"
       OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-jaeger:4318}"
       METRICS_PORT: "${METRICS_PORT:-9090}"
@@ -79,32 +108,59 @@ services:
       - outbox
     restart: unless-stopped
 
-  consumer-worker:
-    build:
-      context: ..
-      dockerfile: build/Dockerfile
-      args:
-        SERVICE: consumer-worker
+  # One consumer-worker service per payment method (Phase 3 Track 1) — each
+  # sets PAYMENT_QUEUE so it binds to and drains exactly one queue. `make seed`/
+  # `seed-pix`/`seed-boleto`/`seed-transfer` post to ingestion-api, which fans
+  # out to whichever of these queues matches the payment's method.
+  consumer-pix:
+    <<: *consumer-worker-base
     environment:
-      DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@postgres:5432/${POSTGRES_DB:-outbox}?sslmode=disable"
-      RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
-      PREFETCH_COUNT: "${CONSUMER_PREFETCH:-10}"
-      MAX_DELIVERIES: "${RABBITMQ_MAX_REDELIVERIES:-5}"
-      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-consumer-worker}"
-      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-jaeger:4318}"
-      METRICS_PORT: "${CONSUMER_METRICS_PORT:-9091}"
+      <<: *consumer-worker-env
+      PAYMENT_QUEUE: "payments.pix.queue"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-consumer-worker}-pix"
+      METRICS_PORT: "9091"
     ports:
-      - "${CONSUMER_METRICS_PORT:-9091}:9091"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-      jaeger:
-        condition: service_started
-    networks:
-      - outbox
-    restart: unless-stopped
+      - "9091:9091"
+
+  consumer-boleto:
+    <<: *consumer-worker-base
+    environment:
+      <<: *consumer-worker-env
+      PAYMENT_QUEUE: "payments.boleto.queue"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-consumer-worker}-boleto"
+      METRICS_PORT: "9092"
+    ports:
+      - "9092:9092"
+
+  consumer-transfer:
+    <<: *consumer-worker-base
+    environment:
+      <<: *consumer-worker-env
+      PAYMENT_QUEUE: "payments.transfer.queue"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-consumer-worker}-transfer"
+      METRICS_PORT: "9093"
+    ports:
+      - "9093:9093"
+
+  consumer-cartao-credito:
+    <<: *consumer-worker-base
+    environment:
+      <<: *consumer-worker-env
+      PAYMENT_QUEUE: "payments.cartao_credito.queue"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-consumer-worker}-cartao-credito"
+      METRICS_PORT: "9094"
+    ports:
+      - "9094:9094"
+
+  consumer-cartao-debito:
+    <<: *consumer-worker-base
+    environment:
+      <<: *consumer-worker-env
+      PAYMENT_QUEUE: "payments.cartao_debito.queue"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-consumer-worker}-cartao-debito"
+      METRICS_PORT: "9095"
+    ports:
+      - "9095:9095"
 
 # ── Volumes & Networks ────────────────────────────────────────────────────────
 

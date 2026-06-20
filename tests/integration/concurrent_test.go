@@ -62,7 +62,7 @@ func TestConcurrentIngestion_FiftyUniquePayments_AllPublishedAndPersistedOnce(t 
 	defer cancelDispatch()
 	go dispatcher.Run(dispatchCtx)
 
-	consumer := newConsumer(20, 5)
+	consumer := newConsumer("PIX", 20, 5)
 	consumeCtx, cancelConsume := context.WithCancel(context.Background())
 	defer cancelConsume()
 	go func() { _ = consumer.Run(consumeCtx) }()

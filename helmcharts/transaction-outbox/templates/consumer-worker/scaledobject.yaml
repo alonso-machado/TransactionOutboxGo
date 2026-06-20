@@ -1,0 +1,25 @@
+{{- range .Values.paymentMethods }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: consumer-{{ .name }}
+  namespace: {{ $.Values.namespace }}
+  labels:
+    {{- include "transaction-outbox.labels" $ | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: consumer-{{ .name }}
+  minReplicaCount: {{ $.Values.consumerWorker.keda.minReplicaCount }} # scale to zero when idle
+  maxReplicaCount: {{ $.Values.consumerWorker.keda.maxReplicaCount }}
+  pollingInterval: {{ $.Values.consumerWorker.keda.pollingInterval }} # seconds between queue checks
+  cooldownPeriod: {{ $.Values.consumerWorker.keda.cooldownPeriod }} # seconds to wait before scaling down
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: http
+        queueName: {{ .queue }}
+        mode: QueueLength
+        value: {{ $.Values.consumerWorker.keda.queueLengthValue | quote }}
+        hostFromEnv: RABBITMQ_MANAGEMENT_URL
+{{- end }}

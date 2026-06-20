@@ -1,5 +1,5 @@
 SHELL        := /bin/bash
-COMPOSE_FILE := deployments/docker-compose.yml
+COMPOSE_FILE := docker-compose.yml
 COMPOSE      := podman compose -f $(COMPOSE_FILE)
 GO           := podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine
 
@@ -92,18 +92,30 @@ tail:
 
 ## ── Kubernetes (Track 4) ──────────────────────────────────────────────────────
 
-.PHONY: k8s-apply k8s-delete k8s-status
+.PHONY: k8s-apply k8s-delete k8s-status k8s-lint k8s-template
+
+# helmcharts/transaction-outbox is a Helm chart: one ingestion-api
+# Deployment/Service/HPA, plus one consumer-worker Deployment + KEDA
+# ScaledObject pair per entry in values.yaml's paymentMethods list (rendered
+# via {{ range }}, not hand-duplicated). Assumes `helm` and `kubectl` are on
+# PATH and pointed at the target cluster.
+CHART   := helmcharts/transaction-outbox
+RELEASE := transaction-outbox
+NS      := transaction-outbox
 
 k8s-apply:
-	kubectl apply -f k8s/namespace.yaml
-	kubectl apply -f k8s/configmap.yaml
-	kubectl apply -f k8s/secret.yaml
-	kubectl apply -f k8s/ingestion-api/
-	kubectl apply -f k8s/consumer-worker/
+	helm upgrade --install $(RELEASE) $(CHART) --namespace $(NS) --create-namespace
 
 k8s-delete:
-	kubectl delete -f k8s/ --recursive
+	helm uninstall $(RELEASE) --namespace $(NS)
 
 k8s-status:
-	kubectl get all -n transaction-outbox
-	kubectl get scaledobject -n transaction-outbox
+	helm status $(RELEASE) --namespace $(NS)
+	kubectl get all -n $(NS)
+	kubectl get scaledobject -n $(NS)
+
+k8s-lint:
+	helm lint $(CHART)
+
+k8s-template:
+	helm template $(RELEASE) $(CHART) --namespace $(NS)

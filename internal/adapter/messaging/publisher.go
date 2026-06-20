@@ -71,7 +71,7 @@ func (p *AMQPPublisher) Publish(ctx context.Context, msg *domain.OutboxMessage) 
 
 	span.SetAttributes(attribute.String("message_id", msg.IdempotencyKey))
 
-	err = ch.PublishWithContext(ctx, rmq.Exchange, rmq.RoutingKey, false, false, amqp.Publishing{
+	err = ch.PublishWithContext(ctx, rmq.Exchange, rmq.RoutingKeyFor(msg.PaymentMethod), false, false, amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		MessageId:    msg.IdempotencyKey,

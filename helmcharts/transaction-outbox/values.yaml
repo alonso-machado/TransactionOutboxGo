@@ -1,0 +1,96 @@
+namespace: transaction-outbox
+
+image:
+  ingestionApi: transaction-outbox-go/ingestion-api:latest
+  consumerWorker: transaction-outbox-go/consumer-worker:latest
+
+# Non-sensitive configuration shared by ingestion-api and consumer-worker,
+# rendered verbatim into the transaction-outbox-config ConfigMap.
+configMap:
+  data:
+    # ── ingestion-api ──────────────────────────────────────────────────────
+    HTTP_PORT: "8080"
+    DISPATCH_INTERVAL_MS: "500"
+    DISPATCH_BATCH_SIZE: "50"
+    MAX_RETRIES: "5"
+    PRUNE_AFTER_HOURS: "48"
+
+    # ── consumer-worker ─────────────────────────────────────────────────────
+    PREFETCH_COUNT: "10"
+    MAX_DELIVERIES: "5"
+
+    # ── Observability (Phase 2 Track 1 — OpenTelemetry) ─────────────────────
+    OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+    OTEL_SERVICE_NAME: "transaction-outbox"
+    # Default for ingestion-api. Each per-method consumer-worker Deployment
+    # (templates/consumer-worker/deployment.yaml) overrides this via its own
+    # env: entry — explicit env: takes precedence over envFrom: on a key
+    # collision, so this default never reaches those pods.
+    METRICS_PORT: "9090"
+
+    # ── API docs (Phase 2 Track 2 — Swagger) ────────────────────────────────
+    # Disabled in production; enable only in lower environments via override.
+    SWAGGER_ENABLED: "false"
+
+    # ── Messaging topology ───────────────────────────────────────────────────
+    RABBITMQ_MANAGEMENT_URL: "http://rabbitmq:15672"
+
+# PLACEHOLDER — do NOT use these values in any real environment. Real
+# DATABASE_URL / RABBITMQ_URL are injected by CI/CD (GitHub Actions secrets,
+# HashiCorp Vault, Sealed Secrets, etc.) at deploy time via
+# `--set secret.databaseUrl=... --set secret.rabbitmqUrl=...` or a values
+# override file — never commit real connection strings here. Plaintext here;
+# templates/secret.yaml base64-encodes them.
+secret:
+  databaseUrl: "CHANGE_ME"
+  rabbitmqUrl: "CHANGE_ME"
+
+ingestionApi:
+  replicas: 1
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  hpa:
+    minReplicas: 1
+    maxReplicas: 10
+    cpuUtilization: 70
+    memoryUtilization: 80
+
+consumerWorker:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  keda:
+    minReplicaCount: 0 # scale to zero when idle
+    maxReplicaCount: 10
+    pollingInterval: 15 # seconds between queue checks
+    cooldownPeriod: 60 # seconds to wait before scaling down
+    queueLengthValue: "1000" # 1 replica per 1000 messages
+
+# One Deployment + one KEDA ScaledObject is rendered per entry (see
+# templates/consumer-worker/). Adding a 6th payment method is a one-line
+# change here — no new template files needed.
+paymentMethods:
+  - name: pix
+    queue: payments.pix.queue
+    metricsPort: 9091
+  - name: boleto
+    queue: payments.boleto.queue
+    metricsPort: 9092
+  - name: transfer
+    queue: payments.transfer.queue
+    metricsPort: 9093
+  - name: cartao-credito
+    queue: payments.cartao_credito.queue
+    metricsPort: 9094
+  - name: cartao-debito
+    queue: payments.cartao_debito.queue
+    metricsPort: 9095

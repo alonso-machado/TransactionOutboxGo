@@ -122,6 +122,7 @@ func (uc *IngestPayment) Execute(ctx context.Context, req Request) (*Response, e
 		Headers:        req.Headers,
 		Status:         domain.OutboxStatusNew,
 		CreatedAt:      time.Now().UTC(),
+		PaymentMethod:  req.Method,
 	}
 
 	var created bool

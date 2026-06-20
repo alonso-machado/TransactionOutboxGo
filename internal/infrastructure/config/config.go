@@ -9,9 +9,13 @@ type Config struct {
 	DispatchInterval  int    `envconfig:"DISPATCH_INTERVAL_MS" default:"500"`
 	DispatchBatchSize int    `envconfig:"DISPATCH_BATCH_SIZE" default:"50"`
 	MaxRetries        int    `envconfig:"MAX_RETRIES" default:"5"`
-	PruneAfterHours   int    `envconfig:"PRUNE_AFTER_HOURS" default:"24"`
+	PruneAfterHours   int    `envconfig:"PRUNE_AFTER_HOURS" default:"48"`
 	PrefetchCount     int    `envconfig:"PREFETCH_COUNT" default:"10"`
 	MaxDeliveries     int    `envconfig:"MAX_DELIVERIES" default:"5"`
+	// PaymentQueue is consumer-worker-only. Not `required` here because Config
+	// is shared with ingestion-api, which never sets it — consumer-worker's
+	// main.go fails fast itself if this is empty or not a known queue.
+	PaymentQueue string `envconfig:"PAYMENT_QUEUE"`
 	OtelServiceName   string `envconfig:"OTEL_SERVICE_NAME" default:"transaction-outbox-go"`
 	OtelEndpoint      string `envconfig:"OTEL_EXPORTER_OTLP_ENDPOINT" default:"localhost:4318"`
 	MetricsPort       string `envconfig:"METRICS_PORT" default:"9090"`

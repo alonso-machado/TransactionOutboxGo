@@ -29,6 +29,7 @@ type OutboxMessage struct {
 	LastError      string
 	CreatedAt      time.Time
 	PublishedAt    *time.Time
+	PaymentMethod  string // e.g. "PIX" — drives the per-method routing key
 }
 
 // OutboxRepository is the port for the Outbox table. Enqueue reports

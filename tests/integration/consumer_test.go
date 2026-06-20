@@ -42,7 +42,7 @@ func publishRaw(t *testing.T, messageID string, body []byte, headers amqp.Table)
 	defer func() { _ = ch.Close() }()
 	require.NoError(t, ch.Confirm(false))
 	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
-	err = ch.PublishWithContext(context.Background(), rmq.Exchange, rmq.RoutingKey, false, false, amqp.Publishing{
+	err = ch.PublishWithContext(context.Background(), rmq.Exchange, rmq.RoutingKeyFor("PIX"), false, false, amqp.Publishing{
 		ContentType: "application/json",
 		MessageId:   messageID,
 		Body:        body,
@@ -71,7 +71,7 @@ func TestConsumer_DuplicateDelivery_DedupesViaUniqueConstraint(t *testing.T) {
 	publishRaw(t, msgID, body, nil)
 	publishRaw(t, msgID, body, nil) // duplicate delivery, same MessageId
 
-	consumer := newConsumer(10, 5)
+	consumer := newConsumer("PIX", 10, 5)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	go func() { _ = consumer.Run(ctx) }()
@@ -103,7 +103,7 @@ func TestConsumer_PoisonMessage_RoutesToDeadLetterQueue(t *testing.T) {
 	publishRaw(t, msgID, body, nil)
 
 	const maxDeliveries = 2
-	consumer := newConsumer(10, maxDeliveries)
+	consumer := newConsumer("PIX", 10, maxDeliveries)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	go func() { _ = consumer.Run(ctx) }()
@@ -111,7 +111,7 @@ func TestConsumer_PoisonMessage_RoutesToDeadLetterQueue(t *testing.T) {
 	ok := waitFor(t, 14*time.Second, func() bool {
 		return dlqDepth(t) >= 1
 	})
-	require.True(t, ok, fmt.Sprintf("expected poison message to land in %s", rmq.DLQ))
+	require.True(t, ok, fmt.Sprintf("expected poison message to land in %s", rmq.DLQFor("PIX")))
 	require.Equal(t, int64(0), countPayments())
 }
 
@@ -120,7 +120,7 @@ func dlqDepth(t *testing.T) int {
 	ch, err := suite.amqpConn.Channel()
 	require.NoError(t, err)
 	defer func() { _ = ch.Close() }()
-	q, err := ch.QueueDeclarePassive(rmq.DLQ, true, false, false, false, nil)
+	q, err := ch.QueueDeclarePassive(rmq.DLQFor("PIX"), true, false, false, false, nil)
 	require.NoError(t, err)
 	return q.Messages
 }

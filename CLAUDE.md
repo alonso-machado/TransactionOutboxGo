@@ -58,8 +58,8 @@ interfaces.
 | RabbitMQ connection + topology declaration | `internal/infrastructure/rabbitmq/` |
 | Composition root / DI (ingestion-api) | `cmd/ingestion-api/main.go` |
 | Composition root / DI (consumer-worker) | `cmd/consumer-worker/main.go` |
-| Docker Compose (local dev) | `deployments/docker-compose.yml` |
-| Multi-stage Dockerfile (ARG SERVICE) | `build/Dockerfile` |
+| Docker Compose (local dev) | `docker-compose.yml` |
+| Multi-stage Dockerfile (ARG SERVICE) | `Dockerfile` |
 
 ---
 

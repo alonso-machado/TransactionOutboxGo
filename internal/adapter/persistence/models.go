@@ -19,6 +19,7 @@ type OutboxMessageModel struct {
 	LastError      string
 	CreatedAt      time.Time
 	PublishedAt    *time.Time
+	PaymentMethod  string `gorm:"column:payment_method;not null"`
 }
 
 func (OutboxMessageModel) TableName() string { return "outbox_messages" }

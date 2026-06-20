@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	rmq "github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/rabbitmq"
 )
 
 // ProviderDTO identifies the upstream payment provider that emitted this event.
@@ -104,11 +106,17 @@ func (d BoletoDetailsDTO) Validate() error {
 // envelope checks. TRANSFER is an internally-originated method (no external
 // provider event drives it) and requires both parties to be known; PIX and
 // BOLETO require their respective sibling detail object, looked up in raw by
-// the lowercased method name. Unknown methods pass through unvalidated —
-// that's the point of the polymorphic MethodDetails design: new methods
-// don't require a code change here.
+// the lowercased method name. A method outside rmq.Methods is rejected here:
+// since Phase 3 routes by method onto a dedicated queue, a method with no
+// bound queue would be published to the topic exchange, match no binding,
+// and be silently dropped — rejecting at ingest avoids that black hole.
 func (dto PaymentEventRequestDTO) ValidateMethod(raw map[string]json.RawMessage) error {
-	switch strings.ToUpper(dto.Payment.Method) {
+	method := strings.ToUpper(dto.Payment.Method)
+	if !rmq.IsValidMethod(method) {
+		return fmt.Errorf("payment.method %q is not supported (expected one of: %v)", dto.Payment.Method, rmq.Methods)
+	}
+
+	switch method {
 	case "PIX":
 		details, ok := raw["pix"]
 		if !ok {

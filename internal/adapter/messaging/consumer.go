@@ -25,12 +25,16 @@ const retryCountHeader = "x-retry-count"
 type AMQPConsumer struct {
 	conn          *amqp.Connection
 	processMsg    *consume.ProcessMessage
+	method        string
 	prefetch      int
 	maxDeliveries int
 }
 
-func NewConsumer(conn *amqp.Connection, processMsg *consume.ProcessMessage, prefetch, maxDeliveries int) *AMQPConsumer {
-	return &AMQPConsumer{conn: conn, processMsg: processMsg, prefetch: prefetch, maxDeliveries: maxDeliveries}
+// NewConsumer builds a consumer bound to method's queue (e.g. "PIX" ->
+// payments.pix.queue) — each consumer-worker instance consumes exactly one
+// method's queue, decoupling payment methods from consumer scaling.
+func NewConsumer(conn *amqp.Connection, processMsg *consume.ProcessMessage, method string, prefetch, maxDeliveries int) *AMQPConsumer {
+	return &AMQPConsumer{conn: conn, processMsg: processMsg, method: method, prefetch: prefetch, maxDeliveries: maxDeliveries}
 }
 
 func (c *AMQPConsumer) Run(ctx context.Context) error {
@@ -40,11 +44,15 @@ func (c *AMQPConsumer) Run(ctx context.Context) error {
 	}
 	defer func() { _ = ch.Close() }()
 
+	if err := rmq.DeclareQueue(ch, c.method); err != nil {
+		return fmt.Errorf("declare queue: %w", err)
+	}
+
 	if err := ch.Qos(c.prefetch, 0, false); err != nil {
 		return err
 	}
 
-	deliveries, err := ch.Consume(rmq.Queue, "", false, false, false, false, nil)
+	deliveries, err := ch.Consume(rmq.QueueFor(c.method), "", false, false, false, false, nil)
 	if err != nil {
 		return err
 	}
@@ -132,7 +140,7 @@ func (c *AMQPConsumer) requeueWithRetryCount(d amqp.Delivery, retryCount int) er
 	}
 	headers[retryCountHeader] = int32(retryCount)
 
-	err = ch.PublishWithContext(context.Background(), rmq.Exchange, rmq.RoutingKey, false, false, amqp.Publishing{
+	err = ch.PublishWithContext(context.Background(), rmq.Exchange, rmq.RoutingKeyFor(c.method), false, false, amqp.Publishing{
 		ContentType:  d.ContentType,
 		DeliveryMode: amqp.Persistent,
 		MessageId:    d.MessageId,

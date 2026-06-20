@@ -118,15 +118,18 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// truncateAll resets both tables and purges queues between tests, preserving
-// the shared container pair and RabbitMQ topology for speed.
+// truncateAll resets both tables and purges every method's queue + DLQ
+// between tests, preserving the shared container pair and RabbitMQ topology
+// for speed.
 func truncateAll(t *testing.T) {
 	t.Helper()
 	if err := suite.db.Exec("TRUNCATE TABLE payments, outbox_messages").Error; err != nil {
 		t.Fatalf("truncate tables: %v", err)
 	}
-	purgeQueue(t, rmq.Queue)
-	purgeQueue(t, rmq.DLQ)
+	for _, method := range rmq.Methods {
+		purgeQueue(t, rmq.QueueFor(method))
+		purgeQueue(t, rmq.DLQFor(method))
+	}
 }
 
 func purgeQueue(t *testing.T, name string) {
@@ -180,12 +183,12 @@ func amqpDial(t *testing.T) (*amqp.Connection, error) {
 }
 
 // newConsumer wires a real AMQPConsumer + ProcessMessage against the shared
-// DB and AMQP connection.
-func newConsumer(prefetch, maxDeliveries int) *messaging.AMQPConsumer {
+// DB and AMQP connection, bound to method's queue.
+func newConsumer(method string, prefetch, maxDeliveries int) *messaging.AMQPConsumer {
 	paymentRepo := persistence.NewPaymentRepository(suite.db)
 	uow := persistence.NewUnitOfWork(suite.db)
 	processMsg := consume.New(paymentRepo, uow)
-	return messaging.NewConsumer(suite.amqpConn, processMsg, prefetch, maxDeliveries)
+	return messaging.NewConsumer(suite.amqpConn, processMsg, method, prefetch, maxDeliveries)
 }
 
 // waitFor polls cond until it returns true or timeout elapses, returning the

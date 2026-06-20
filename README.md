@@ -300,8 +300,8 @@ TransactionOutboxGo/
 │   ├── usecase/                # ingest (IngestPayment) / outbox (DispatchOutbox) / consume (ProcessMessage)
 │   ├── adapter/                # http · persistence · messaging
 │   └── infrastructure/         # config · database · rabbitmq
-├── deployments/docker-compose.yml
-├── build/Dockerfile
+├── docker-compose.yml
+├── Dockerfile
 └── Makefile
 ```
 
@@ -320,9 +320,9 @@ make tidy     # go mod tidy
 make lint     # golangci-lint run ./...
 
 # Podman Compose — starts Postgres + RabbitMQ + both services
-make up       # podman compose -f deployments/docker-compose.yml up --build -d
+make up       # podman compose -f docker-compose.yml up --build -d
 make logs     # tail logs from all services
-make down     # podman compose -f deployments/docker-compose.yml down -v
+make down     # podman compose -f docker-compose.yml down -v
 make seed     # curl a sample POST to the ingestion-api
 ```
 
@@ -353,7 +353,7 @@ Expect `201 Created` with a `paymentId`, `idempotencyKey`, and `status: "accepte
   `payments`.
 - **Idempotency:** repeat the same `curl` → outbox response comes back
   `status: "duplicate"`; still a single `payments` row.
-- **Loss resistance:** `podman compose -f deployments/docker-compose.yml stop rabbitmq`,
+- **Loss resistance:** `podman compose -f docker-compose.yml stop rabbitmq`,
   send a request (still `201`, outbox row stays `NEW`), then restart RabbitMQ →
   `DispatchOutbox` drains the backlog and the consumer persists it.
 
