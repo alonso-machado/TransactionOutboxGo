@@ -10,10 +10,10 @@ configMap:
   data:
     # ── ingestion-api ──────────────────────────────────────────────────────
     HTTP_PORT: "8080"
-    DISPATCH_INTERVAL_MS: "500"
-    DISPATCH_BATCH_SIZE: "50"
-    MAX_RETRIES: "5"
-    PRUNE_AFTER_HOURS: "48"
+    OUTBOX_DISPATCH_INTERVAL_MS: "500"
+    OUTBOX_DISPATCH_BATCH_SIZE: "50"
+    OUTBOX_MAX_RETRIES: "5"
+    OUTBOX_PRUNE_AFTER_HOURS: "48"
 
     # ── consumer-worker ─────────────────────────────────────────────────────
     PREFETCH_COUNT: "10"
