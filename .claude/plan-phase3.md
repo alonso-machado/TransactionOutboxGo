@@ -16,7 +16,7 @@ Five tracks. Recommended execution order — each builds on the previous:
 | 1 | **Per-method RabbitMQ queues** | The routing/topology change is the structural core of Phase 3; everything else (consumers, KEDA, CI, infra) targets the new shape |
 | 2 | **Card payment methods + PII** | New methods (`CARTAO_CREDITO`, `CARTAO_DEBITO`) flow through the per-method queues from track 1 and add a card-number PII surface |
 | 3 | **GitHub Actions CI/CD** | Build → unit tests (gate) → golangci-lint (gate) → optional TestContainers — locks quality before any deploy |
-| 4 | **Pulumi / AWS (EKS)** | Provision the cloud target the CI pipeline deploys to; reuses the K8s + KEDA manifests from Phase 2 |
+| 4 | **Pulumi / AWS (EKS)** | Provision the cloud target the CI pipeline deploys to; installs the `helmcharts/transaction-outbox` chart (already built during Track 1) onto it |
 | 5 | **Cross-cutting adjustments** | Tests, docs, config and observability updates that span the tracks |
 | 6 | **k6 load tests** | Run last — three scripts: P95/P99 latency baseline (pinned 1/queue), autoscaling test (KEDA `min 0`/`max 10`, scale-to-zero), and a consumer-worker test (xk6-amqp publish → DB observe). Needs tracks 1–2 and a deployed target |
 
@@ -375,23 +375,74 @@ jobs:
 
 ---
 
-## Track 4 — Pulumi (AWS / EKS)
+## Track 4 — Helm Chart + Pulumi (AWS / EKS)
+
+> **Status note:** the raw Phase 2 `k8s/` manifests were superseded *during*
+> Phase 3 Track 1 by a proper Helm chart at `helmcharts/transaction-outbox/` —
+> this happened organically while wiring the per-method consumer
+> Deployments/ScaledObjects (one template, looped over a `paymentMethods` list
+> in `values.yaml`, rather than N hand-written manifest files). So Track 4's
+> "workloads" half is **already done**; what's left of Track 4 is purely the
+> Pulumi/AWS provisioning that installs this chart onto a real EKS cluster.
+> Everywhere below that used to say "the Phase 2 `k8s/` manifests" now says
+> "the `helmcharts/transaction-outbox` chart."
 
 ### Goal
 
-Provision the AWS target the CI pipeline deploys to, as code. Reuse the Phase 2
-K8s + KEDA manifests rather than re-authoring them — Pulumi stands up the cluster
-and managed dependencies, installs KEDA, and applies (or templates) the existing
-`k8s/` manifests.
+Provision the AWS target the CI pipeline deploys to, as code. Reuse the
+existing `helmcharts/transaction-outbox` Helm chart rather than re-authoring
+the workload manifests — Pulumi stands up the cluster and managed
+dependencies, installs KEDA, then installs this chart via `pulumi-kubernetes`'
+`helm.Release`/`helm.Chart` (local chart path, not a kustomize/ConfigGroup
+apply of raw YAML as originally sketched).
 
 ### Why EKS (not ECS)
 
-Phase 2 already built `k8s/` manifests **and KEDA ScaledObjects**. KEDA is a
-Kubernetes-native autoscaler — it does not run on ECS. The per-method KEDA scaling
-from Track 1 is the whole point of Phase 3's queue split, so the AWS target must
-be Kubernetes ⇒ **EKS**. (ECS Fargate would mean re-implementing queue-depth
-autoscaling with Application Auto Scaling + custom CloudWatch metrics, discarding
-the KEDA work — rejected.)
+The chart already declares **KEDA `ScaledObject`s** (one per payment method,
+templated from `values.yaml`'s `paymentMethods` list — see
+`templates/consumer-worker/scaledobject.yaml`). KEDA is a Kubernetes-native
+autoscaler — it does not run on ECS. The per-method KEDA scaling from Track 1
+is the whole point of Phase 3's queue split, so the AWS target must be
+Kubernetes ⇒ **EKS**. (ECS Fargate would mean re-implementing queue-depth
+autoscaling with Application Auto Scaling + custom CloudWatch metrics,
+discarding the KEDA work and the chart that already wires it — rejected.)
+
+### Network & Security Boundary (the most important decision in this track)
+
+**`ingestion-api` is the only component reachable from the public internet.
+Everything else — `consumer-worker`, Amazon MQ (RabbitMQ), and RDS Postgres —
+is 100% isolated inside the AWS account, reachable only from within the VPC,
+never from the web.** Concretely:
+
+- **`ingestion-api`** gets an internet-facing NLB (`Service.type: LoadBalancer`,
+  `service.beta.kubernetes.io/aws-load-balancer-internal: "false"`) — anyone on
+  the web can reach it on its HTTP port. This is the single front door.
+- **`consumer-worker`** has **no Kubernetes Service at all** (the chart never
+  defined one for it) — there is nothing to expose, by construction. It only
+  ever *consumes* from its own RabbitMQ queue and writes to Postgres; nothing
+  calls it, so it needs no inbound path, public or private.
+- **Amazon MQ (RabbitMQ) and RDS Postgres** are both `PubliclyAccessible: false`
+  and sit behind a dedicated security group whose **only ingress rule sources
+  from the EKS worker-node security group** — not the VPC CIDR, not "0.0.0.0/0",
+  literally just the node SG ID. Nothing outside the cluster's own nodes, and
+  nothing on the internet, can open a connection to either.
+- **Both EKS node groups run in private subnets with no public IPs**
+  (`NodeAssociatePublicIpAddress: false`) — including the ingestion-api node
+  group. Internet exposure happens *only* at the Service/LoadBalancer layer
+  (a public-subnet NLB targeting private-subnet pods); no node, including the
+  one running ingestion-api, ever has a public IP of its own.
+- **ingestion-api's blast radius stops at the broker.** It talks to Amazon MQ
+  to relay the outbox (and to Postgres only to read/write the outbox table —
+  see CLAUDE.md: ingestion-api never writes the `payments` table). It has no
+  path to `consumer-worker` and no reason to: the broker is the only thing
+  connecting the two halves of the pipeline, and that connection is itself
+  locked to the node security group, not exposed.
+
+This is enforced in three places, not just documented: `cluster.go` (two
+private-subnet-only node groups), `data.go` (the node-SG-only security group
+on RDS + Amazon MQ), and `workloads.go` (only `ingestionApi.service.type` is
+ever set to `LoadBalancer`; `consumerWorker` gets no equivalent override
+because the chart has no Service template for it to override).
 
 ### Decisions
 
@@ -409,22 +460,28 @@ the KEDA work — rejected.)
   | Registry | **ECR** repos: `ingestion-api`, `consumer-worker` | CI pushes SHA-tagged images here (Track 3) |
   | Database | **RDS PostgreSQL 17** | Multi-AZ in prod; security group allows EKS nodes only |
   | Broker | **Amazon MQ for RabbitMQ** | Managed; exposes the management HTTP API that KEDA's `rabbitmq` trigger needs (matches `scaledobject.yaml`'s `protocol: http`). **Decision: Amazon MQ over SQS** — see below |
-  | Autoscaler | **KEDA** via Helm release | `pulumi-kubernetes` `helm.Release` of the KEDA chart into the cluster |
-  | Secrets | **AWS Secrets Manager** (DB DSN, RabbitMQ mgmt URL) | Injected into pods via env / External Secrets; replaces the placeholder `k8s/secret.yaml` |
-  | Workloads | The Phase 2 `k8s/` manifests | Applied via `pulumi-kubernetes` `ConfigGroup`/`kustomize`, **one consumer Deployment + ScaledObject per method** (Track 1) |
-- **Per-method consumer deployments:** Track 1 turned one consumer into N. Pulumi
-  generates the N Deployments + N KEDA ScaledObjects by looping over the `Methods`
-  list — each Deployment sets `PAYMENT_QUEUE=payments.<method>.queue` and its
-  ScaledObject's `queueName` to the same, so each method scales independently
-  (incl. scale-to-zero). This is the cloud realization of the Phase 3 goal.
-- **KEDA tuning per method (Phase 3 values):** every per-method `ScaledObject` is
-  set to **`minReplicaCount: 0`** (scale-to-zero when the queue is idle),
-  **`maxReplicaCount: 10`** (hard cap of 10 pods per queue), and a RabbitMQ
-  `QueueLength` trigger with **`value: "1000"`** — i.e. KEDA targets ~1000 queued
-  messages per replica, so a queue must climb past 1000 before a 2nd pod is added,
-  and it tops out at 10 pods (≈10 000+ backlog). These supersede the Phase 2
-  placeholder (`max 20`, `value 100`). This is the configuration the autoscaling
-  k6 test (Track 6, scenario 2) exercises.
+  | Autoscaler | **KEDA** via Helm release | `pulumi-kubernetes` `helm.Release` of the upstream KEDA chart into the cluster (the *operator*, distinct from our own app chart) |
+  | Secrets | **AWS Secrets Manager** (DB DSN, RabbitMQ mgmt URL) | Injected via `--set secret.databaseUrl=...`/`--set secret.rabbitmqUrl=...` on the `helm.Release` below (the chart's own `templates/secret.yaml` base64-encodes them) — replaces the chart's `CHANGE_ME` placeholder values |
+  | Workloads | **`helmcharts/transaction-outbox`** (already built) | Installed via `pulumi-kubernetes` `helm.Release` pointing at the local chart path; **no Pulumi-side looping needed** — the chart's own `paymentMethods` list in `values.yaml` already renders one consumer Deployment + ScaledObject per method (Track 1) |
+- **Per-method consumer deployments — already solved by the chart, not by
+  Pulumi.** The original plan had Pulumi loop over `rmq.Methods` to generate N
+  Deployments + N ScaledObjects. That looping already happened inside the Helm
+  chart (`templates/consumer-worker/deployment.yaml` and `scaledobject.yaml`,
+  both `{{- range .Values.paymentMethods }}`), so Pulumi's job shrinks to: set
+  `image.ingestionApi`/`image.consumerWorker` to the CI-built ECR tags and
+  `secret.databaseUrl`/`secret.rabbitmqUrl` to the real Amazon MQ/RDS
+  endpoints, then `helm.Release` the chart as-is. Adding a 6th payment method
+  is still a one-line `values.yaml` change — Pulumi doesn't need to know the
+  method list at all.
+- **KEDA tuning per method (Phase 3 values) — already in the chart.** The
+  chart's `values.yaml` already sets `consumerWorker.keda.minReplicaCount: 0`
+  (scale-to-zero when idle), `maxReplicaCount: 10` (hard cap of 10 pods per
+  queue), and `queueLengthValue: "1000"` (1 replica per ~1000 queued
+  messages) — these supersede the Phase 2 placeholder (`max 20`, `value 100`)
+  and are exactly what the chart's `scaledobject.yaml` template renders into
+  each `ScaledObject`. Pulumi inherits this for free by installing the chart
+  unmodified; only override it via `--set` for the k6 pin/unpin scenarios
+  (Track 6).
 - **Amazon MQ vs SQS (decided: Amazon MQ):** SQS is cheaper (serverless, ~zero
   cost when idle, native DLQ redrive, native KEDA `aws-sqs-queue` scaler), but it
   is **not AMQP** — adopting it means **rewriting the entire `adapter/messaging` +
@@ -437,8 +494,8 @@ the KEDA work — rejected.)
   cost becomes the priority over keeping the RabbitMQ showcase.
 - **Amazon MQ vs RabbitMQ-on-EKS:** within the RabbitMQ path, managed Amazon MQ is
   chosen for the dev path (less to operate, native mgmt API for KEDA). The
-  RabbitMQ Cluster Operator on EKS is noted as the prod-grade alternative (matches
-  `k8s/rabbitmq/NOTE.md`) but not built now.
+  RabbitMQ Cluster Operator on EKS is noted as the prod-grade alternative but not
+  built now.
 
 ### File structure
 
@@ -452,8 +509,8 @@ infra/
     ├── network.go                 # VPC/subnets
     ├── cluster.go                 # EKS + node group + ECR
     ├── data.go                    # RDS Postgres + Amazon MQ RabbitMQ + Secrets Manager
-    ├── keda.go                    # KEDA Helm release
-    ├── workloads.go               # apply k8s/ manifests; generate per-method consumer Deployment+ScaledObject
+    ├── keda.go                    # KEDA operator Helm release
+    ├── workloads.go               # helm.Release of ../../helmcharts/transaction-outbox with image tags + secret values set
     └── README.md                  # how to `pulumi up`, required config/secrets, AWS creds
 ```
 
@@ -498,8 +555,10 @@ infra-destroy:
 
 ### Verification
 
-1. `make infra-preview` → Pulumi shows the planned VPC/EKS/RDS/Amazon MQ graph.
-2. `make infra-up` (dev) → cluster `ACTIVE`, `kubectl get nodes` ready.
+1. `make infra-preview` → Pulumi shows the planned VPC/EKS/RDS/Amazon MQ graph
+   plus the `helmcharts/transaction-outbox` release.
+2. `make infra-up` (dev) → cluster `ACTIVE`, `kubectl get nodes` ready, `helm
+   list -n transaction-outbox` shows the chart deployed.
 3. `kubectl get scaledobject -n transaction-outbox` → one per method, `READY=True`.
 4. CI merge to `main` → images in ECR → `deploy` job's `pulumi up` rolls out the
    new SHA → pods `Running`.

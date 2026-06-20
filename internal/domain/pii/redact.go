@@ -1,9 +1,9 @@
 // Package pii masks the personally-identifiable fields that can appear in
-// a payment payload — boleto.payerDocument (CPF/CNPJ), boleto.barcode, and
-// pix.endToEndId/txid — before they reach a log line, error response, or
-// trace span. It has zero framework dependencies so usecase and adapter
-// code can both call it without breaking the Clean Architecture dependency
-// rule.
+// a payment payload — boleto.payerDocument (CPF/CNPJ), boleto.barcode,
+// pix.endToEndId/txid, and cardNumber (PAN) — before they reach a log line,
+// error response, or trace span. It has zero framework dependencies so
+// usecase and adapter code can both call it without breaking the Clean
+// Architecture dependency rule.
 package pii
 
 import (
@@ -20,12 +20,13 @@ var sensitiveKeys = map[string]struct{}{
 	"barcode":       {},
 	"endtoendid":    {},
 	"txid":          {},
+	"cardnumber":    {},
 }
 
 // keyValuePattern catches the same field names when they show up in plain
 // text (e.g. inside a Go error string) rather than structured JSON, in the
 // form `key: value`, `key=value`, or `"key":"value"`.
-var keyValuePattern = regexp.MustCompile(`(?i)\b(payerDocument|barcode|endToEndId|txid)("?\s*[:=]\s*"?)([^",}\s]+)`)
+var keyValuePattern = regexp.MustCompile(`(?i)\b(payerDocument|barcode|endToEndId|txid|cardNumber)("?\s*[:=]\s*"?)([^",}\s]+)`)
 
 // Redact masks known PII fields wherever they appear in s. If s is a JSON
 // object/array, matching keys are masked structurally; otherwise (or for

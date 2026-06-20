@@ -78,6 +78,20 @@ func TestRedactJSON_InvalidJSON_ReturnedUnchanged(t *testing.T) {
 	}
 }
 
+func TestRedact_CardNumber_MaskedInJSONAndText(t *testing.T) {
+	inJSON := `{"cardNumber":"4111111111111111","cardType":"CREDIT"}`
+	gotJSON := Redact(inJSON)
+	if strings.Contains(gotJSON, "4111111111111111") {
+		t.Fatalf("expected cardNumber value to be masked in JSON, got %q", gotJSON)
+	}
+
+	inText := "cardNumber: 4111111111111111"
+	gotText := Redact(inText)
+	if strings.Contains(gotText, "4111111111111111") {
+		t.Fatalf("expected cardNumber value to be masked in text, got %q", gotText)
+	}
+}
+
 func TestRedactJSON_KeyMatchIsCaseInsensitive(t *testing.T) {
 	in := []byte(`{"PAYERDOCUMENT":"12345678900"}`)
 	out := RedactJSON(in)

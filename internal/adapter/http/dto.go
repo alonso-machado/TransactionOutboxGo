@@ -102,6 +102,58 @@ func (d BoletoDetailsDTO) Validate() error {
 	}
 }
 
+// CardDetailsDTO is the "cartao_credito"/"cartao_debito" sibling object
+// required when payment.method is one of the card methods. cardNumber is
+// the raw PAN as received from the client — it is masked to last-4 at the
+// HTTP boundary (see maskPAN in card.go) before it ever reaches ingest, so
+// the full number is never persisted, published, or logged.
+type CardDetailsDTO struct {
+	CardNumber string `json:"cardNumber"`
+	CardType   string `json:"cardType"`
+	CardIssuer string `json:"cardIssuer"`
+}
+
+var cardIssuers = map[string]struct{}{
+	"VISA":       {},
+	"MASTERCARD": {},
+	"AMERICAN":   {},
+}
+
+// cardTypeForMethod maps a card method to the cardType it must declare.
+var cardTypeForMethod = map[string]string{
+	"CARTAO_CREDITO": "CREDIT",
+	"CARTAO_DEBITO":  "DEBIT",
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// Validate checks card.cardNumber/cardType/cardIssuer, including that
+// cardType is consistent with method (CARTAO_CREDITO ⇒ CREDIT,
+// CARTAO_DEBITO ⇒ DEBIT). cardNumber's value is never echoed in an error.
+func (d CardDetailsDTO) Validate(method string) error {
+	switch {
+	case !isDigits(d.CardNumber) || len(d.CardNumber) < 13 || len(d.CardNumber) > 19:
+		return errors.New("card.cardNumber must be 13-19 digits")
+	case d.CardType != cardTypeForMethod[method]:
+		return fmt.Errorf("card.cardType must be %q for method %s", cardTypeForMethod[method], method)
+	default:
+		if _, ok := cardIssuers[d.CardIssuer]; !ok {
+			return errors.New("card.cardIssuer must be one of VISA, MASTERCARD, AMERICAN")
+		}
+		return nil
+	}
+}
+
 // ValidateMethod applies method-specific rules on top of Validate's generic
 // envelope checks. TRANSFER is an internally-originated method (no external
 // provider event drives it) and requires both parties to be known; PIX and
@@ -146,6 +198,17 @@ func (dto PaymentEventRequestDTO) ValidateMethod(raw map[string]json.RawMessage)
 		default:
 			return nil
 		}
+	case "CARTAO_CREDITO", "CARTAO_DEBITO":
+		sibling := strings.ToLower(method)
+		details, ok := raw[sibling]
+		if !ok {
+			return fmt.Errorf("%s details are required for method %s", sibling, method)
+		}
+		var card CardDetailsDTO
+		if err := json.Unmarshal(details, &card); err != nil {
+			return fmt.Errorf("invalid %s details: %w", sibling, err)
+		}
+		return card.Validate(method)
 	default:
 		return nil
 	}

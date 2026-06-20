@@ -1,0 +1,10 @@
+name: transaction-outbox
+runtime: go
+description: >-
+  AWS infrastructure (EKS, RDS Postgres, Amazon MQ for RabbitMQ, ECR, KEDA)
+  for the Transaction Outbox Go monorepo. Installs the existing
+  helmcharts/transaction-outbox chart onto the provisioned cluster — this
+  program does not author Kubernetes workload manifests itself.
+config:
+  aws:region:
+    description: AWS region to provision into

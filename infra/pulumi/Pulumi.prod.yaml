@@ -1,0 +1,17 @@
+config:
+  aws:region: us-east-1
+  transaction-outbox:environment: prod
+  transaction-outbox:nodeInstanceType: t3.large
+  transaction-outbox:nodeDesiredCapacity: 3
+  transaction-outbox:nodeMinCapacity: 2
+  transaction-outbox:nodeMaxCapacity: 10
+  transaction-outbox:dbInstanceClass: db.t3.medium
+  transaction-outbox:dbMultiAz: true
+  transaction-outbox:rabbitmqInstanceType: mq.m5.large
+  transaction-outbox:imageTag: latest
+  # dbPassword / rabbitmqPassword are NOT set here — they must be added as
+  # encrypted secrets before `pulumi up` can run:
+  #   pulumi config set --secret dbPassword <...> --stack prod
+  #   pulumi config set --secret rabbitmqPassword <...> --stack prod
+  # `pulumi config set --secret` appends an encrypted entry to this file;
+  # never hand-write a plaintext value under these keys.

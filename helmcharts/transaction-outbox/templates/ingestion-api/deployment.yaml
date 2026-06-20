@@ -16,6 +16,10 @@ spec:
       labels:
         app: ingestion-api
     spec:
+      {{- with .Values.ingestionApi.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: ingestion-api
           # CI tags images by git SHA (see Dockerfile ARG SERVICE=ingestion-api);

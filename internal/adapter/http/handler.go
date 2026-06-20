@@ -79,6 +79,15 @@ func (h *PaymentHandler) Handle(c *gin.Context) {
 	}
 
 	methodDetails := raw[strings.ToLower(dto.Payment.Method)]
+	switch strings.ToUpper(dto.Payment.Method) {
+	case "CARTAO_CREDITO", "CARTAO_DEBITO":
+		masked, err := maskPAN(methodDetails)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": pii.Redact(err.Error())})
+			return
+		}
+		methodDetails = masked
+	}
 
 	headers := make(map[string]string, len(c.Request.Header))
 	for k := range c.Request.Header {

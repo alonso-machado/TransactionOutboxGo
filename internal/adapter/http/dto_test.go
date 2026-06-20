@@ -139,3 +139,78 @@ func TestValidateMethod_KnownMethodsCaseInsensitive(t *testing.T) {
 		t.Fatalf("expected lowercase known method to validate, got %v", err)
 	}
 }
+
+func TestValidateMethod_CartaoCredito_RequiresSiblingObject(t *testing.T) {
+	dto := validDTO()
+	dto.Payment.Method = "CARTAO_CREDITO"
+
+	if err := dto.ValidateMethod(map[string]json.RawMessage{}); err == nil {
+		t.Fatal("expected error when cartao_credito details are missing")
+	}
+
+	raw := map[string]json.RawMessage{
+		"cartao_credito": json.RawMessage(`{"cardNumber":"4111111111111111","cardType":"CREDIT","cardIssuer":"VISA"}`),
+	}
+	if err := dto.ValidateMethod(raw); err != nil {
+		t.Fatalf("expected valid card details to pass, got %v", err)
+	}
+}
+
+func TestValidateMethod_CartaoCredito_TypeMismatchRejected(t *testing.T) {
+	dto := validDTO()
+	dto.Payment.Method = "CARTAO_CREDITO"
+	raw := map[string]json.RawMessage{
+		"cartao_credito": json.RawMessage(`{"cardNumber":"4111111111111111","cardType":"DEBIT","cardIssuer":"VISA"}`),
+	}
+	if err := dto.ValidateMethod(raw); err == nil {
+		t.Fatal("expected cardType/method mismatch to be rejected")
+	}
+}
+
+func TestValidateMethod_CartaoCredito_IssuerNotInEnumRejected(t *testing.T) {
+	dto := validDTO()
+	dto.Payment.Method = "CARTAO_CREDITO"
+	raw := map[string]json.RawMessage{
+		"cartao_credito": json.RawMessage(`{"cardNumber":"4111111111111111","cardType":"CREDIT","cardIssuer":"ELO"}`),
+	}
+	if err := dto.ValidateMethod(raw); err == nil {
+		t.Fatal("expected issuer outside the enum to be rejected")
+	}
+}
+
+func TestValidateMethod_CartaoDebito_RequiresDebitType(t *testing.T) {
+	dto := validDTO()
+	dto.Payment.Method = "CARTAO_DEBITO"
+	raw := map[string]json.RawMessage{
+		"cartao_debito": json.RawMessage(`{"cardNumber":"4111111111111111","cardType":"DEBIT","cardIssuer":"MASTERCARD"}`),
+	}
+	if err := dto.ValidateMethod(raw); err != nil {
+		t.Fatalf("expected valid debit card details to pass, got %v", err)
+	}
+}
+
+func TestCardDetailsDTO_CardNumberDigitLength(t *testing.T) {
+	cases := []struct {
+		name    string
+		number  string
+		wantErr bool
+	}{
+		{"too short", "123456789012", true},
+		{"too long", "12345678901234567890", true},
+		{"non-numeric", "411111111111111a", true},
+		{"valid 16 digits", "4111111111111111", false},
+		{"valid 13 digits", "1234567890123", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := CardDetailsDTO{CardNumber: tc.number, CardType: "CREDIT", CardIssuer: "VISA"}
+			err := d.Validate("CARTAO_CREDITO")
+			if tc.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+		})
+	}
+}

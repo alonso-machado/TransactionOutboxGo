@@ -23,6 +23,10 @@ spec:
       labels:
         app: consumer-{{ .name }}
     spec:
+      {{- with $.Values.consumerWorker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: consumer-worker
           # CI tags images by git SHA (see Dockerfile ARG SERVICE=consumer-worker);

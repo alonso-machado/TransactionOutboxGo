@@ -47,6 +47,13 @@ secret:
 
 ingestionApi:
   replicas: 1
+  # Empty by default (schedules on any node) — the cloud target
+  # (infra/pulumi/workloads.go) overrides this to pin ingestion-api pods to
+  # its own dedicated node group, separate from consumer-worker's.
+  nodeSelector: {}
+  service:
+    type: ClusterIP
+    annotations: {}
   resources:
     requests:
       cpu: "100m"
@@ -61,6 +68,10 @@ ingestionApi:
     memoryUtilization: 80
 
 consumerWorker:
+  # Empty by default — the cloud target (infra/pulumi/workloads.go)
+  # overrides this to pin consumer-worker pods to its own dedicated node
+  # group, separate from ingestion-api's.
+  nodeSelector: {}
   resources:
     requests:
       cpu: "100m"
