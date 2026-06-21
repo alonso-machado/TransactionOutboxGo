@@ -1,0 +1,164 @@
+name: CI - ingestion-api
+
+# Independent of consumer-worker.yml on purpose — see .github/workflows/README.md
+# for why this is two separate workflow files rather than one matrixed
+# workflow. Gate order: build -> lint -> unit-tests -> upload -> deploy.
+# integration-tests is an optional, flag-gated safety measure off the gate
+# path — it never blocks upload/deploy.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "internal/**"
+      - "cmd/ingestion-api/**"
+      - "go.mod"
+      - "go.sum"
+      - "Dockerfile"
+      - ".github/workflows/ingestion-api.yml"
+  pull_request:
+    paths:
+      - "internal/**"
+      - "cmd/ingestion-api/**"
+      - "go.mod"
+      - "go.sum"
+      - "Dockerfile"
+      - ".github/workflows/ingestion-api.yml"
+  workflow_dispatch:
+    inputs:
+      run_integration:
+        description: "Run the TestContainers integration suite (safety measure only — never blocks this pipeline)"
+        type: boolean
+        default: false
+
+env:
+  GO_VERSION: "1.26"
+  SERVICE: ingestion-api
+
+jobs:
+  build:
+    name: build (gate 1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go build ./cmd/${{ env.SERVICE }}/... ./internal/...
+
+  lint:
+    name: lint (gate 2)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: golangci/golangci-lint-action@v6
+      # Lints the workflow YAML itself (this file included) — catches a
+      # broken pipeline (bad expression, undefined secret reference, wrong
+      # shell syntax) the same way golangci-lint catches broken Go.
+      - uses: reviewdog/action-actionlint@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          fail_level: error
+
+  unit-tests:
+    name: unit-tests (gate 3)
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go test -race ./internal/...
+
+  # Optional, flag-gated safety measure — needs unit-tests to reuse the gate
+  # result, but nothing downstream needs this job, so it can be skipped or
+  # fail without blocking upload/deploy. Off by default: only runs when
+  # explicitly requested via workflow_dispatch or a PR label.
+  integration-tests:
+    name: integration-tests (optional, non-blocking)
+    needs: unit-tests
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.run_integration) ||
+      contains(github.event.pull_request.labels.*.name, 'ci:integration')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go test -tags=integration -race -timeout=300s ./tests/integration/...
+
+  upload:
+    name: upload image (ECR + Docker Hub mirror)
+    needs: unit-tests
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # for OIDC auth to AWS — no long-lived AWS keys in this repo
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          build-args: SERVICE=${{ env.SERVICE }}
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.SERVICE }}:${{ github.sha }}
+
+      # Secondary mirror — only runs if Docker Hub credentials are configured.
+      - uses: docker/login-action@v3
+        if: ${{ vars.DOCKERHUB_USERNAME != '' }}
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        if: ${{ vars.DOCKERHUB_USERNAME != '' }}
+        with:
+          context: .
+          file: Dockerfile
+          build-args: SERVICE=${{ env.SERVICE }}
+          push: true
+          tags: ${{ vars.DOCKERHUB_USERNAME }}/${{ env.SERVICE }}:${{ github.sha }}
+
+  deploy:
+    name: deploy (pulumi up)
+    needs: upload
+    if: github.ref == 'refs/heads/main'
+    environment: dev # prod uses a separate, manually-approved environment
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: pulumi/actions@v6
+        with:
+          command: up
+          stack-name: dev
+          work-dir: infra/pulumi
+          # Only this service's image-tag config key — never touches
+          # consumer-worker's, so this deploy can't redeploy the other
+          # service's pods (see Track 4's workloads.go).
+          config-map: '{"transaction-outbox:imageTagIngestionApi":{"value":"${{ github.sha }}","secret":false}}'
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}

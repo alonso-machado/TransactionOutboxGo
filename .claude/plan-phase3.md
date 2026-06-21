@@ -228,10 +228,18 @@ carry a sibling object named `cartao_credito` / `cartao_debito` respectively, wi
 
 ### Goal
 
-A pipeline that **gates** on quality before any deploy: every push/PR builds,
-then runs unit tests (stop on failure), then runs golangci-lint (stop on
-failure), with an **optional** TestContainers integration stage. Image build +
-deploy only run after the gates pass on the default branch.
+**Two independent pipelines, not one shared one** — `ingestion-api` and
+`consumer-worker` are separate microservices (separate ECR repos, separate
+EKS node groups and Deployments per Track 4) and a change to one should never
+block, re-test, or re-deploy the other. Both pipelines are the **same shape**:
+
+```
+Build → golangci-lint → Unit Tests → Upload (ECR/Docker Hub) → Deploy (AWS)
+                                              │
+                                              └── Integration Tests (optional,
+                                                  flag-gated, TestContainers —
+                                                  never blocks the pipeline)
+```
 
 > **Note on the host-Podman convention:** the "no `go` on the host, run everything
 > through Podman" rule is a *local-dev* convention for the user's machine. CI
@@ -240,71 +248,102 @@ deploy only run after the gates pass on the default branch.
 > directly. This is intentional and does not violate the project rule (which is
 > about the dev host, not CI).
 
-### Pipeline shape
+### Why two workflows instead of one with a matrix
 
-`.github/workflows/ci.yml` — triggered on `push` and `pull_request`. The three
-mandatory gates run **strictly in this order** — any one failing **terminates the
-CI/CD** and nothing downstream runs:
+A single matrixed workflow (`strategy.matrix.service: [ingestion-api,
+consumer-worker]`) would still be **one workflow run** — a red job for one
+service shows up in the same run as the other, and a `workflow_dispatch`/path
+trigger still evaluates against both. Two separate workflow files give true
+independence: each has its own trigger (gated by `paths:` so a
+`consumer-worker`-only change never even starts the `ingestion-api` workflow,
+and vice versa), its own run history, its own status badge, and its own
+required-check configuration in branch protection. Shared logic (Go version,
+lint config, the build/test commands) is duplicated between the two files on
+purpose — this is the standard "rule of three" trade-off: two near-identical
+~80-line YAML files are easier to reason about independently than a shared
+composite/reusable workflow would be to keep generic for exactly two callers.
+
+### Pipeline shape (both workflows, identical)
+
+`.github/workflows/ingestion-api.yml` and
+`.github/workflows/consumer-worker.yml` — each triggered on `push`/
+`pull_request`, scoped via `paths:` to the code it actually depends on
+(`internal/**`, `cmd/<service>/**`, `go.mod`, `go.sum`, `Dockerfile`, plus its
+own workflow file). The four mandatory gates run **strictly in this order** —
+any one failing **terminates that service's pipeline** and nothing downstream
+runs. The optional integration stage is a side branch off Unit Tests that
+never gates Upload/Deploy:
 
 ```
-build  →  lint (GATE)  →  unit-tests (GATE)  →  docker  →  deploy
-                                   └──────────►  integration-tests (OPTIONAL, off the deploy path)
+build  →  lint (GATE)  →  unit-tests (GATE)  →  upload (ECR/Docker Hub)  →  deploy (AWS)
+                                  └──────────►  integration-tests (OPTIONAL, off the deploy path)
 ```
 
-- **`build`** (gate 1) — `go build ./...` (the same compilation `make build`
-  does). Fails ⇒ stop.
-- **`lint`** (gate 2) — `golangci/golangci-lint-action@v6`, `needs: build`.
-  Mirrors the local `make lint` zero-issues rule. A finding **fails the workflow**
-  ⇒ stop. **Runs before the unit tests**, per requirement.
-- **`unit-tests`** (gate 3) — `go test -race ./internal/...` (the non-`integration`
-  tagged tests), `needs: lint`. A failure **fails the workflow** ⇒ stop. **Runs
-  after lint.**
-- **`integration-tests` (optional, NOT a deploy gate)** — runs the Phase 2
-  TestContainers suite (`go test -tags=integration ...`), `needs: unit-tests`. It
-  is a **side branch**: it never blocks `docker`/`deploy`. Optional via:
-  - `workflow_dispatch` boolean input `run_integration` (manual runs), **or**
-  - a `ci:integration` PR label / push to the default branch.
-  - Skipped on ordinary PRs by default (keeps PR feedback fast; the suite needs
-    Docker and is slow). `ubuntu-latest` has Docker, so TestContainers/Ryuk work
-    with no extra service config.
-- **`docker`** — multi-arch build of both services via `build/Dockerfile`
-  (`ARG SERVICE`), push to the registry (ECR — see Track 4), tag = git SHA.
-  `needs: unit-tests`; runs only on the default branch after the 3 gates pass.
-- **`deploy` (last)** — runs `pulumi up` (Track 4). Comes **right after the unit
-  tests** in the chain (`unit-tests → docker → deploy`); it does **not** wait on
-  the optional integration suite. Prod gated by an environment protection rule.
+- **`build`** (gate 1) — `go build ./cmd/<service>/...` plus `./internal/...`
+  (the shared packages that service imports). Fails ⇒ stop.
+- **`lint`** (gate 2) — `golangci/golangci-lint-action@v6` over the whole
+  module (golangci-lint doesn't meaningfully scope by binary; lint findings in
+  shared `internal/` code are relevant to both services anyway). `needs: build`.
+  A finding **fails the workflow** ⇒ stop. **Runs before the unit tests.**
+- **`unit-tests`** (gate 3) — `go test -race ./internal/...` (the non-
+  `integration`-tagged tests). `needs: lint`. A failure **fails the workflow**
+  ⇒ stop. **Runs after lint.**
+- **`integration-tests` (optional, flag-gated, NOT a deploy gate)** — runs the
+  Phase 2 TestContainers suite (`go test -tags=integration ...`),
+  `needs: unit-tests`. A **safety-measure side branch**: gated behind a flag
+  (`workflow_dispatch` boolean input `run_integration`, or a `ci:integration`
+  PR label) and never wired into anything downstream — a failure here does
+  **not** block `upload`/`deploy`, and by default (flag unset, no label) the
+  job is skipped entirely so ordinary pushes/PRs stay fast.
+- **`upload`** — builds that one service's image via the root `Dockerfile`
+  (`ARG SERVICE=<service>`), pushes to ECR (primary, OIDC-authenticated — see
+  Track 4) and optionally Docker Hub (secondary mirror, if
+  `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` secrets are configured), tag =
+  `${{ github.sha }}`. `needs: unit-tests`; runs only on the default branch.
+- **`deploy` (last)** — runs `pulumi up` scoped to *this service's* image tag
+  config key only (`transaction-outbox:imageTag<Service>` — see Track 4's
+  `workloads.go`, which reads a tag per service rather than one shared tag, so
+  deploying `consumer-worker` doesn't redeploy `ingestion-api`'s pods).
+  `needs: upload`; does **not** wait on the optional integration suite. Prod
+  gated by a GitHub `environment: prod` protection rule (manual approval), not
+  built in this track.
 
 ### Gating semantics (explicit, per the requirements)
 
-- **Order is build → lint → unit-tests**, enforced by the `needs` chain
-  (`lint: needs build`, `unit-tests: needs lint`). Each is a hard gate: a red job
-  stops everything after it.
-- **Integration TestContainers is optional and off the deploy path** —
-  `needs: unit-tests` only so it reuses the gate result, but nothing `needs` it,
-  so it can be skipped/fail without blocking deploy.
-- **Deploy is last, right after unit-tests** — the deploy path is
-  `unit-tests → docker → deploy`; it depends on the unit-test gate (transitively
-  on lint+build), never on integration.
+- **Order is Build → lint → Unit Tests → Upload → Deploy**, enforced by the
+  `needs` chain. Each of the first three is a hard gate: a red job stops
+  everything after it in that service's pipeline.
+- **Integration TestContainers is optional, flag-gated, and off the deploy
+  path** — `needs: unit-tests` only so it reuses the gate result, but nothing
+  `needs` it, so it can be skipped/fail without blocking `upload`/`deploy`.
+  This is explicitly a safety measure, not a release gate.
+- **The two pipelines never block each other** — a lint failure introduced
+  only in `cmd/consumer-worker/` (or triggered by a PR that only touches that
+  path) never runs, let alone fails, the `ingestion-api` workflow.
 
 ### Files to add
 
 | File | Purpose |
 |---|---|
-| `.github/workflows/ci.yml` | The pipeline above |
-| `.github/workflows/README.md` *(optional)* | One-paragraph description of the gates + how to trigger the optional integration run |
+| `.github/workflows/ingestion-api.yml` | The pipeline above, scoped to ingestion-api |
+| `.github/workflows/consumer-worker.yml` | The same pipeline, scoped to consumer-worker |
+| `.github/workflows/README.md` | Description of the gates, the two-workflow rationale, and how to trigger the optional integration run on each |
 | `.golangci.yml` | **Only if needed** to pin the linter version for CI reproducibility — *no rule-silencing overrides* (the project rule: fix code, never suppress). Default config preferred |
 
-### Sketch (`ci.yml`)
+### Sketch (shape shared by both workflows; `<service>` substituted per file)
 
 ```yaml
-name: CI
+name: CI - <service>
 on:
-  push: { branches: [main] }
+  push:
+    branches: [main]
+    paths: ["internal/**", "cmd/<service>/**", "go.mod", "go.sum", "Dockerfile", ".github/workflows/<service>.yml"]
   pull_request:
+    paths: ["internal/**", "cmd/<service>/**", "go.mod", "go.sum", "Dockerfile", ".github/workflows/<service>.yml"]
   workflow_dispatch:
     inputs:
       run_integration:
-        description: "Run TestContainers integration suite"
+        description: "Run TestContainers integration suite (safety measure only — never blocks this pipeline)"
         type: boolean
         default: false
 
@@ -315,7 +354,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: "1.26" }
-      - run: go build ./...
+      - run: go build ./cmd/<service>/... ./internal/...
 
   lint:                 # GATE 2 — after build, before unit-tests
     needs: build
@@ -335,10 +374,9 @@ jobs:
         with: { go-version: "1.26" }
       - run: go test -race ./internal/...
 
-  integration-tests:    # OPTIONAL — side branch, never gates deploy
+  integration-tests:    # OPTIONAL, flag-gated — safety measure, never gates the pipeline
     needs: unit-tests
     if: >-
-      github.event_name == 'push' ||
       (github.event_name == 'workflow_dispatch' && inputs.run_integration) ||
       contains(github.event.pull_request.labels.*.name, 'ci:integration')
     runs-on: ubuntu-latest   # Docker is available → TestContainers works
@@ -348,30 +386,35 @@ jobs:
         with: { go-version: "1.26" }
       - run: go test -tags=integration -race -timeout=300s ./tests/integration/...
 
-  docker:               # after unit-tests gate
+  upload:                # after unit-tests gate — ECR (+ optional Docker Hub mirror)
     needs: unit-tests
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    # build+push ingestion-api and consumer-worker to ECR, tag = ${{ github.sha }}
+    # build <service> image (Dockerfile ARG SERVICE=<service>), push to ECR
+    # tag = ${{ github.sha }}; optionally mirror to Docker Hub
 
-  deploy:               # LAST — right after unit-tests (via docker), not after integration
-    needs: docker
+  deploy:                # LAST — right after upload, not after integration
+    needs: upload
     if: github.ref == 'refs/heads/main'
-    environment: dev      # prod gated by environment protection rules
+    environment: dev      # prod gated by a separate environment protection rule
     runs-on: ubuntu-latest
-    # pulumi up (Track 4)
+    # pulumi up, setting only this service's imageTag config key (Track 4)
 ```
 
 ### Verification
 
-1. Introduce a lint finding → `lint` red → `unit-tests`, `docker`, `deploy` never
-   run (lint is gate 2, before unit tests).
-2. Open a PR with a failing unit test (lint clean) → `unit-tests` red →
-   `docker`/`deploy` skipped.
-3. Add the `ci:integration` label → `integration-tests` runs the TestContainers
-   suite, but a failure there does **not** block `deploy` (optional, off-path).
-4. Merge to `main` with the 3 gates green → `docker` pushes SHA-tagged images →
-   `deploy` runs `pulumi up` (last).
+1. Introduce a lint finding in either service's path → that service's `lint`
+   job goes red → its `unit-tests`/`upload`/`deploy` never run; the *other*
+   service's workflow is entirely unaffected (different trigger paths).
+2. Open a PR touching only `cmd/consumer-worker/` → only the
+   `consumer-worker.yml` workflow runs.
+3. Run `consumer-worker.yml` via `workflow_dispatch` with `run_integration`
+   checked → `integration-tests` runs the TestContainers suite; force it to
+   fail → `upload`/`deploy` still run (optional, off-path, by design).
+4. Merge to `main` with the 3 gates green on `ingestion-api.yml` → `upload`
+   pushes a SHA-tagged image to ECR → `deploy` runs `pulumi up`, updating only
+   the `ingestion-api` Deployment's image — `consumer-worker`'s pods are
+   untouched.
 
 ---
 
@@ -520,16 +563,30 @@ infra/
 pulumi config set aws:region us-east-1
 pulumi config set --secret dbPassword <...>
 pulumi config set --secret rabbitmqPassword <...>
-pulumi config set imageTag <git-sha>     # set by CI from ${{ github.sha }}
+# Per-service image tags, NOT one shared `imageTag` — Track 3 runs two
+# independent CI pipelines (ingestion-api.yml, consumer-worker.yml), each
+# deploying only its own service. A single shared `imageTag` key would mean
+# either pipeline's `pulumi up` redeploys BOTH services' pods, defeating the
+# independence Track 3 is built for.
+pulumi config set imageTagIngestionApi <git-sha>     # set by ingestion-api.yml
+pulumi config set imageTagConsumerWorker <git-sha>   # set by consumer-worker.yml
 ```
+
+`workloads.go` reads both keys and resolves each service's image
+independently (`imageFor("ingestion-api")` / `imageFor("consumer-worker")`),
+so a `pulumi up` triggered by one service's pipeline only changes that
+service's Helm values — the other service's Deployment is untouched (Helm's
+values merge means an unset/unchanged key doesn't trigger a diff on the
+other Deployment).
 
 ### CI integration
 
-The Track 3 `deploy` job runs:
+Each service's `deploy` job (Track 3) runs:
 ```bash
 pulumi login s3://<state-bucket>      # or Pulumi Cloud
 pulumi stack select dev
-pulumi config set imageTag ${{ github.sha }}
+pulumi config set imageTagIngestionApi ${{ github.sha }}     # ingestion-api.yml only
+pulumi config set imageTagConsumerWorker ${{ github.sha }}   # consumer-worker.yml only
 pulumi up --yes
 ```
 prod uses a separate job gated by a GitHub `environment: prod` protection rule
