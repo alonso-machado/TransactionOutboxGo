@@ -26,7 +26,7 @@ func TestDispatchOutbox_PublishesAndMarksPublished(t *testing.T) {
 	dispatcher, _ := newDispatch(10, 5, 100*time.Millisecond, 24*time.Hour)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go dispatcher.Run(ctx)
+	go dispatcher.Run(ctx, nil)
 
 	ok := waitFor(t, 10*time.Second, func() bool {
 		return countOutboxByStatus("PUBLISHED") == 1
@@ -60,7 +60,7 @@ func TestDispatchOutbox_BrokerUnavailable_StaysNewUntilRecovered(t *testing.T) {
 
 	badDispatcher, _ := newDispatchWithConn(deadConn, 10, 5, 100*time.Millisecond, 24*time.Hour)
 	ctx, cancel := context.WithCancel(context.Background())
-	go badDispatcher.Run(ctx)
+	go badDispatcher.Run(ctx, nil)
 
 	time.Sleep(500 * time.Millisecond)
 	cancel()
@@ -73,7 +73,7 @@ func TestDispatchOutbox_BrokerUnavailable_StaysNewUntilRecovered(t *testing.T) {
 	goodDispatcher, _ := newDispatch(10, 5, 100*time.Millisecond, 24*time.Hour)
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
-	go goodDispatcher.Run(ctx2)
+	go goodDispatcher.Run(ctx2, nil)
 
 	ok := waitFor(t, 10*time.Second, func() bool {
 		return countOutboxByStatus("PUBLISHED") == 1
@@ -100,7 +100,7 @@ func TestDispatchOutbox_MaxRetriesExceeded_DeadLetters(t *testing.T) {
 	dispatcher, _ := newDispatchWithConn(deadConn, 10, maxRetries, 50*time.Millisecond, 24*time.Hour)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go dispatcher.Run(ctx)
+	go dispatcher.Run(ctx, nil)
 
 	ok := waitFor(t, 10*time.Second, func() bool {
 		return countOutboxByStatus("DEAD_LETTER") == 1

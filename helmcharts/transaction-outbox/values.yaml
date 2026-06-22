@@ -41,9 +41,62 @@ configMap:
 # `--set secret.databaseUrl=... --set secret.rabbitmqUrl=...` or a values
 # override file — never commit real connection strings here. Plaintext here;
 # templates/secret.yaml base64-encodes them.
+#
+# Phase 5 Track 3.B convention: when pgbouncer.enabled is true,
+# secret.databaseUrl should point at the in-cluster PgBouncer Service
+# (postgres://<user>:<pass>@pgbouncer.{{ .Values.namespace }}.svc.cluster.local:6432/<db>)
+# instead of RDS directly — pgbouncer.upstreamHost/.upstreamPort below is
+# where the *real* Postgres/RDS endpoint goes, kept separate from the app's
+# own DATABASE_URL so PgBouncer is genuinely in front of, not bypassed by,
+# every consumer/ingestion-api connection.
 secret:
   databaseUrl: "CHANGE_ME"
   rabbitmqUrl: "CHANGE_ME"
+
+# Phase 5 Track 3.B/3.C — PgBouncer (transaction-pooling mode) + its
+# pgbouncer-exporter sidecar, in front of RDS. Mirrors docker-compose.yml's
+# pgbouncer/pgbouncer-exporter services so local and cloud behave
+# identically. Disabled by default so existing deployments aren't forced
+# into the pooler topology change without an explicit opt-in; the cloud
+# target (infra/pulumi) sets this true.
+pgbouncer:
+  enabled: false
+  replicas: 1
+  image: "edoburu/pgbouncer:latest"
+  # The real Postgres/RDS endpoint PgBouncer pools connections to — set this
+  # to the RDS instance's endpoint (infra/pulumi/data.go) in the cloud
+  # values override; "postgres" only resolves locally via compose, kept here
+  # purely as a documented default.
+  upstreamHost: "postgres"
+  upstreamPort: 5432
+  authType: scram-sha-256
+  adminUser: "outbox"
+  maxClientConn: 1000
+  defaultPoolSize: 25
+  # PLACEHOLDER — base64-decoded contents of userlist.txt
+  # ("\"user\" \"password\"" lines); inject via
+  # --set pgbouncer.userlist=... at deploy time, never commit real
+  # credentials. See observability/pgbouncer/pgbouncer.ini's comment on the
+  # plain-vs-scram-sha-256 tradeoff for how the password must be shaped.
+  userlist: "CHANGE_ME"
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "250m"
+      memory: "128Mi"
+  exporter:
+    image: "quay.io/prometheuscommunity/pgbouncer-exporter:latest"
+    resources:
+      requests:
+        cpu: "25m"
+        memory: "32Mi"
+      limits:
+        cpu: "100m"
+        memory: "64Mi"
+  # PLACEHOLDER — postgres://<admin_user>:<password>@pgbouncer:6432/pgbouncer?sslmode=disable
+  exporterDsn: "CHANGE_ME"
 
 # Argo Rollouts canary (Phase 4 Track 4). Off by default — Argo Rollouts'
 # CRDs/controller don't exist in plain docker-compose or a bare cluster, so

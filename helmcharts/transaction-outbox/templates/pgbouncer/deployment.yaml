@@ -1,0 +1,78 @@
+{{- if .Values.pgbouncer.enabled }}
+# Phase 5 Track 3.B — PgBouncer (transaction-pooling mode) in front of RDS,
+# same role as the compose pgbouncer service: collapses the KEDA fan-out's
+# many short-lived consumer-worker connections (0..N pods x 5 methods) plus
+# ingestion-api's HPA replicas onto a small, bounded pool of real Postgres
+# connections. config.databaseUrl (the upstream Postgres/RDS DSN) is rendered
+# into a ConfigMap-mounted pgbouncer.ini; app/consumer DATABASE_URL
+# (secret.databaseUrl) should be pointed at this Deployment's Service
+# instead of RDS directly — see values.yaml's pgbouncer section for the
+# convention.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: pgbouncer
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.pgbouncer.replicas }}
+  selector:
+    matchLabels:
+      app: pgbouncer
+  template:
+    metadata:
+      labels:
+        app: pgbouncer
+    spec:
+      containers:
+        - name: pgbouncer
+          image: {{ .Values.pgbouncer.image }}
+          ports:
+            - name: pgbouncer
+              containerPort: 6432
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pgbouncer/pgbouncer.ini
+              subPath: pgbouncer.ini
+            - name: userlist
+              mountPath: /etc/pgbouncer/userlist.txt
+              subPath: userlist.txt
+          resources:
+            {{- toYaml .Values.pgbouncer.resources | nindent 12 }}
+          readinessProbe:
+            tcpSocket:
+              port: 6432
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 6432
+            initialDelaySeconds: 10
+            periodSeconds: 15
+        # Phase 5 Track 3.C — sidecar exposing SHOW STATS/SHOW POOLS as
+        # Prometheus metrics on :9127, scraped alongside the app pods. Track
+        # 4 wires the scrape job + the INFRA dashboard's PgBouncer row; this
+        # sidecar just needs to run and be reachable for that to land later.
+        - name: pgbouncer-exporter
+          image: {{ .Values.pgbouncer.exporter.image }}
+          env:
+            - name: DATA_SOURCE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: pgbouncer-exporter-secret
+                  key: PGBOUNCER_EXPORTER_DSN
+          ports:
+            - name: metrics
+              containerPort: 9127
+          resources:
+            {{- toYaml .Values.pgbouncer.exporter.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: pgbouncer-config
+        - name: userlist
+          secret:
+            secretName: pgbouncer-userlist
+{{- end }}

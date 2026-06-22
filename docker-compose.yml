@@ -19,12 +19,18 @@ x-consumer-worker-base: &consumer-worker-base
       condition: service_healthy
     migrate:
       condition: service_completed_successfully
+    pgbouncer:
+      condition: service_healthy
   networks:
     - outbox
   restart: unless-stopped
 
 x-consumer-worker-env: &consumer-worker-env
-  DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@postgres:5432/${POSTGRES_DB:-outbox}?sslmode=disable"
+  # Phase 5 Track 3.B — points at PgBouncer (transaction-pooling mode), not
+  # postgres directly, so the 0..N-per-method KEDA fan-out's many short-lived
+  # connections collapse onto a small server-side pool instead of each pod
+  # opening its own GORM pool straight against Postgres.
+  DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@pgbouncer:6432/${POSTGRES_DB:-outbox}?sslmode=disable"
   RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
   PREFETCH_COUNT: "${CONSUMER_PREFETCH:-10}"
   MAX_DELIVERIES: "${RABBITMQ_MAX_REDELIVERIES:-5}"
@@ -116,6 +122,55 @@ services:
     networks:
       - outbox
 
+  # Phase 5 Track 3.B — PgBouncer in transaction-pooling mode, in front of
+  # Postgres. Identical local/cloud topology (see
+  # helmcharts/transaction-outbox/templates/pgbouncer/): both ingestion-api
+  # and every per-method consumer-worker point DATABASE_URL here instead of
+  # at postgres directly, so the KEDA fan-out's many short-lived sessions
+  # collapse onto a small pool of real Postgres connections. GORM's
+  # PrepareStmt is disabled (internal/infrastructure/database/database.go)
+  # because transaction-mode pooling doesn't guarantee the same server
+  # connection across statements.
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    volumes:
+      - ./observability/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./observability/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports:
+      - "${PGBOUNCER_PORT:-6432}:6432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U ${POSTGRES_USER:-outbox}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - outbox
+
+  # Phase 5 Track 3.C — exposes PgBouncer's admin pseudo-database (SHOW
+  # STATS/SHOW POOLS) as Prometheus metrics on :9127. Track 4 wires this into
+  # observability/prometheus/prometheus.yml's scrape config and adds a
+  # PgBouncer row to observability/grafana/dashboards/infra.json — this
+  # service just needs to run and be reachable for that to land later.
+  pgbouncer-exporter:
+    image: quay.io/prometheuscommunity/pgbouncer-exporter:latest
+    environment:
+      PGBOUNCER_EXPORTER_HOST: pgbouncer
+      PGBOUNCER_EXPORTER_PORT: "6432"
+      PGBOUNCER_EXPORTER_USER: "${POSTGRES_USER:-outbox}"
+      PGBOUNCER_EXPORTER_PASSWORD: "${POSTGRES_PASSWORD:-outbox}"
+      DATA_SOURCE_NAME: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@pgbouncer:6432/pgbouncer?sslmode=disable"
+    ports:
+      - "9127:9127"
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    networks:
+      - outbox
+    restart: unless-stopped
+
   # ── Application services ────────────────────────────────────────────────────
 
   ingestion-api:
@@ -125,7 +180,9 @@ services:
       args:
         SERVICE: ingestion-api
     environment:
-      DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@postgres:5432/${POSTGRES_DB:-outbox}?sslmode=disable"
+      # Phase 5 Track 3.B — points at PgBouncer, not postgres directly (see
+      # the pgbouncer service above and consumer-worker-env's note).
+      DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@pgbouncer:6432/${POSTGRES_DB:-outbox}?sslmode=disable"
       RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
       HTTP_PORT: "${APP_PORT:-8080}"
       SWAGGER_ENABLED: "${SWAGGER_ENABLED:-true}"
@@ -160,6 +217,8 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      pgbouncer:
+        condition: service_healthy
     networks:
       - outbox
     restart: unless-stopped

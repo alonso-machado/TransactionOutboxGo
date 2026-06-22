@@ -59,15 +59,43 @@ func New(
 	}
 }
 
-func (d *DispatchOutbox) Run(ctx context.Context) {
+// notifyDebounce is how long Run waits after the first trigger signal in a
+// burst before dispatching, so a flurry of NOTIFYs (e.g. many concurrent
+// POSTs landing in the same instant) coalesces into a single dispatch pass
+// instead of one per notification.
+const notifyDebounce = 50 * time.Millisecond
+
+// Run drives DispatchOutbox: it dispatches on every tick of the poll
+// interval (the correctness fallback — always runs, regardless of trigger),
+// prunes old published rows hourly, and — Phase 5 Track 3.A — also
+// dispatches shortly after a NOTIFY arrives on trigger, so payments publish
+// in single-digit ms on an idle system instead of waiting out the full poll
+// interval.
+//
+// trigger may be nil (e.g. in tests, or if the caller chooses not to wire up
+// a Listener) — Run works correctly with NOTIFY entirely absent, it just
+// falls back to polling only. This is the dependency-rule seam: this
+// use-case receives a plain `<-chan struct{}` and never imports pgx/lib/pq;
+// the channel's producer (internal/infrastructure/database.Listener) is
+// wired in by cmd/ingestion-api/main.go.
+func (d *DispatchOutbox) Run(ctx context.Context, trigger <-chan struct{}) {
 	ticker := time.NewTicker(d.interval)
 	pruneTicker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 	defer pruneTicker.Stop()
 
+	// debounce is non-nil only while a trigger signal is pending, so the
+	// select below only fires it once per debounce window even under a
+	// burst of NOTIFYs.
+	var debounce *time.Timer
+	var debounceC <-chan time.Time
+
 	for {
 		select {
 		case <-ctx.Done():
+			if debounce != nil {
+				debounce.Stop()
+			}
 			return
 		case <-ticker.C:
 			d.dispatch(ctx)
@@ -75,6 +103,15 @@ func (d *DispatchOutbox) Run(ctx context.Context) {
 			if err := d.outboxRepo.DeleteOldPublished(ctx, d.pruneAfter); err != nil {
 				log.Printf("outbox prune error: %v", err)
 			}
+		case <-trigger:
+			if debounce == nil {
+				debounce = time.NewTimer(notifyDebounce)
+				debounceC = debounce.C
+			}
+		case <-debounceC:
+			debounce = nil
+			debounceC = nil
+			d.dispatch(ctx)
 		}
 	}
 }

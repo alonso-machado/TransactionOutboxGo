@@ -1,0 +1,27 @@
+{{- if .Values.pgbouncer.enabled }}
+# pgbouncer.ini's [databases] entry points at the real Postgres/RDS endpoint
+# (.Values.pgbouncer.upstreamHost/.upstreamPort) — credentials themselves
+# stay in the userlist Secret below, never in this ConfigMap.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgbouncer-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+data:
+  pgbouncer.ini: |
+    [databases]
+    * = host={{ .Values.pgbouncer.upstreamHost }} port={{ .Values.pgbouncer.upstreamPort }}
+
+    [pgbouncer]
+    listen_addr = 0.0.0.0
+    listen_port = 6432
+    auth_type = {{ .Values.pgbouncer.authType }}
+    auth_file = /etc/pgbouncer/userlist.txt
+    admin_users = {{ .Values.pgbouncer.adminUser }}
+    pool_mode = transaction
+    max_client_conn = {{ .Values.pgbouncer.maxClientConn }}
+    default_pool_size = {{ .Values.pgbouncer.defaultPoolSize }}
+    max_prepared_statements = 100
+{{- end }}

@@ -30,7 +30,7 @@ func TestOutboxPruning_RemovesOldPublishedRowsOnly(t *testing.T) {
 
 	dispatcher, outboxRepo := newDispatch(10, 5, 50*time.Millisecond, time.Hour)
 	ctx, cancel := context.WithCancel(context.Background())
-	go dispatcher.Run(ctx)
+	go dispatcher.Run(ctx, nil)
 	ok := waitFor(t, 10*time.Second, func() bool { return countOutboxByStatus("PUBLISHED") == 1 })
 	cancel()
 	require.True(t, ok, "expected first row to publish before backdating")
@@ -49,7 +49,7 @@ func TestOutboxPruning_RemovesOldPublishedRowsOnly(t *testing.T) {
 	dispatcher2, _ := newDispatch(10, 5, 50*time.Millisecond, time.Hour)
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
-	go dispatcher2.Run(ctx2)
+	go dispatcher2.Run(ctx2, nil)
 	ok2 := waitFor(t, 10*time.Second, func() bool { return countOutboxByStatus("PUBLISHED") == 2 })
 	require.True(t, ok2, "expected second row to publish")
 

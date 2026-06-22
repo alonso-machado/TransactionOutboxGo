@@ -1,0 +1,21 @@
+{{- if .Values.pgbouncer.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgbouncer
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: pgbouncer
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app: pgbouncer
+  ports:
+    - name: pgbouncer
+      port: 6432
+      targetPort: 6432
+    - name: metrics
+      port: 9127
+      targetPort: 9127
+{{- end }}

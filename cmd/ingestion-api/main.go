@@ -110,7 +110,13 @@ func main() {
 		}()
 	}
 
-	go dispatchUC.Run(ctx)
+	// Phase 5 Track 3.A — a dedicated LISTEN connection wakes DispatchOutbox
+	// immediately on enqueue; the poll ticker inside Run remains the
+	// correctness fallback if this connection ever drops.
+	notifyListener := database.NewListener(cfg.DatabaseURL)
+	go notifyListener.Run(ctx)
+
+	go dispatchUC.Run(ctx, notifyListener.Notify)
 
 	srv := &http.Server{
 		Addr:    ":" + cfg.HTTPPort,

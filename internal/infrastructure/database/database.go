@@ -23,6 +23,15 @@ func Connect(dsn string) (*gorm.DB, error) {
 
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
 		Logger: gormLogger,
+		// Phase 5 Track 3.B: PgBouncer in transaction-pooling mode hands out
+		// a different server connection per transaction, so a server-side
+		// prepared statement from one transaction may not exist (or may
+		// collide with another client's statement of the same name) on the
+		// next. Disabling GORM's own prepared-statement cache keeps the app
+		// pooler-safe behind PgBouncer; see docker-compose.yml's pgbouncer
+		// service and DATABASE_URL now pointing at it instead of postgres
+		// directly.
+		PrepareStmt: false,
 	})
 	if err != nil {
 		return nil, err
