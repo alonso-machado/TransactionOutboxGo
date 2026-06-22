@@ -63,7 +63,7 @@ func newCluster(ctx *pulumi.Context, cfg *stackConfig, net *network) (*clusterSt
 	}
 
 	if _, err := eks.NewManagedNodeGroup(ctx, "ingestion-api", &eks.ManagedNodeGroupArgs{
-		Cluster:       cluster.Core,
+		Cluster:       cluster,
 		NodeRole:      nodeRole,
 		AmiType:       pulumi.String("AL2_ARM_64"), // Graviton
 		InstanceTypes: pulumi.StringArray{pulumi.String(cfg.nodeInstanceType)},
@@ -81,7 +81,7 @@ func newCluster(ctx *pulumi.Context, cfg *stackConfig, net *network) (*clusterSt
 	}
 
 	if _, err := eks.NewManagedNodeGroup(ctx, "consumer-worker", &eks.ManagedNodeGroupArgs{
-		Cluster:       cluster.Core,
+		Cluster:       cluster,
 		NodeRole:      nodeRole,
 		AmiType:       pulumi.String("AL2_ARM_64"), // Graviton — consumer-worker is event-driven, no need for x86
 		InstanceTypes: pulumi.StringArray{pulumi.String(cfg.nodeInstanceType)},

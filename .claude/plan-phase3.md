@@ -437,6 +437,23 @@ jobs:
 > Everywhere below that used to say "the Phase 2 `k8s/` manifests" now says
 > "the `helmcharts/transaction-outbox` chart."
 
+> **Build status:** `infra/pulumi`'s code is written (all files below exist).
+> `go build ./...` cannot be completed on this machine — the Podman VM's 2GiB
+> memory limit gets OOM-killed compiling `pulumi-aws`'s generated SDK package.
+> Every API surface used (`eks.ManagedNodeGroupArgs`, `helm.ReleaseArgs`,
+> `mq.BrokerArgs`, `rds.InstanceArgs`, `ec2.SecurityGroupArgs`,
+> `iam.RolePolicyAttachmentArgs`, `ecr.RepositoryArgs`,
+> `secretsmanager.SecretArgs`, `kubernetes.ProviderArgs`) has been
+> cross-checked against `pkg.go.dev` and is correct as written, with two
+> fixes already applied from that check: `workloads.go` now sets `Chart`
+> (not `Path`, which doesn't exist on `helm.ReleaseArgs`) to install the
+> local chart directory, and `cluster.go` now passes the whole `*eks.Cluster`
+> to `ManagedNodeGroupArgs.Cluster` (not `cluster.Core`). A full `go build`
+> still needs to run somewhere with more memory than this machine has (CI's
+> `ubuntu-latest` runners, or a bigger local machine) before this is
+> considered verified — API-surface review isn't a substitute for an actual
+> compile.
+
 ### Goal
 
 Provision the AWS target the CI pipeline deploys to, as code. Reuse the

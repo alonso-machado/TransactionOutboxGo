@@ -34,8 +34,8 @@ func installWorkloads(ctx *pulumi.Context, cfg *stackConfig, cluster *clusterSta
 	}
 
 	_, err := k8shelm.NewRelease(ctx, "transaction-outbox", &k8shelm.ReleaseArgs{
-		Name: pulumi.String("transaction-outbox"),
-		Path: pulumi.String(chartPath),
+		Name:  pulumi.String("transaction-outbox"),
+		Chart: pulumi.String(chartPath),
 		Values: pulumi.Map{
 			"namespace": pulumi.String("transaction-outbox"),
 			"image": pulumi.Map{
