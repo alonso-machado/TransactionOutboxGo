@@ -19,6 +19,7 @@ Payments domain:
 
 Full design (Phase 1 — core system): [`.claude/plan.md`](.claude/plan.md)
 Phase 2 plan (OTel · Swagger · TestContainers · K8s+KEDA): [`.claude/plan-phase2.md`](.claude/plan-phase2.md)
+Phase 3 plan (per-method queues · card payments · CI/CD · Pulumi/AWS · k6): [`.claude/plan-phase3.md`](.claude/plan-phase3.md)
 User-facing docs: [`README.md`](README.md)
 
 ---
@@ -60,6 +61,11 @@ interfaces.
 | Composition root / DI (consumer-worker) | `cmd/consumer-worker/main.go` |
 | Docker Compose (local dev) | `docker-compose.yml` |
 | Multi-stage Dockerfile (ARG SERVICE) | `Dockerfile` |
+| Helm chart (one Deployment + ScaledObject per payment method, templated) | `helmcharts/transaction-outbox/` |
+| Pulumi (AWS: EKS, RDS, Amazon MQ, ECR, KEDA — installs the Helm chart) | `infra/pulumi/` |
+| GitHub Actions CI/CD (one workflow per microservice — see below) | `.github/workflows/` |
+| PII redaction (`Redact`/`RedactJSON`, masks `cardNumber`/`payerDocument`/etc.) | `internal/domain/pii/` |
+| Integration tests (TestContainers: Postgres + RabbitMQ) | `tests/integration/` |
 
 ---
 
@@ -94,17 +100,29 @@ interfaces.
 - **`payerId`/`recipientId` are optional**, nested under `payment` in the
   wire format, and stored as `*uuid.UUID` (nullable) in the `Payment` domain
   entity and `payments` table — **except for `TRANSFER`**, see below.
-- **Three first-class methods, validated in `internal/adapter/http/dto.go`
+- **Five first-class methods, validated in `internal/adapter/http/dto.go`
   (`ValidateMethod`)**:
   - `PIX` — requires the `pix{endToEndId, txid}` sibling object.
   - `BOLETO` — requires the `boleto{barcode, dueDate, payerDocument}` sibling object.
   - `TRANSFER` — an **internally-originated** method (no external payment
     provider drives it); requires both `payment.payerId` and
     `payment.recipientId` to be present instead of a sibling object.
-  - Any other `method` value passes `ValidateMethod` unvalidated — that's
-    intentional: the polymorphic `MethodDetails` design means new methods
-    don't require a code change, only a new `case` in `ValidateMethod` if
-    first-class validation is wanted later.
+  - `CARTAO_CREDITO` / `CARTAO_DEBITO` — require the `cartao_credito`/
+    `cartao_debito` sibling object (`CardDetailsDTO`: `cardNumber`, `cardType`,
+    `cardIssuer`). `cardType` must match the method (`CREDIT`/`DEBIT`) and
+    `cardIssuer` must be one of `VISA`/`MASTERCARD`/`AMERICAN`. The handler
+    masks `cardNumber` to its last 4 digits (`internal/adapter/http/card.go`,
+    `maskPAN`) **before** it ever reaches `ingest.Execute` — the full PAN is
+    never persisted, published to RabbitMQ, or logged. `cardNumber` is also a
+    key in `pii.Redact`'s sensitive-key set as a second layer of defense.
+  - **Any method not in `rmq.Methods` is rejected with `400`** — Phase 3's
+    per-method RabbitMQ queues mean an unrecognized method has no bound
+    queue, so it would be a silent black hole if published (topic exchange,
+    no matching binding, message dropped). Adding a 6th method is a 2-line
+    change: add it to `rmq.Methods` (so a queue/DLQ gets declared) and,
+    optionally, a new `case` in `ValidateMethod` for first-class validation
+    — the polymorphic `MethodDetails` design means the schema itself never
+    needs to change.
 - **Outbox status state machine:** `NEW` → `PUBLISHED`, `NEW` → `RETRYING`,
   `RETRYING` → `PUBLISHED`, `RETRYING` → `DEAD_LETTER` (after max retries).
 - **`DispatchOutbox`** (`usecase/outbox`) is the Transactional Outbox core: it runs
@@ -158,6 +176,32 @@ done. Key rules enforced:
   For `Close()` calls in `main` before the server starts, log the error.
 - All default golangci-lint linters apply — do not add `.golangci.yml` overrides
   to silence findings; fix the code instead.
+
+---
+
+## CI/CD (GitHub Actions)
+
+**One workflow per microservice, not one shared pipeline** —
+[`.github/workflows/ingestion-api.yml`](.github/workflows/ingestion-api.yml) and
+[`consumer-worker.yml`](.github/workflows/consumer-worker.yml). Each is
+triggered only by changes to its own `cmd/<service>/**` path (plus shared
+`internal/**`/`go.mod`/`go.sum`/`Dockerfile`), so a change scoped to one
+service never triggers, gates, or redeploys the other. Both follow the same
+gate order:
+
+```
+build → lint (golangci-lint + actionlint, GATE) → unit-tests (GATE) → upload (ECR) → deploy (pulumi up)
+                                                              └── integration-tests (optional, flag-gated, never blocks)
+```
+
+`lint` runs **two** checks: `golangci-lint` over the Go code, and
+`actionlint` over the workflow YAML itself (catches a broken pipeline the
+same way golangci-lint catches broken Go). `integration-tests` (the
+TestContainers suite) is a safety measure only — off by default, triggered
+via `workflow_dispatch` or a `ci:integration` PR label, and never wired into
+anything `upload`/`deploy` depends on. See
+[`.github/workflows/README.md`](.github/workflows/README.md) for the full
+rationale.
 
 ---
 

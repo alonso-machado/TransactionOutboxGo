@@ -21,13 +21,16 @@ const chartPath = "../../helmcharts/transaction-outbox"
 // strings. It does not loop over payment methods — the chart already does
 // that internally.
 func installWorkloads(ctx *pulumi.Context, cfg *stackConfig, cluster *clusterStack, data *dataStack, provider *kubernetes.Provider) error {
-	imageFor := func(repoName string) pulumi.StringOutput {
+	// Each service resolves its OWN tag (imageTagIngestionApi /
+	// imageTagConsumerWorker — see config.go) so that one service's CI
+	// pipeline deploying never drags the other service's image along.
+	imageFor := func(repoName, tag string) pulumi.StringOutput {
 		for _, repo := range cluster.EcrRepos {
 			if repo.name == repoName {
-				return pulumi.Sprintf("%s:%s", repo.url, cfg.imageTag)
+				return pulumi.Sprintf("%s:%s", repo.url, tag)
 			}
 		}
-		return pulumi.String(repoName + ":" + cfg.imageTag).ToStringOutput()
+		return pulumi.String(repoName + ":" + tag).ToStringOutput()
 	}
 
 	_, err := k8shelm.NewRelease(ctx, "transaction-outbox", &k8shelm.ReleaseArgs{
@@ -36,8 +39,8 @@ func installWorkloads(ctx *pulumi.Context, cfg *stackConfig, cluster *clusterSta
 		Values: pulumi.Map{
 			"namespace": pulumi.String("transaction-outbox"),
 			"image": pulumi.Map{
-				"ingestionApi":   imageFor("ingestion-api"),
-				"consumerWorker": imageFor("consumer-worker"),
+				"ingestionApi":   imageFor("ingestion-api", cfg.imageTagIngestionApi),
+				"consumerWorker": imageFor("consumer-worker", cfg.imageTagConsumerWorker),
 			},
 			"secret": pulumi.Map{
 				"databaseUrl": data.databaseURL,

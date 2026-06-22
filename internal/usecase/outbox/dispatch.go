@@ -108,6 +108,12 @@ func (d *DispatchOutbox) dispatch(ctx context.Context) {
 		if markErr := d.outboxRepo.MarkPublished(ctx, msg.ID, time.Now().UTC()); markErr != nil {
 			log.Printf("outbox mark published error: %v", markErr)
 		}
+		// Per-message, not batched, so the counter carries a `method`
+		// dimension — a Grafana panel can show publish rate per method,
+		// feeding capacity planning for the per-method KEDA limits.
+		if d.publishedTotal != nil {
+			d.publishedTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("method", msg.PaymentMethod)))
+		}
 	}
 
 	span.SetAttributes(
@@ -116,9 +122,6 @@ func (d *DispatchOutbox) dispatch(ctx context.Context) {
 		attribute.Int("retrying_count", retryingCount),
 		attribute.Int("dead_letter_count", deadLetterCount),
 	)
-	if d.publishedTotal != nil && publishedCount > 0 {
-		d.publishedTotal.Add(ctx, int64(publishedCount))
-	}
 	if d.pendingCount != nil {
 		d.pendingCount.Record(ctx, int64(len(msgs)))
 	}

@@ -44,8 +44,11 @@ acknowledges the client, and a separate relay reliably forwards it to the broker
 
 ## Architecture
 
-Two binaries. The **`DispatchOutbox`** use case runs as a background goroutine
-inside `ingestion-api` (not a third process), so the API both serves HTTP and
+Two binaries, but **N consumer-worker instances** — one per payment method
+(Phase 3), each bound to exactly one RabbitMQ queue via `PAYMENT_QUEUE`, so
+KEDA can scale a method's consumers independently of the others. The
+**`DispatchOutbox`** use case runs as a background goroutine inside
+`ingestion-api` (not a third process), so the API both serves HTTP and
 dispatches the outbox — handling the full Transactional Outbox responsibility.
 The API **never writes to the `payments` table** — only `consumer-worker` does.
 
@@ -65,26 +68,42 @@ flowchart LR
         PAY[[payments]]
     end
 
-    subgraph MQ["RabbitMQ 4.3 (quorum)"]
-        EX{{payments.exchange}}
-        Q[[payments.queue]]
-        DLQ[[payments.dlq]]
-        EX --> Q
-        Q -. "redelivery limit" .-> DLQ
+    subgraph MQ["RabbitMQ 4.3 (quorum, one queue + DLQ per method)"]
+        EX{{payments.exchange<br/>topic, routing key = payment.&lt;method&gt;}}
+        QPIX[[payments.pix.queue]]
+        QBOL[[payments.boleto.queue]]
+        QTRF[[payments.transfer.queue]]
+        QCC[[payments.cartao_credito.queue]]
+        QCD[[payments.cartao_debito.queue]]
+        DLX{{payments.dlx}}
+        EX --> QPIX & QBOL & QTRF & QCC & QCD
+        QPIX -. "max deliveries" .-> DLX
+        QBOL -. "max deliveries" .-> DLX
+        QTRF -. "max deliveries" .-> DLX
+        QCC -. "max deliveries" .-> DLX
+        QCD -. "max deliveries" .-> DLX
     end
 
-    subgraph WORK["consumer-worker (process 2)"]
-        C[Consumer<br/>manual ack + prefetch]
+    subgraph WORK["consumer-worker — one instance per method (PAYMENT_QUEUE)"]
+        CPIX[Consumer: pix]
+        CBOL[Consumer: boleto]
+        CTRF[Consumer: transfer]
+        CCC[Consumer: cartao_credito]
+        CCD[Consumer: cartao_debito]
     end
 
     Client -- "POST/PUT/PATCH /api/v1/payments" --> H
-    H -- "tx: INSERT (idempotency_key UNIQUE, status=NEW)" --> OBX
+    H -- "tx: INSERT (idempotency_key UNIQUE, status=NEW, payment_method)" --> OBX
     H -- "201 Created" --> Client
     R -- "SELECT status IN (NEW, RETRYING) FOR UPDATE SKIP LOCKED" --> OBX
-    R -- "publish (confirm, persistent)" --> EX
+    R -- "publish (confirm, persistent, routing key = payment.&lt;method&gt;)" --> EX
     R -- "mark PUBLISHED" --> OBX
-    Q -- "deliver" --> C
-    C -- "INSERT ... ON CONFLICT (source_message_id) DO NOTHING" --> PAY
+    QPIX --> CPIX
+    QBOL --> CBOL
+    QTRF --> CTRF
+    QCC --> CCC
+    QCD --> CCD
+    CPIX & CBOL & CTRF & CCC & CCD -- "INSERT ... ON CONFLICT (source_message_id) DO NOTHING" --> PAY
 ```
 
 ### End-to-end flow
@@ -248,19 +267,33 @@ a generic envelope plus a method-specific sibling object named after
 | `PIX` | `pix` | `endToEndId`, `txid` |
 | `BOLETO` | `boleto` | `barcode`, `dueDate`, `payerDocument` |
 | `TRANSFER` | *(none — internal)* | `payment.payerId` and `payment.recipientId` |
+| `CARTAO_CREDITO` | `cartao_credito` | `cardNumber`, `cardType` (`CREDIT`), `cardIssuer` |
+| `CARTAO_DEBITO` | `cartao_debito` | `cardNumber`, `cardType` (`DEBIT`), `cardIssuer` |
 
 `TRANSFER` is the one method **we** originate rather than a provider — there's
 no external webhook driving it, so instead of a sibling details object it
-requires both parties (`payerId`, `recipientId`) to be present. Any other
-`method` value is accepted without first-class validation (the polymorphic
-`MethodDetails` design tolerates unknown methods); see `ValidateMethod` in
-[`internal/adapter/http/dto.go`](internal/adapter/http/dto.go) to add
-validation for a new one.
+requires both parties (`payerId`, `recipientId`) to be present.
+
+The two card methods carry a PAN (`cardNumber`) — **PII that's masked to its
+last 4 digits at the HTTP boundary** (`internal/adapter/http/card.go`,
+`maskPAN`) before the request ever reaches the outbox, RabbitMQ, or
+Postgres. `cardType` must match the method (`CARTAO_CREDITO` ⇒ `CREDIT`,
+`CARTAO_DEBITO` ⇒ `DEBIT`) and `cardIssuer` must be one of `VISA` /
+`MASTERCARD` / `AMERICAN`; a mismatch is a `400`.
+
+**A `method` outside this table is rejected with `400`** — Phase 3 routes
+each method to its own dedicated RabbitMQ queue (see the diagram above), so
+an unrecognized method has no bound queue and would be silently dropped by
+the broker if accepted. See `ValidateMethod` in
+[`internal/adapter/http/dto.go`](internal/adapter/http/dto.go) and `Methods`
+in [`internal/infrastructure/rabbitmq/rabbitmq.go`](internal/infrastructure/rabbitmq/rabbitmq.go)
+to add a 6th method.
 
 ```bash
 make seed-pix       # PIX sample
 make seed-boleto    # BOLETO sample
 make seed-transfer  # TRANSFER sample (payerId -> recipientId)
+make seed-card      # CARTAO_CREDITO sample (cardNumber masked to last-4 by the handler)
 ```
 
 ## Idempotency / dedup key
@@ -307,6 +340,45 @@ TransactionOutboxGo/
 
 ---
 
+## Environment variables
+
+Both binaries read config via [`internal/infrastructure/config`](internal/infrastructure/config/config.go)
+(`envconfig`). `DATABASE_URL` and `RABBITMQ_URL` are the only two marked
+`required` — everything else has a default. See [`.env.example`](.env.example)
+for local-dev values and [`docker-compose.yml`](docker-compose.yml) for how
+each service's env block is actually wired.
+
+### Shared (both `ingestion-api` and `consumer-worker`)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATABASE_URL` | *(required)* | Postgres DSN |
+| `RABBITMQ_URL` | *(required)* | AMQP connection string |
+| `OTEL_SERVICE_NAME` | `transaction-outbox-go` | OTel resource service name — each service/per-method consumer overrides this to its own name (e.g. `consumer-worker-pix`) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `localhost:4318` | OTLP/HTTP collector endpoint (Jaeger in local dev) |
+| `METRICS_PORT` | `9090` | Prometheus `/metrics` port — each per-method consumer-worker overrides this to its own fixed port (9091–9095, see `docker-compose.yml`) |
+
+### `ingestion-api` only
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HTTP_PORT` | `8080` | HTTP listen port |
+| `SWAGGER_ENABLED` | `false` | Serve swagger UI at `/swagger/index.html` (local dev defaults this to `true`; production leaves it `false`) |
+| `OUTBOX_DISPATCH_INTERVAL_MS` | `500` | Poll interval for the `DispatchOutbox` goroutine |
+| `OUTBOX_DISPATCH_BATCH_SIZE` | `50` | Rows fetched per dispatch poll |
+| `OUTBOX_MAX_RETRIES` | `5` | Publish attempts before an outbox row is marked `DEAD_LETTER` |
+| `OUTBOX_PRUNE_AFTER_HOURS` | `48` | Hours after which a `PUBLISHED` row is eligible for pruning |
+
+### `consumer-worker` only
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PAYMENT_QUEUE` | *(required — no default)* | The single RabbitMQ queue this instance binds to and drains, e.g. `payments.pix.queue`. Must be one of `rmq.Methods`' queue names ([`internal/infrastructure/rabbitmq`](internal/infrastructure/rabbitmq/rabbitmq.go)) — every other env var here is shared with `ingestion-api`'s `Config` struct, but this one is consumer-worker-only and the binary fails fast at startup if it's empty or unrecognized (no implicit "consume everything" mode) |
+| `PREFETCH_COUNT` | `10` | AMQP consumer prefetch count |
+| `MAX_DELIVERIES` | `5` | Redelivery attempts before a message is routed to its method's DLQ |
+
+---
+
 ## Build / run commands (local dev)
 
 Go is **not installed on the host** — everything runs inside containers via
@@ -348,14 +420,56 @@ Expect `201 Created` with a `paymentId`, `idempotencyKey`, and `status: "accepte
 
 ### Verifying it works
 
-- **Persistence:** the outbox row moves `NEW → PUBLISHED`, flows through
-  `payments.queue` (visible in the RabbitMQ UI), and lands as one row in
-  `payments`.
+- **Persistence:** the outbox row moves `NEW → PUBLISHED`, flows through that
+  method's own queue (e.g. `payments.pix.queue`, visible in the RabbitMQ UI),
+  and lands as one row in `payments`.
 - **Idempotency:** repeat the same `curl` → outbox response comes back
   `status: "duplicate"`; still a single `payments` row.
 - **Loss resistance:** `podman compose -f docker-compose.yml stop rabbitmq`,
   send a request (still `201`, outbox row stays `NEW`), then restart RabbitMQ →
   `DispatchOutbox` drains the backlog and the consumer persists it.
+- **Per-method isolation:** `make seed-card` then check the RabbitMQ UI —
+  the message lands only in `payments.cartao_credito.queue`; every other
+  method's queue stays at 0.
+
+---
+
+## CI/CD
+
+Two independent GitHub Actions workflows, one per microservice —
+[`ingestion-api.yml`](.github/workflows/ingestion-api.yml) and
+[`consumer-worker.yml`](.github/workflows/consumer-worker.yml) — so a change
+scoped to one service never triggers, gates, or redeploys the other. Both
+follow: **Build → lint (golangci-lint + actionlint) → Unit Tests → Upload
+(ECR, OIDC-authenticated) → Deploy (`pulumi up`)**, with an optional
+flag-gated Integration Tests (TestContainers) job that's a safety measure
+only — it never blocks Upload/Deploy. See
+[`.github/workflows/README.md`](.github/workflows/README.md) for the full
+gate breakdown and why two files instead of one matrixed workflow.
+
+## Deploying to AWS
+
+[`infra/pulumi/`](infra/pulumi/) provisions the AWS target both CI pipelines
+deploy to: EKS (two node groups, one per microservice, Graviton/arm64),
+ECR, RDS Postgres, Amazon MQ for RabbitMQ, and the KEDA operator — then
+installs the existing [`helmcharts/transaction-outbox`](helmcharts/transaction-outbox/)
+chart onto it, unmodified except for image tags, secrets, and per-service
+node selectors.
+
+**Network/security boundary:** `ingestion-api` is the *only* component
+reachable from the public internet (an internet-facing NLB). `consumer-worker`
+has no Kubernetes Service at all — nothing to expose, by construction — and
+both RDS and Amazon MQ are `PubliclyAccessible: false` behind a security
+group whose only ingress rule sources from the EKS node security group, not
+the VPC CIDR or the internet. See `.claude/plan-phase3.md`'s Track 4
+"Network & Security Boundary" section for the full rationale.
+
+```bash
+cd infra/pulumi
+pulumi config set --secret dbPassword <...>
+pulumi config set --secret rabbitmqPassword <...>
+pulumi up --stack dev
+```
 
 ---
 

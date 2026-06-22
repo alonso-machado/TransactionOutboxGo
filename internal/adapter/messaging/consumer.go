@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -23,18 +24,50 @@ import (
 const retryCountHeader = "x-retry-count"
 
 type AMQPConsumer struct {
-	conn          *amqp.Connection
-	processMsg    *consume.ProcessMessage
-	method        string
-	prefetch      int
-	maxDeliveries int
+	conn             *amqp.Connection
+	processMsg       *consume.ProcessMessage
+	method           string
+	prefetch         int
+	maxDeliveries    int
+	messagesTotal    metric.Int64Counter
+	retryAttempts    metric.Int64Counter
 }
 
 // NewConsumer builds a consumer bound to method's queue (e.g. "PIX" ->
 // payments.pix.queue) — each consumer-worker instance consumes exactly one
 // method's queue, decoupling payment methods from consumer scaling.
 func NewConsumer(conn *amqp.Connection, processMsg *consume.ProcessMessage, method string, prefetch, maxDeliveries int) *AMQPConsumer {
-	return &AMQPConsumer{conn: conn, processMsg: processMsg, method: method, prefetch: prefetch, maxDeliveries: maxDeliveries}
+	meter := otel.GetMeterProvider().Meter("adapter/messaging")
+	messagesTotal, err := meter.Int64Counter("consumer.messages_processed_total")
+	if err != nil {
+		log.Printf("create consumer.messages_processed_total counter: %v", err)
+	}
+	retryAttempts, err := meter.Int64Counter("consumer.retry_attempts_total")
+	if err != nil {
+		log.Printf("create consumer.retry_attempts_total counter: %v", err)
+	}
+	return &AMQPConsumer{
+		conn:          conn,
+		processMsg:    processMsg,
+		method:        method,
+		prefetch:      prefetch,
+		maxDeliveries: maxDeliveries,
+		messagesTotal: messagesTotal,
+		retryAttempts: retryAttempts,
+	}
+}
+
+// metricAttrs are the dimensions every consumer metric is sliced by — method
+// and its bound queue/routing (binding) key, so a Grafana panel can isolate
+// one payment method's throughput/retry/poison rate from the others even
+// though every method's consumer shares this same code path.
+func (c *AMQPConsumer) metricAttrs(extra ...attribute.KeyValue) metric.AddOption {
+	attrs := append([]attribute.KeyValue{
+		attribute.String("payment_method", c.method),
+		attribute.String("payment_queue", rmq.QueueFor(c.method)),
+		attribute.String("routing_key", rmq.RoutingKeyFor(c.method)),
+	}, extra...)
+	return metric.WithAttributes(attrs...)
 }
 
 func (c *AMQPConsumer) Run(ctx context.Context) error {
@@ -73,14 +106,27 @@ func (c *AMQPConsumer) Run(ctx context.Context) error {
 func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 	ctx = otel.GetTextMapPropagator().Extract(ctx, amqpHeaderCarrier(d.Headers))
 	retryCount := retryCountFromHeaders(d.Headers)
+	isRetry := retryCount > 0
+	routingKey := rmq.RoutingKeyFor(c.method)
 	ctx, span := tracer.Start(ctx, "rabbitmq.consume", trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(
 			attribute.String("message_id", d.MessageId),
 			attribute.Bool("redelivered", d.Redelivered),
 			attribute.Int("retry_count", retryCount),
+			attribute.Bool("is_retry", isRetry),
+			// Lets traces/logs be sliced per payment method even though
+			// every method's consumer shares this same code path — each
+			// consumer-worker instance only ever handles its own method.
+			attribute.String("payment_method", c.method),
+			attribute.String("payment_queue", rmq.QueueFor(c.method)),
+			attribute.String("routing_key", routingKey), // the topic-exchange binding key this message arrived on
 		),
 	)
 	defer span.End()
+
+	if c.retryAttempts != nil && isRetry {
+		c.retryAttempts.Add(ctx, 1, c.metricAttrs(attribute.Int("retry_count", retryCount)))
+	}
 
 	if err := c.processMsg.Execute(ctx, d.MessageId, d.Body); err != nil {
 		log.Printf("process message %s error: %s — attempt %d", d.MessageId, pii.Redact(err.Error()), retryCount+1)
@@ -90,6 +136,9 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 		if retryCount+1 >= c.maxDeliveries {
 			log.Printf("poison message %s after %d attempts — rejecting to DLQ", d.MessageId, retryCount+1)
 			span.SetAttributes(attribute.String("outcome", "poison_dlq"))
+			if c.messagesTotal != nil {
+				c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "poison_dlq")))
+			}
 			_ = d.Reject(false)
 			return
 		}
@@ -99,8 +148,14 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 			_ = d.Nack(false, true)
 			return
 		}
+		if c.messagesTotal != nil {
+			c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "retry_scheduled")))
+		}
 		_ = d.Ack(false)
 		return
+	}
+	if c.messagesTotal != nil {
+		c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "ack")))
 	}
 	_ = d.Ack(false)
 }

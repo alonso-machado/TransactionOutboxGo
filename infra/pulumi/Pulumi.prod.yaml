@@ -8,7 +8,11 @@ config:
   transaction-outbox:dbInstanceClass: db.t3.medium
   transaction-outbox:dbMultiAz: true
   transaction-outbox:rabbitmqInstanceType: mq.m5.large
-  transaction-outbox:imageTag: latest
+  # Two separate keys, NOT one shared imageTag — each CI workflow
+  # (ingestion-api.yml / consumer-worker.yml) sets only its own key on
+  # deploy, so deploying one service never redeploys the other's pods.
+  transaction-outbox:imageTagIngestionApi: latest
+  transaction-outbox:imageTagConsumerWorker: latest
   # dbPassword / rabbitmqPassword are NOT set here — they must be added as
   # encrypted secrets before `pulumi up` can run:
   #   pulumi config set --secret dbPassword <...> --stack prod

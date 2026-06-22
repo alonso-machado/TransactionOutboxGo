@@ -3,7 +3,7 @@ COMPOSE_FILE := docker-compose.yml
 COMPOSE      := podman compose -f $(COMPOSE_FILE)
 GO           := podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine
 
-.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer lint swag test-unit test-integration coverage
+.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer seed-card lint swag test-unit test-integration coverage
 
 ## ── Docker Compose ────────────────────────────────────────────────────────────
 
@@ -65,7 +65,7 @@ swag:
 ## ── Dev helpers ───────────────────────────────────────────────────────────────
 
 # Send sample POSTs to the ingestion-api (requires the stack to be running).
-# `seed` defaults to the PIX sample; seed-boleto/seed-transfer cover the other methods.
+# `seed` defaults to the PIX sample; seed-boleto/seed-transfer/seed-card cover the other methods.
 seed: seed-pix
 
 seed-pix:
@@ -85,6 +85,15 @@ seed-transfer:
 		-H "Content-Type: application/json" \
 		-H "Idempotency-Key: seed-transfer-$(shell date +%s)" \
 		-d '{"eventId":"evt_seed_transfer_1","provider":{"name":"INTERNAL","providerPaymentId":"internal-1"},"payment":{"paymentId":"pay_789","amount":75.00,"currency":"USD","method":"TRANSFER","payerId":"018f7f9e-6e8b-7c3a-8f2a-000000000001","recipientId":"018f7f9e-6e8b-7c3a-8f2a-000000000002"},"occurredAt":"2026-06-19T18:30:00Z"}'
+
+# Sends a CARTAO_CREDITO sample; cardNumber here is a well-known test PAN
+# (never a real one) and is masked to its last 4 digits by the handler
+# before it's stored or published — see CardDetailsDTO/maskPAN.
+seed-card:
+	curl -i -X POST http://localhost:8080/api/v1/payments \
+		-H "Content-Type: application/json" \
+		-H "Idempotency-Key: seed-card-$(shell date +%s)" \
+		-d '{"eventId":"evt_seed_card_1","provider":{"name":"ACQUIRER","providerPaymentId":"card-001"},"payment":{"paymentId":"pay_card_1","amount":199.90,"currency":"BRL","method":"CARTAO_CREDITO"},"cartao_credito":{"cardNumber":"4111111111111111","cardType":"CREDIT","cardIssuer":"VISA"},"occurredAt":"2026-06-19T18:30:00Z"}'
 
 # Tail a single service: make service=ingestion-api tail
 tail:
@@ -119,3 +128,38 @@ k8s-lint:
 
 k8s-template:
 	helm template $(RELEASE) $(CHART) --namespace $(NS)
+
+## ── k6 load tests (Track 6) ─────────────────────────────────────────────────────
+
+.PHONY: loadtest loadtest-report loadtest-autoscale k6-ext-build loadtest-consumer
+
+# 6.1 — two-phase latency baseline (P95/P99). Pin every consumer to 1
+# replica/queue first (KEDA paused-replicas annotation, or compose default).
+loadtest:
+	podman run --rm -i -e TARGET_URL=$(TARGET_URL) -v "$(CURDIR)/loadtest:/lt" -w /lt \
+		grafana/k6 run k6-baseline.js
+
+# Same as `loadtest`, but archives the full default summary to JSON.
+loadtest-report:
+	podman run --rm -i -e TARGET_URL=$(TARGET_URL) -v "$(CURDIR)/loadtest:/lt" -w /lt \
+		grafana/k6 run --summary-export=summary.json k6-baseline.js
+
+# 6.2 — floods one method's queue (METHOD=PIX default) to trigger KEDA
+# scale-up, then stops so it scales back to 0. Do NOT pin consumers for this
+# one — needs the real KEDA config (min 0 / max 10). Kubernetes-only.
+loadtest-autoscale:
+	podman run --rm -i -e TARGET_URL=$(TARGET_URL) -e METHOD=$(METHOD) \
+		-v "$(CURDIR)/loadtest:/lt" -w /lt grafana/k6 run k6-autoscale.js
+
+# Builds the custom k6 binary (xk6-amqp + xk6-sql) that 6.3 needs.
+k6-ext-build:
+	podman build -t k6-ext -f build/k6/Dockerfile .
+
+# 6.3 — publishes straight onto a per-method queue (bypassing
+# ingestion-api), measures consumer-worker's drain rate + consume->persist
+# latency. SCENARIO=drain (default) or SCENARIO=dedup. Points at a
+# load/test database only — DATABASE_URL must never be production.
+loadtest-consumer:
+	podman run --rm -i -e RABBITMQ_URL=$(RABBITMQ_URL) -e DATABASE_URL=$(DATABASE_URL) \
+		-e METHOD=$(METHOD) -e N=$(N) -e SCENARIO=$(SCENARIO) \
+		-v "$(CURDIR)/loadtest:/lt" -w /lt k6-ext run k6-consumer.js
