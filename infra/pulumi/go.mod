@@ -4,6 +4,7 @@ go 1.26
 
 require (
 	github.com/pulumi/pulumi-aws/sdk v1.31.0
+	github.com/pulumi/pulumi-aws/sdk/v5 v5.35.0
 	github.com/pulumi/pulumi-awsx/sdk v1.0.6
 	github.com/pulumi/pulumi-eks/sdk v1.0.4
 	github.com/pulumi/pulumi-kubernetes/sdk/v4 v4.32.0
@@ -79,7 +80,6 @@ require (
 	github.com/pkg/term v1.1.0 // indirect
 	github.com/pulumi/appdash v0.0.0-20231130102222-75f619a67231 // indirect
 	github.com/pulumi/esc v0.24.0 // indirect
-	github.com/pulumi/pulumi-aws/sdk/v5 v5.35.0 // indirect
 	github.com/pulumi/pulumi-docker/sdk/v3 v3.2.0 // indirect
 	github.com/pulumi/pulumi-kubernetes/sdk/v3 v3.17.0 // indirect
 	github.com/pulumi/pulumi/sdk v1.13.1 // indirect

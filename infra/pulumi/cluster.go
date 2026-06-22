@@ -3,9 +3,9 @@ package main
 import (
 	"fmt"
 
-	"github.com/pulumi/pulumi-aws/sdk/go/aws/ecr"
-	awseks "github.com/pulumi/pulumi-aws/sdk/go/aws/eks"
-	"github.com/pulumi/pulumi-aws/sdk/go/aws/iam"
+	"github.com/pulumi/pulumi-aws/sdk/v5/go/aws/ecr"
+	awseks "github.com/pulumi/pulumi-aws/sdk/v5/go/aws/eks"
+	"github.com/pulumi/pulumi-aws/sdk/v5/go/aws/iam"
 	"github.com/pulumi/pulumi-eks/sdk/go/eks"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
@@ -57,6 +57,10 @@ func newCluster(ctx *pulumi.Context, cfg *stackConfig, net *network) (*clusterSt
 		NodeAssociatePublicIpAddress: pulumi.BoolRef(false),
 		SkipDefaultNodeGroup: pulumi.BoolRef(true),
 		InstanceRoles:        iam.RoleArray{nodeRole},
+		// Phase 4 Track 1/4: the AWS Load Balancer Controller's service
+		// account authenticates via IRSA (albcontroller.go), which needs the
+		// cluster's own OIDC provider to exist.
+		CreateOidcProvider: pulumi.BoolPtr(true),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create eks cluster: %w", err)

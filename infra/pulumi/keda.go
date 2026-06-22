@@ -22,8 +22,8 @@ func newK8sProvider(ctx *pulumi.Context, cluster *clusterStack) (*kubernetes.Pro
 // workloads.go) via its official Helm chart. This is a different chart from
 // helmcharts/transaction-outbox: KEDA is cluster-wide infrastructure, the
 // app chart is the workload.
-func installKeda(ctx *pulumi.Context, provider *kubernetes.Provider) error {
-	_, err := k8shelm.NewRelease(ctx, "keda", &k8shelm.ReleaseArgs{
+func installKeda(ctx *pulumi.Context, provider *kubernetes.Provider) (*k8shelm.Release, error) {
+	release, err := k8shelm.NewRelease(ctx, "keda", &k8shelm.ReleaseArgs{
 		Chart:           pulumi.String("keda"),
 		Version:         pulumi.String("2.16.0"),
 		Namespace:       pulumi.String("keda"),
@@ -33,7 +33,7 @@ func installKeda(ctx *pulumi.Context, provider *kubernetes.Provider) error {
 		},
 	}, pulumi.Provider(provider))
 	if err != nil {
-		return fmt.Errorf("install keda chart: %w", err)
+		return nil, fmt.Errorf("install keda chart: %w", err)
 	}
-	return nil
+	return release, nil
 }

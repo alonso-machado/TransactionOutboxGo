@@ -67,6 +67,13 @@ jobs:
       # golangci-lint/actionlint catch broken Go/YAML.
       - uses: azure/setup-helm@v4
       - run: helm lint helmcharts/transaction-outbox
+      # Also lint the canary.enabled=true path (Phase 4 Track 4 — Argo
+      # Rollout/AnalysisTemplate/Ingress instead of Deployment/HPA). The
+      # default-values lint above only ever exercises canary.enabled=false.
+      - run: |
+          helm lint helmcharts/transaction-outbox \
+            --set canary.enabled=true \
+            --set ingestionApi.ingress.enabled=true
 
   unit-tests:
     name: unit-tests (gate 3)

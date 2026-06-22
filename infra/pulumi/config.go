@@ -26,6 +26,18 @@ type stackConfig struct {
 	imageTagConsumerWorker string
 	dbPassword             pulumi.StringOutput
 	rabbitmqPassword       pulumi.StringOutput
+	// albControllerPolicyArn is the ARN of the IAM policy granting the AWS
+	// Load Balancer Controller's permissions (Phase 4 Track 1/4 — provisions
+	// the ALB behind the ingestion-api Ingress / canary traffic routing).
+	// Deliberately NOT authored as inline IAM JSON here: it's AWS's own
+	// published, versioned policy document
+	// (https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json),
+	// several hundred lines and updated upstream as the controller gains
+	// features — hand-transcribing it risks a stale or subtly wrong
+	// permission set for a controller that can create/delete internet-facing
+	// load balancers. Operator runs `aws iam create-policy` against that
+	// document once per account and sets this config to the resulting ARN.
+	albControllerPolicyArn string
 }
 
 func loadConfig(ctx *pulumi.Context) *stackConfig {
@@ -43,5 +55,6 @@ func loadConfig(ctx *pulumi.Context) *stackConfig {
 		imageTagConsumerWorker: c.Get("imageTagConsumerWorker"),
 		dbPassword:             c.RequireSecret("dbPassword"),
 		rabbitmqPassword:       c.RequireSecret("rabbitmqPassword"),
+		albControllerPolicyArn: c.Get("albControllerPolicyArn"),
 	}
 }

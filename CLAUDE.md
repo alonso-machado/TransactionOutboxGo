@@ -62,8 +62,10 @@ interfaces.
 | Composition root / DI (consumer-worker) | `cmd/consumer-worker/main.go` |
 | Docker Compose (local dev) | `docker-compose.yml` |
 | Multi-stage Dockerfile (ARG SERVICE) | `Dockerfile` |
-| Helm chart (one Deployment + ScaledObject per payment method, templated) | `helmcharts/transaction-outbox/` |
-| Pulumi (AWS: EKS, RDS, Amazon MQ, ECR, KEDA — installs the Helm chart) | `infra/pulumi/` |
+| Helm chart (one Deployment/Rollout + ScaledObject per payment method, templated; `canary.enabled` switches Deployment+HPA ↔ Argo Rollout+AnalysisTemplate) | `helmcharts/transaction-outbox/` |
+| Pulumi (AWS: EKS, RDS, Amazon MQ, ECR, KEDA, Argo Rollouts, AWS Load Balancer Controller — installs the Helm chart) | `infra/pulumi/` |
+| Rate limiter (leaky-bucket IP throttle, ingestion-api only) | `internal/adapter/http/ratelimit/` |
+| Prometheus/Grafana provisioning (dashboards, datasource, postgres-exporter queries) | `observability/` |
 | GitHub Actions CI/CD (one workflow per microservice — see below) | `.github/workflows/` |
 | PII redaction (`Redact`/`RedactJSON`, masks `cardNumber`/`payerDocument`/etc.) | `internal/domain/pii/` |
 | Integration tests (TestContainers: Postgres + RabbitMQ) | `tests/integration/` |

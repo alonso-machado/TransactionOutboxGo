@@ -3,10 +3,10 @@ package main
 import (
 	"fmt"
 
-	"github.com/pulumi/pulumi-aws/sdk/go/aws/ec2"
-	"github.com/pulumi/pulumi-aws/sdk/go/aws/mq"
-	"github.com/pulumi/pulumi-aws/sdk/go/aws/rds"
-	"github.com/pulumi/pulumi-aws/sdk/go/aws/secretsmanager"
+	"github.com/pulumi/pulumi-aws/sdk/v5/go/aws/ec2"
+	"github.com/pulumi/pulumi-aws/sdk/v5/go/aws/mq"
+	"github.com/pulumi/pulumi-aws/sdk/v5/go/aws/rds"
+	"github.com/pulumi/pulumi-aws/sdk/v5/go/aws/secretsmanager"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
 
@@ -34,29 +34,40 @@ type dataStack struct {
 // AMQP-based adapter/messaging + infrastructure/rabbitmq code needs zero
 // rewrite (see the Track 4 plan's "Amazon MQ vs SQS" decision).
 func newData(ctx *pulumi.Context, cfg *stackConfig, net *network, cluster *clusterStack) (*dataStack, error) {
+	// cluster.NodeSecurityGroup is an ec2.SecurityGroupOutput (a pulumi-eks
+	// component sub-output), which has no .ID() of its own — only the
+	// underlying *ec2.SecurityGroup resource does. ApplyT flattens the
+	// Output-returning callback into a single StringOutput. See
+	// https://github.com/pulumi/pulumi-eks/issues/644 (a known gap in the
+	// pulumi-eks Go SDK: there's no direct way to get a usable ID string off
+	// this field).
+	nodeSGID := cluster.NodeSecurityGroup.ApplyT(func(sg *ec2.SecurityGroup) pulumi.StringOutput {
+		return sg.ID().ToStringOutput()
+	}).(pulumi.StringOutput)
+
 	dataSG, err := ec2.NewSecurityGroup(ctx, "transaction-outbox-data", &ec2.SecurityGroupArgs{
 		VpcId: net.vpc.VpcId,
 		Ingress: ec2.SecurityGroupIngressArray{
 			&ec2.SecurityGroupIngressArgs{
-				Description:     pulumi.String("PostgreSQL from EKS worker nodes only"),
-				Protocol:        pulumi.String("tcp"),
-				FromPort:        pulumi.Int(5432),
-				ToPort:          pulumi.Int(5432),
-				SecurityGroups:  pulumi.StringArray{cluster.NodeSecurityGroup.ID()},
+				Description:    pulumi.String("PostgreSQL from EKS worker nodes only"),
+				Protocol:       pulumi.String("tcp"),
+				FromPort:       pulumi.Int(5432),
+				ToPort:         pulumi.Int(5432),
+				SecurityGroups: pulumi.StringArray{nodeSGID},
 			},
 			&ec2.SecurityGroupIngressArgs{
 				Description:    pulumi.String("Amazon MQ AMQPS from EKS worker nodes only"),
 				Protocol:       pulumi.String("tcp"),
 				FromPort:       pulumi.Int(5671),
 				ToPort:         pulumi.Int(5671),
-				SecurityGroups: pulumi.StringArray{cluster.NodeSecurityGroup.ID()},
+				SecurityGroups: pulumi.StringArray{nodeSGID},
 			},
 			&ec2.SecurityGroupIngressArgs{
 				Description:    pulumi.String("Amazon MQ management HTTPS (KEDA rabbitmq trigger) from EKS worker nodes only"),
 				Protocol:       pulumi.String("tcp"),
 				FromPort:       pulumi.Int(15671),
 				ToPort:         pulumi.Int(15671),
-				SecurityGroups: pulumi.StringArray{cluster.NodeSecurityGroup.ID()},
+				SecurityGroups: pulumi.StringArray{nodeSGID},
 			},
 		},
 		Egress: ec2.SecurityGroupEgressArray{

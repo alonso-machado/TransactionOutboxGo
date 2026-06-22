@@ -20,7 +20,11 @@ const chartPath = "../../helmcharts/transaction-outbox"
 // the CI-built ECR image tags and the real Amazon MQ/RDS connection
 // strings. It does not loop over payment methods — the chart already does
 // that internally.
-func installWorkloads(ctx *pulumi.Context, cfg *stackConfig, cluster *clusterStack, data *dataStack, provider *kubernetes.Provider) error {
+//
+// dependsOn must include the Argo Rollouts and AWS Load Balancer Controller
+// releases (main.go) — this release renders Rollout/AnalysisTemplate/Ingress
+// CRs that those controllers' CRDs/webhooks must already exist for.
+func installWorkloads(ctx *pulumi.Context, cfg *stackConfig, cluster *clusterStack, data *dataStack, provider *kubernetes.Provider, dependsOn []pulumi.Resource) error {
 	// Each service resolves its OWN tag (imageTagIngestionApi /
 	// imageTagConsumerWorker — see config.go) so that one service's CI
 	// pipeline deploying never drags the other service's image along.
@@ -46,28 +50,33 @@ func installWorkloads(ctx *pulumi.Context, cfg *stackConfig, cluster *clusterSta
 				"databaseUrl": data.databaseURL,
 				"rabbitmqUrl": data.rabbitmqURL,
 			},
+			// Phase 4 Track 4: Argo Rollouts controller is installed
+			// (main.go) — render Rollout/AnalysisTemplate instead of plain
+			// Deployment/HPA.
+			"canary": pulumi.Map{
+				"enabled": pulumi.Bool(true),
+			},
 			// Pin each microservice to its own EKS node group (cluster.go) —
 			// never shared capacity between ingestion-api and consumer-worker.
 			"ingestionApi": pulumi.Map{
 				"nodeSelector": pulumi.Map{nodeGroupLabel: pulumi.String("ingestion-api")},
-				"service": pulumi.Map{
-					// The ONLY service exposed outside the cluster: an
-					// internet-facing NLB. consumer-worker has no Service at
-					// all, and RabbitMQ/Postgres are locked to the node
-					// security group only (data.go) — nothing else is
-					// reachable from outside.
-					"type": pulumi.String("LoadBalancer"),
-					"annotations": pulumi.Map{
-						"service.beta.kubernetes.io/aws-load-balancer-type":     pulumi.String("nlb"),
-						"service.beta.kubernetes.io/aws-load-balancer-internal": pulumi.String("false"),
-					},
+				// ClusterIP (the chart's default) — Phase 4 Track 1 replaces
+				// the Phase 3 NLB with an ALB Ingress below as the front
+				// door, since an NLB can neither expose the real client IP
+				// (no X-Forwarded-For) nor be a WAF/canary traffic-routing
+				// attach point. The AWS Load Balancer Controller (main.go)
+				// targets pods directly (target-type: ip) from the public
+				// subnets — same exposure topology as the old NLB,
+				// ingestion-api remains the only publicly reachable service.
+				"ingress": pulumi.Map{
+					"enabled": pulumi.Bool(true),
 				},
 			},
 			"consumerWorker": pulumi.Map{
 				"nodeSelector": pulumi.Map{nodeGroupLabel: pulumi.String("consumer-worker")},
 			},
 		},
-	}, pulumi.Provider(provider))
+	}, pulumi.Provider(provider), pulumi.DependsOn(dependsOn))
 	if err != nil {
 		return fmt.Errorf("install transaction-outbox chart: %w", err)
 	}

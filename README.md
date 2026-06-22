@@ -106,6 +106,13 @@ flowchart LR
     CPIX & CBOL & CTRF & CCC & CCD -- "INSERT ... ON CONFLICT (source_message_id) DO NOTHING" --> PAY
 ```
 
+> This diagram is the core Phase 1–3 dataflow. In cloud, `Client` actually
+> hits an ALB + AWS WAF in front of `ingestion-api` (not shown — see
+> [Edge protection](#edge-protection-rate-limiting--waf)), both services
+> deploy via Argo Rollouts canary steps (see [Canary deploys](#canary-deploys)),
+> and Prometheus/Grafana observe every box above (see
+> [Observability](#observability-prometheus--grafana)).
+
 ### End-to-end flow
 
 ```mermaid
@@ -368,6 +375,10 @@ each service's env block is actually wired.
 | `OUTBOX_DISPATCH_BATCH_SIZE` | `50` | Rows fetched per dispatch poll |
 | `OUTBOX_MAX_RETRIES` | `5` | Publish attempts before an outbox row is marked `DEAD_LETTER` |
 | `OUTBOX_PRUNE_AFTER_HOURS` | `48` | Hours after which a `PUBLISHED` row is eligible for pruning |
+| `RATE_LIMIT_ENABLED` | `false` locally, `true` in cloud Helm values | Leaky-bucket IP rate limiter (see [Edge protection](#edge-protection-rate-limiting--waf) below). Off by default in `docker-compose.yml`/`.env.example` so k6 load tests and seed scripts don't throttle themselves |
+| `RATE_LIMIT_RATE` | `50` | Leak rate, requests/second per client IP |
+| `RATE_LIMIT_BURST` | `100` | Bucket capacity (requests admitted immediately before throttling kicks in) |
+| `TRUSTED_PROXIES` | *(empty)* | Comma-separated CIDRs Gin trusts for `X-Forwarded-For` when resolving `c.ClientIP()`. Empty locally (no proxy in front, uses `RemoteAddr` directly); set to the VPC/private-subnet CIDRs in cloud, where the ALB sits in front and injects XFF |
 
 ### `consumer-worker` only
 
@@ -457,18 +468,122 @@ chart onto it, unmodified except for image tags, secrets, and per-service
 node selectors.
 
 **Network/security boundary:** `ingestion-api` is the *only* component
-reachable from the public internet (an internet-facing NLB). `consumer-worker`
-has no Kubernetes Service at all — nothing to expose, by construction — and
-both RDS and Amazon MQ are `PubliclyAccessible: false` behind a security
-group whose only ingress rule sources from the EKS node security group, not
-the VPC CIDR or the internet. See `.claude/plan-phase3.md`'s Track 4
-"Network & Security Boundary" section for the full rationale.
+reachable from the public internet — an internet-facing **ALB** (Phase 4
+Track 1 replaced the Phase 3 NLB; see [Edge protection](#edge-protection-rate-limiting--waf)
+below for why). `consumer-worker` has no Kubernetes Service at all — nothing
+to expose, by construction — and both RDS and Amazon MQ are
+`PubliclyAccessible: false` behind a security group whose only ingress rule
+sources from the EKS node security group, not the VPC CIDR or the internet.
+See `.claude/plan-phase3.md`'s Track 4 "Network & Security Boundary" section
+for the full rationale.
+
+`infra/pulumi/` also installs the **AWS Load Balancer Controller** (provisions
+the ALB from the chart's `Ingress`) and the **Argo Rollouts** controller
+(drives the canary deploys — see [Canary deploys](#canary-deploys) below).
+Both are cluster-wide infrastructure, installed before the app chart so their
+CRDs/webhooks exist when the chart's `Rollout`/`Ingress` resources apply.
 
 ```bash
 cd infra/pulumi
 pulumi config set --secret dbPassword <...>
 pulumi config set --secret rabbitmqPassword <...>
+# One-time per AWS account — see albcontroller.go for why this isn't
+# provisioned by Pulumi itself.
+pulumi config set albControllerPolicyArn <policy-arn-from-aws-docs>
 pulumi up --stack dev
+```
+
+---
+
+## Edge protection: rate limiting + WAF
+
+`ingestion-api` is the only publicly reachable service, so it carries two
+layers of per-IP throttling — defense in depth, not redundancy:
+
+1. **App-level leaky bucket** ([`internal/adapter/http/ratelimit`](internal/adapter/http/ratelimit/)) —
+   an in-process, per-pod meter keyed on `c.ClientIP()`. Each client IP leaks
+   at `RATE_LIMIT_RATE` req/s with a burst capacity of `RATE_LIMIT_BURST`;
+   once exhausted, requests get `429 Too Many Requests` with a `Retry-After`
+   header. `/healthz`, `/metrics`, and `/swagger` are exempt — only
+   `/api/v1/payments` is limited. This is the **only** layer present locally
+   (no ALB/WAF in `docker-compose.yml`), and is **off by default** there (see
+   the env var table above) so k6/seed scripts don't throttle themselves.
+   - **Caveat:** with `ingestionApi.hpa` scaling `1→10` replicas and no shared
+     store, the effective global limit per IP is `N × RATE_LIMIT_RATE` across
+     N pods — each meters independently. A Redis-backed shared bucket would
+     fix this; out of scope for now, and the `BucketStore` interface is
+     written so swapping in one later is a one-file change.
+2. **AWS WAF rate-based rule + managed rule groups**, attached to the ALB —
+   a coarser, cluster-wide per-IP cap (blocks an IP exceeding N requests per
+   5-minute window) plus `AWSManagedRulesCommonRuleSet` /
+   `AWSManagedRulesKnownBadInputsRuleSet` / `AWSManagedRulesAmazonIpReputationList`.
+   This sheds volumetric floods at the edge, before they ever reach a pod —
+   complementary to, not a replacement for, the app-level limiter.
+3. **AWS Shield Standard** — free, automatic, always-on for the ALB
+   (L3/L4 DDoS mitigation). No configuration; Shield Advanced is out of scope.
+
+**Why the front door moved from an NLB to an ALB:** an NLB is layer-4 and
+strips the real client IP (`kube-proxy` SNATs to the node IP under the
+default `externalTrafficPolicy`), making IP-based limiting meaningless, and
+AWS WAF can't attach to an NLB at all. The ALB injects `X-Forwarded-For` with
+the real client IP, and `router.SetTrustedProxies(TRUSTED_PROXIES)` makes
+Gin's `c.ClientIP()` trust only that — a spoofed client-supplied XFF entry is
+ignored.
+
+## Observability: Prometheus + Grafana
+
+`make up` (or `make observability-up` for just the app + dashboards subset)
+brings up **Prometheus** (scraping every service's existing OTel
+`/metrics` endpoint plus RabbitMQ's built-in `rabbitmq_prometheus` plugin and
+a `postgres_exporter` sidecar) and **Grafana** at `http://localhost:3000`
+(`admin`/`admin` by default — see `GRAFANA_ADMIN_USER`/`PASSWORD`), with three
+dashboards auto-provisioned from committed JSON
+([`observability/grafana/dashboards/`](observability/grafana/dashboards/)) —
+the same files serve local Grafana and cloud Grafana, so they never drift:
+
+- **ingestion-api** — request rate, P50/P95/P99 latency, 2xx/4xx/5xx
+  breakdown, rate-limiter rejections, outbox publish rate/backlog, Go runtime
+  metrics.
+- **consumer-worker** — per-method throughput/outcome (`ack`/
+  `retry_scheduled`/`poison_dlq`), retry depth, queue backlog, a `$method`
+  template variable to isolate one payment method.
+- **infra** — RabbitMQ per-queue depth (queues *and* DLQs, so a poison spike
+  on one method is visible without touching the others), Postgres connections/
+  TPS/cache-hit-ratio/deadlocks.
+
+In cloud, Grafana is internal-only (no public Ingress) — reach it via
+`kubectl port-forward svc/...grafana 3000`.
+
+## Canary deploys
+
+Both services roll out progressively via **Argo Rollouts**
+(`helmcharts/transaction-outbox`'s `canary.enabled` — `true` in the Pulumi
+cloud target, `false` locally where the controller isn't installed, falling
+back to a plain `Deployment`+HPA). The two services use different step
+shapes — see `.claude/plan-phase4.md` Track 4 for the full rationale:
+
+- **ingestion-api:** lands at **0%** → a human promotes → **5%** → a human
+  promotes → from there it advances **automatically every 20 minutes**
+  through 20→50→100%, *unless* a background `AnalysisTemplate` (querying
+  Prometheus for the canary's own 5xx rate) detects a regression, in which
+  case it auto-aborts. Traffic is split at the **request** level via the
+  ALB target groups (`trafficRouting.alb`) — "5%" means 5% of requests.
+  - **Testing the canary on demand, even at 0% weight:** any request carrying
+    the header `canary: true` is always routed to the canary pods,
+    independent of the current weight — a second, static ALB listener rule
+    (`ingress-canary-header.yaml`) that Argo Rollouts doesn't manage.
+- **consumer-worker:** lands at **0%** → a human promotes → **5%** → after
+  **1 hour** with no manual action, it jumps straight to **100%** (no 20/50
+  steps — a queue consumer's blast radius is already bounded by the 1-hour
+  soak). It has no Service, so "weight" here means the canary/stable **pod
+  proportion**, i.e. the fraction of messages the new version processes.
+
+Promote/abort via the `kubectl-argo-rollouts` plugin:
+
+```bash
+kubectl argo rollouts get rollout ingestion-api --watch
+kubectl argo rollouts promote ingestion-api      # advance one step
+kubectl argo rollouts abort ingestion-api         # roll back to stable
 ```
 
 ---

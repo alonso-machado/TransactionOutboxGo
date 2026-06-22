@@ -19,3 +19,10 @@ config:
   #   pulumi config set --secret rabbitmqPassword <...> --stack prod
   # `pulumi config set --secret` appends an encrypted entry to this file;
   # never hand-write a plaintext value under these keys.
+  #
+  # albControllerPolicyArn is NOT set here either — create the IAM policy
+  # once per account from AWS's published document
+  # (https://kubernetes-sigs.github.io/aws-load-balancer-controller/latest/install/iam_policy.json),
+  # then: pulumi config set albControllerPolicyArn <policy-arn> --stack prod
+  # Left unset, the AWS Load Balancer Controller (Phase 4 Track 1/4) installs
+  # but can't actually reconcile any Ingress — see albcontroller.go.

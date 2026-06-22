@@ -35,11 +35,27 @@ func main() {
 			return err
 		}
 
-		if err := installKeda(ctx, k8sProvider); err != nil {
+		kedaRelease, err := installKeda(ctx, k8sProvider)
+		if err != nil {
 			return err
 		}
 
-		if err := installWorkloads(ctx, cfg, cluster, data, k8sProvider); err != nil {
+		// Phase 4 Track 4: Argo Rollouts controller + (Track 1) the AWS Load
+		// Balancer Controller must both be installed — and their CRDs/
+		// webhooks ready — before the app chart applies any Rollout,
+		// AnalysisTemplate, or ALB-annotated Ingress resources.
+		argoRollouts, err := installArgoRollouts(ctx, k8sProvider)
+		if err != nil {
+			return err
+		}
+
+		albController, err := installAlbController(ctx, cfg, net, cluster, k8sProvider)
+		if err != nil {
+			return err
+		}
+
+		workloadDeps := []pulumi.Resource{kedaRelease, argoRollouts, albController}
+		if err := installWorkloads(ctx, cfg, cluster, data, k8sProvider, workloadDeps); err != nil {
 			return err
 		}
 
