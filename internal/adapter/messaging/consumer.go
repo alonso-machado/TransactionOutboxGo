@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
+	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain/pii"
 	rmq "github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/rabbitmq"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/consume"
@@ -29,6 +31,8 @@ type AMQPConsumer struct {
 	method           string
 	prefetch         int
 	maxDeliveries    int
+	retryBackoffBase time.Duration
+	retryBackoffCap  time.Duration
 	messagesTotal    metric.Int64Counter
 	retryAttempts    metric.Int64Counter
 }
@@ -36,7 +40,15 @@ type AMQPConsumer struct {
 // NewConsumer builds a consumer bound to method's queue (e.g. "PIX" ->
 // payments.pix.queue) — each consumer-worker instance consumes exactly one
 // method's queue, decoupling payment methods from consumer scaling.
-func NewConsumer(conn *amqp.Connection, processMsg *consume.ProcessMessage, method string, prefetch, maxDeliveries int) *AMQPConsumer {
+// retryBackoffBase/Cap drive the per-message TTL on the *.retry queue
+// (Phase 5 Track 2.A); zero values fall back to 1s/5m.
+func NewConsumer(conn *amqp.Connection, processMsg *consume.ProcessMessage, method string, prefetch, maxDeliveries int, retryBackoffBase, retryBackoffCap time.Duration) *AMQPConsumer {
+	if retryBackoffBase <= 0 {
+		retryBackoffBase = time.Second
+	}
+	if retryBackoffCap <= 0 {
+		retryBackoffCap = 5 * time.Minute
+	}
 	meter := otel.GetMeterProvider().Meter("adapter/messaging")
 	messagesTotal, err := meter.Int64Counter("consumer.messages_processed_total")
 	if err != nil {
@@ -47,13 +59,15 @@ func NewConsumer(conn *amqp.Connection, processMsg *consume.ProcessMessage, meth
 		log.Printf("create consumer.retry_attempts_total counter: %v", err)
 	}
 	return &AMQPConsumer{
-		conn:          conn,
-		processMsg:    processMsg,
-		method:        method,
-		prefetch:      prefetch,
-		maxDeliveries: maxDeliveries,
-		messagesTotal: messagesTotal,
-		retryAttempts: retryAttempts,
+		conn:             conn,
+		processMsg:       processMsg,
+		method:           method,
+		prefetch:         prefetch,
+		maxDeliveries:    maxDeliveries,
+		retryBackoffBase: retryBackoffBase,
+		retryBackoffCap:  retryBackoffCap,
+		messagesTotal:    messagesTotal,
+		retryAttempts:    retryAttempts,
 	}
 }
 
@@ -133,6 +147,20 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 		span.RecordError(errors.New(pii.Redact(err.Error())))
 		span.SetStatus(codes.Error, pii.Redact(err.Error()))
 
+		// An unknown/newer schema version can never succeed on retry — it's
+		// a structural incompatibility, not a transient failure — so reject
+		// straight to DLQ on the first attempt instead of burning through
+		// maxDeliveries (Phase 5 Track 2.D).
+		if errors.Is(err, consume.ErrUnknownSchemaVersion) {
+			log.Printf("unknown schema version for message %s — rejecting to DLQ", d.MessageId)
+			span.SetAttributes(attribute.String("outcome", "unknown_schema_version"))
+			if c.messagesTotal != nil {
+				c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "unknown_schema_version")))
+			}
+			_ = d.Reject(false)
+			return
+		}
+
 		if retryCount+1 >= c.maxDeliveries {
 			log.Printf("poison message %s after %d attempts — rejecting to DLQ", d.MessageId, retryCount+1)
 			span.SetAttributes(attribute.String("outcome", "poison_dlq"))
@@ -173,10 +201,15 @@ func retryCountFromHeaders(h amqp.Table) int {
 	}
 }
 
-// requeueWithRetryCount republishes the delivery to the same queue with its
-// retry count incremented, then the caller Acks the original delivery — a
-// plain Nack(requeue=true) can't carry an updated header, so the retry has
-// to be a fresh publish.
+// requeueWithRetryCount publishes the delivery onto the per-method
+// *.retry queue (Phase 5 Track 2.A) with its retry count incremented and a
+// per-message `expiration` (TTL) set to the computed backoff, then the
+// caller Acks the original delivery — a plain Nack(requeue=true) can't
+// carry an updated header or a delay, so the retry has to be a fresh
+// publish. The retry queue has no consumer; once its TTL elapses the broker
+// dead-letters the message back onto the main queue (see
+// rmq.declareMethodQueue's retryArgs), giving variable per-message
+// exponential backoff with no broker plugin.
 func (c *AMQPConsumer) requeueWithRetryCount(d amqp.Delivery, retryCount int) error {
 	ch, err := c.conn.Channel()
 	if err != nil {
@@ -195,13 +228,21 @@ func (c *AMQPConsumer) requeueWithRetryCount(d amqp.Delivery, retryCount int) er
 	}
 	headers[retryCountHeader] = int32(retryCount)
 
-	err = ch.PublishWithContext(context.Background(), rmq.Exchange, rmq.RoutingKeyFor(c.method), false, false, amqp.Publishing{
+	backoff := domain.Backoff(retryCount, c.retryBackoffBase, c.retryBackoffCap)
+	expirationMs := strconv.FormatInt(backoff.Milliseconds(), 10)
+
+	// Publish directly to the retry queue (default exchange, routing key =
+	// queue name) — it isn't bound to rmq.Exchange, it's a holding pen the
+	// message sits in for its TTL before the broker's own DLX redelivers it
+	// onto the main queue.
+	err = ch.PublishWithContext(context.Background(), "", rmq.RetryQueueFor(c.method), false, false, amqp.Publishing{
 		ContentType:  d.ContentType,
 		DeliveryMode: amqp.Persistent,
 		MessageId:    d.MessageId,
 		Timestamp:    time.Now().UTC(),
 		Body:         d.Body,
 		Headers:      headers,
+		Expiration:   expirationMs,
 	})
 	if err != nil {
 		return fmt.Errorf("publish retry: %w", err)

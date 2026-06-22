@@ -44,6 +44,15 @@ func DLQFor(method string) string {
 	return "payments." + strings.ToLower(method) + ".dlq"
 }
 
+// RetryQueueFor returns the per-method retry-holding queue name for method,
+// e.g. "payments.pix.retry" (Phase 5 Track 2.A). It has no consumer; a
+// message sits here for its backoff TTL (set per-message via the
+// `expiration` field on publish), then the broker dead-letters it back onto
+// QueueFor(method) via this queue's DLX/dead-letter-routing-key args.
+func RetryQueueFor(method string) string {
+	return "payments." + strings.ToLower(method) + ".retry"
+}
+
 // RoutingKeyFor returns the topic-exchange routing key for method, e.g.
 // "payment.pix".
 func RoutingKeyFor(method string) string {
@@ -140,6 +149,23 @@ func declareMethodQueue(ch *amqp.Channel, method string) error {
 	}
 	if err := ch.QueueBind(queue, RoutingKeyFor(method), Exchange, false, nil); err != nil {
 		return fmt.Errorf("bind queue %s: %w", queue, err)
+	}
+
+	// Phase 5 Track 2.A: per-method retry-holding queue, no consumer. A
+	// message republished here with a per-message `expiration` (the
+	// computed backoff) sits for that TTL, then the broker dead-letters it
+	// back onto the routing key below — straight back onto `queue` — via
+	// this queue's own DLX args. Bound directly to Exchange/RoutingKeyFor so
+	// it's reachable the same way the main queue is, with no separate
+	// binding needed for the retry republish.
+	retryQueue := RetryQueueFor(method)
+	retryArgs := amqp.Table{
+		"x-queue-type":              "quorum",
+		"x-dead-letter-exchange":    Exchange,
+		"x-dead-letter-routing-key": RoutingKeyFor(method),
+	}
+	if _, err := ch.QueueDeclare(retryQueue, true, false, false, false, retryArgs); err != nil {
+		return fmt.Errorf("declare retry queue %s: %w", retryQueue, err)
 	}
 	return nil
 }

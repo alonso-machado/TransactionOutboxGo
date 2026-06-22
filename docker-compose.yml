@@ -17,6 +17,8 @@ x-consumer-worker-base: &consumer-worker-base
       condition: service_healthy
     rabbitmq:
       condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
   networks:
     - outbox
   restart: unless-stopped
@@ -26,6 +28,8 @@ x-consumer-worker-env: &consumer-worker-env
   RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
   PREFETCH_COUNT: "${CONSUMER_PREFETCH:-10}"
   MAX_DELIVERIES: "${RABBITMQ_MAX_REDELIVERIES:-5}"
+  RETRY_BACKOFF_BASE: "${RETRY_BACKOFF_BASE:-1s}"
+  RETRY_BACKOFF_CAP: "${RETRY_BACKOFF_CAP:-5m}"
   OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-jaeger:4318}"
 
 services:
@@ -89,6 +93,29 @@ services:
     networks:
       - outbox
 
+  # Phase 5 Track 1: one-shot golang-migrate container that applies
+  # migrations/*.up.sql before any app service starts — replaces the
+  # AutoMigrate/MigrateTimescale boot-time calls that used to live in
+  # cmd/ingestion-api/main.go and cmd/consumer-worker/main.go. Exits 0 (or
+  # a no-op if already at the latest version) and the container is left in
+  # "Exited" state, which `depends_on: condition: service_completed_successfully`
+  # below waits on.
+  migrate:
+    image: migrate/migrate:latest
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint:
+      - migrate
+      - -path=/migrations
+      - -database
+      - "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@postgres:5432/${POSTGRES_DB:-outbox}?sslmode=disable"
+      - up
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - outbox
+
   # ── Application services ────────────────────────────────────────────────────
 
   ingestion-api:
@@ -106,6 +133,8 @@ services:
       OUTBOX_DISPATCH_BATCH_SIZE: "${OUTBOX_DISPATCH_BATCH_SIZE:-50}"
       OUTBOX_MAX_RETRIES: "${OUTBOX_MAX_RETRIES:-5}"
       OUTBOX_PRUNE_AFTER_HOURS: "${OUTBOX_PRUNE_AFTER_HOURS:-48}"
+      RETRY_BACKOFF_BASE: "${RETRY_BACKOFF_BASE:-1s}"
+      RETRY_BACKOFF_CAP: "${RETRY_BACKOFF_CAP:-5m}"
       OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-ingestion-api}"
       OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-jaeger:4318}"
       METRICS_PORT: "${METRICS_PORT:-9090}"
@@ -129,6 +158,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     networks:
       - outbox
     restart: unless-stopped

@@ -19,15 +19,16 @@ type OutboxMessageModel struct {
 	LastError      string
 	CreatedAt      time.Time
 	PublishedAt    *time.Time
-	PaymentMethod  string `gorm:"column:payment_method;not null"`
+	PaymentMethod  string     `gorm:"column:payment_method;not null"`
+	NextRetryAt    *time.Time `gorm:"column:next_retry_at"`
 }
 
 func (OutboxMessageModel) TableName() string { return "outbox_messages" }
 
 type PaymentModel struct {
-	ID                uuid.UUID  `gorm:"type:uuid;primaryKey"`
-	SourceMessageID   string     `gorm:"uniqueIndex;not null"`
-	EventID           string     `gorm:"index"`
+	ID                uuid.UUID `gorm:"type:uuid;primaryKey"`
+	SourceMessageID   string    `gorm:"uniqueIndex;not null"`
+	EventID           string    `gorm:"index"`
 	ProviderName      string
 	ProviderPaymentID string
 	ExternalPaymentID string

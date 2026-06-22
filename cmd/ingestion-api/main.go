@@ -50,15 +50,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("database: %v", err)
 	}
-	if err := persistence.AutoMigrate(db); err != nil {
-		log.Fatalf("migrate: %v", err)
-	}
-	// ingestion-api owns the TimescaleDB migration — it has the DB pool
-	// first, and consumer-worker only ever writes to these tables, never
-	// creates them.
-	if err := persistence.MigrateTimescale(db); err != nil {
-		log.Fatalf("migrate timescale: %v", err)
-	}
+	// Schema migrations are no longer applied here — Phase 5 Track 1 moved
+	// them to versioned golang-migrate files under migrations/, applied by
+	// `make migrate` / the migrate/migrate compose service before the app
+	// starts (see docker-compose.yml's `migrate` service).
 
 	conn, err := rmq.Connect(cfg.RabbitMQURL)
 	if err != nil {
@@ -78,7 +73,7 @@ func main() {
 	}
 
 	uow := persistence.NewUnitOfWork(db)
-	outboxRepo := persistence.NewOutboxRepository(db)
+	outboxRepo := persistence.NewOutboxRepository(db, cfg.RetryBackoffBase, cfg.RetryBackoffCap)
 	publisher := messaging.NewPublisher(conn)
 
 	ingestUC := ingest.New(outboxRepo, uow)

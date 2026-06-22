@@ -18,6 +18,12 @@ import (
 
 var tracer = otel.Tracer("usecase/ingest")
 
+// SchemaVersion is the outbox payload / RabbitMQ message envelope's major
+// version (Phase 5 Track 2.D) — carried in the body and as a message
+// header so the consumer can reject an unknown/newer version to DLQ instead
+// of crash-looping on a parse error.
+const SchemaVersion = "1"
+
 type IngestPayment struct {
 	outboxRepo domain.OutboxRepository
 	uow        domain.UnitOfWork
@@ -36,7 +42,7 @@ type Request struct {
 	ExternalPaymentID string
 	PayerID           *uuid.UUID
 	RecipientID       *uuid.UUID
-	Amount            int64  // minor units — converted from the wire float at the HTTP boundary
+	Amount            int64 // minor units — converted from the wire float at the HTTP boundary
 	Currency          string
 	Method            string
 	MethodDetails     []byte // raw JSON sub-object, e.g. the "pix" object
@@ -55,6 +61,7 @@ type Response struct {
 // the RabbitMQ message — it pre-commits the Payment's primary key so the
 // consumer doesn't need to mint a new one.
 type outboxPayload struct {
+	SchemaVersion     string          `json:"schemaVersion"`
 	PaymentID         uuid.UUID       `json:"paymentId"`
 	EventID           string          `json:"eventId"`
 	ProviderName      string          `json:"providerName"`
@@ -84,6 +91,7 @@ func (uc *IngestPayment) Execute(ctx context.Context, req Request) (*Response, e
 	}
 
 	payload, err := json.Marshal(outboxPayload{
+		SchemaVersion:     SchemaVersion,
 		PaymentID:         paymentID,
 		EventID:           req.EventID,
 		ProviderName:      req.ProviderName,
@@ -112,6 +120,15 @@ func (uc *IngestPayment) Execute(ctx context.Context, req Request) (*Response, e
 	key := computeKey(req.HTTPMethod, []byte(keySource), req.IdempotencyKey)
 	span.SetAttributes(attribute.String("idempotency_key", key))
 
+	// Carry schemaVersion as a RabbitMQ message header too (Track 2.D), not
+	// just in the body — lets a future consumer-side filter/inspection tool
+	// branch on it without parsing the body.
+	headers := make(map[string]string, len(req.Headers)+1)
+	for k, v := range req.Headers {
+		headers[k] = v
+	}
+	headers["schemaVersion"] = SchemaVersion
+
 	msg := &domain.OutboxMessage{
 		ID:             paymentID,
 		IdempotencyKey: key,
@@ -119,7 +136,7 @@ func (uc *IngestPayment) Execute(ctx context.Context, req Request) (*Response, e
 		HTTPMethod:     req.HTTPMethod,
 		Route:          req.Route,
 		Payload:        payload,
-		Headers:        req.Headers,
+		Headers:        headers,
 		Status:         domain.OutboxStatusNew,
 		CreatedAt:      time.Now().UTC(),
 		PaymentMethod:  req.Method,

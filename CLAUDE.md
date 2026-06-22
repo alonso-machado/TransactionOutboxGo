@@ -227,3 +227,7 @@ rationale.
   tudo"). The user commits and pushes everything themselves. Stage/diff/log
   read-only git commands are fine; leave the working tree's changes
   uncommitted and tell the user what's ready for them to commit.
+- Do **not** run `pulumi` locally, ever (no `pulumi up`/`preview`/`destroy`/etc.).
+  Pulumi changes are reviewed as code only — the user applies them themselves
+  from their own environment. `grep`/`find`, and read-only `podman run`/`podman
+  logs`/`podman ps` are always fine to run.

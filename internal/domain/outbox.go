@@ -30,6 +30,11 @@ type OutboxMessage struct {
 	CreatedAt      time.Time
 	PublishedAt    *time.Time
 	PaymentMethod  string // e.g. "PIX" — drives the per-method routing key
+	// NextRetryAt gates FetchPending eligibility (Phase 5 Track 2.A): NULL
+	// for NEW rows (eligible immediately), set to now()+backoff(RetryCount)
+	// by MarkRetrying so RETRYING rows wait out their backoff instead of
+	// being re-fetched every dispatch tick.
+	NextRetryAt *time.Time
 }
 
 // OutboxRepository is the port for the Outbox table. Enqueue reports
@@ -38,11 +43,34 @@ type OutboxMessage struct {
 // "accepted".
 type OutboxRepository interface {
 	Enqueue(ctx context.Context, uow UnitOfWork, msg *OutboxMessage) (created bool, err error)
-	FetchPending(ctx context.Context, limit int) ([]*OutboxMessage, error) // status IN (NEW, RETRYING)
+	// FetchPending selects status IN (NEW, RETRYING) AND (next_retry_at IS
+	// NULL OR next_retry_at <= now()), FOR UPDATE SKIP LOCKED.
+	FetchPending(ctx context.Context, limit int) ([]*OutboxMessage, error)
 	MarkPublished(ctx context.Context, id uuid.UUID, publishedAt time.Time) error
 	MarkRetrying(ctx context.Context, id uuid.UUID, lastError string) error
 	MarkDeadLetter(ctx context.Context, id uuid.UUID, lastError string) error
 	DeleteOldPublished(ctx context.Context, olderThan time.Duration) error
+	// CountPending returns the true count of status IN (NEW, RETRYING) rows
+	// — Phase 5 Track 2.B fix for the "pending_count" gauge being capped at
+	// batchSize (len(msgs)) instead of reflecting the real backlog.
+	CountPending(ctx context.Context) (int64, error)
+	// CountDeadLetter returns the count of DEAD_LETTER rows, exposed as the
+	// dead_letter_count gauge (Track 2.B) — a non-zero value is an operator
+	// signal.
+	CountDeadLetter(ctx context.Context) (int64, error)
+}
+
+// DLQReplayer is the port for outbox-side dead-letter replay (Phase 5
+// Track 2.C): resets DEAD_LETTER rows back to NEW so the existing dispatch
+// loop picks them up and republishes. Kept as a separate, small interface
+// (rather than folded into OutboxRepository) so cmd/outbox-admin depends on
+// exactly the operation it needs.
+type DLQReplayer interface {
+	// ReplayDeadLetters resets up to limit DEAD_LETTER rows for method (or
+	// all methods if method is "") back to status=NEW, retry_count=0,
+	// next_retry_at=NULL, last_error cleared. Returns the number of rows
+	// reset.
+	ReplayDeadLetters(ctx context.Context, method string, limit int) (int64, error)
 }
 
 type Publisher interface {

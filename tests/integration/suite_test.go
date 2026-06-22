@@ -6,6 +6,8 @@ import (
 	"context"
 	"log"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +22,9 @@ import (
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ingest"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/outbox"
 	"github.com/gin-gonic/gin"
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
 	amqp "github.com/rabbitmq/amqp091-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	tcrabbitmq "github.com/testcontainers/testcontainers-go/modules/rabbitmq"
@@ -39,13 +44,46 @@ var suite struct {
 	rmqC     *tcrabbitmq.RabbitMQContainer
 }
 
+// migrationsDir resolves the repo's migrations/ directory relative to this
+// source file (not the test binary's working directory), so the suite
+// finds it regardless of where `go test` is invoked from.
+func migrationsDir() (string, error) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", os.ErrNotExist
+	}
+	return filepath.Abs(filepath.Join(filepath.Dir(thisFile), "..", "..", "migrations"))
+}
+
+// applyMigrations runs every up migration in migrations/ against dsn via
+// golang-migrate's Go library — the in-process equivalent of `make migrate`
+// /the compose `migrate` service, used here so the ephemeral testcontainer
+// Postgres ends up with exactly the schema production gets, with no
+// AutoMigrate anywhere in the suite.
+func applyMigrations(dsn string) error {
+	dir, err := migrationsDir()
+	if err != nil {
+		return err
+	}
+	m, err := migrate.New("file://"+filepath.ToSlash(dir), dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _, _ = m.Close() }()
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		return err
+	}
+	return nil
+}
+
 func TestMain(m *testing.M) {
 	gin.SetMode(gin.TestMode)
 	ctx := context.Background()
 
 	pgC, err := tcpostgres.Run(ctx,
-		// Phase 4 Track 2: the suite needs the timescaledb extension to
-		// exercise MigrateTimescale below — plain postgres can't run it.
+		// Phase 4 Track 2: the suite needs the timescaledb extension for the
+		// hypertables created by migrations/000002_timescale.up.sql (applied
+		// below via applyMigrations) — plain postgres can't run it.
 		"timescale/timescaledb:latest-pg18",
 		tcpostgres.WithDatabase("outbox_test"),
 		tcpostgres.WithUsername("outbox"),
@@ -85,16 +123,13 @@ func TestMain(m *testing.M) {
 	}
 	suite.db = db
 
-	// AutoMigrate against the ephemeral testcontainer schema only — this is
-	// not the "shared/real schema" scenario CLAUDE.md's AutoMigrate ban
-	// guards against; the container (and its schema) is destroyed at suite
-	// teardown and never reused outside this test run.
-	if err := persistence.AutoMigrate(db); err != nil {
-		log.Printf("automigrate: %v", err)
-		os.Exit(1)
-	}
-	if err := persistence.MigrateTimescale(db); err != nil {
-		log.Printf("migrate timescale: %v", err)
+	// Phase 5 Track 1: apply the same versioned migrations/ directory the
+	// real services rely on (via golang-migrate) against the ephemeral
+	// testcontainer Postgres, instead of AutoMigrate/MigrateTimescale — so
+	// the integration suite is also a regression test that the migrations
+	// directory alone produces a working schema.
+	if err := applyMigrations(dsn); err != nil {
+		log.Printf("apply migrations: %v", err)
 		os.Exit(1)
 	}
 
@@ -159,7 +194,7 @@ func purgeQueue(t *testing.T, name string) {
 
 // newIngest wires a fresh IngestPayment use case against the shared DB.
 func newIngest() *ingest.IngestPayment {
-	outboxRepo := persistence.NewOutboxRepository(suite.db)
+	outboxRepo := persistence.NewOutboxRepository(suite.db, 0, 0)
 	uow := persistence.NewUnitOfWork(suite.db)
 	return ingest.New(outboxRepo, uow)
 }
@@ -182,7 +217,7 @@ func newDispatch(batchSize, maxRetries int, interval, pruneAfter time.Duration) 
 // unavailability and max-retry/dead-letter scenarios without touching the
 // shared connection other tests depend on.
 func newDispatchWithConn(conn *amqp.Connection, batchSize, maxRetries int, interval, pruneAfter time.Duration) (*outbox.DispatchOutbox, *persistence.GORMOutboxRepository) {
-	outboxRepo := persistence.NewOutboxRepository(suite.db)
+	outboxRepo := persistence.NewOutboxRepository(suite.db, 0, 0)
 	publisher := messaging.NewPublisher(conn)
 	return outbox.New(outboxRepo, publisher, batchSize, maxRetries, interval, pruneAfter), outboxRepo
 }
@@ -201,7 +236,7 @@ func newConsumer(method string, prefetch, maxDeliveries int) *messaging.AMQPCons
 	paymentRepo := persistence.NewPaymentRepository(suite.db)
 	uow := persistence.NewUnitOfWork(suite.db)
 	processMsg := consume.New(paymentRepo, uow)
-	return messaging.NewConsumer(suite.amqpConn, processMsg, method, prefetch, maxDeliveries)
+	return messaging.NewConsumer(suite.amqpConn, processMsg, method, prefetch, maxDeliveries, 0, 0)
 }
 
 // waitFor polls cond until it returns true or timeout elapses, returning the

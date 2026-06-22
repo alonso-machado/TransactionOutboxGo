@@ -12,11 +12,23 @@ import (
 )
 
 type GORMOutboxRepository struct {
-	db *gorm.DB
+	db               *gorm.DB
+	retryBackoffBase time.Duration
+	retryBackoffCap  time.Duration
 }
 
-func NewOutboxRepository(db *gorm.DB) *GORMOutboxRepository {
-	return &GORMOutboxRepository{db: db}
+// NewOutboxRepository wires the repository with the retry-backoff
+// base/cap used by MarkRetrying (Phase 5 Track 2.A) — falls back to the
+// config defaults (1s/5m) if zero values are passed so existing callers
+// (and tests) that don't care about backoff still get sane behavior.
+func NewOutboxRepository(db *gorm.DB, retryBackoffBase, retryBackoffCap time.Duration) *GORMOutboxRepository {
+	if retryBackoffBase <= 0 {
+		retryBackoffBase = time.Second
+	}
+	if retryBackoffCap <= 0 {
+		retryBackoffCap = 5 * time.Minute
+	}
+	return &GORMOutboxRepository{db: db, retryBackoffBase: retryBackoffBase, retryBackoffCap: retryBackoffCap}
 }
 
 func (r *GORMOutboxRepository) Enqueue(ctx context.Context, uow domain.UnitOfWork, msg *domain.OutboxMessage) (bool, error) {
@@ -47,6 +59,7 @@ func (r *GORMOutboxRepository) FetchPending(ctx context.Context, limit int) ([]*
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		return tx.
 			Where("status IN ?", []string{string(domain.OutboxStatusNew), string(domain.OutboxStatusRetrying)}).
+			Where("next_retry_at IS NULL OR next_retry_at <= ?", time.Now().UTC()).
 			Order("created_at ASC").
 			Limit(limit).
 			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
@@ -68,13 +81,23 @@ func (r *GORMOutboxRepository) MarkPublished(ctx context.Context, id uuid.UUID, 
 		Updates(map[string]any{"status": string(domain.OutboxStatusPublished), "published_at": publishedAt}).Error
 }
 
+// MarkRetrying bumps retry_count and sets next_retry_at = now() +
+// backoff(retry_count) — exponential with full jitter (Phase 5 Track 2.A) —
+// so FetchPending's new predicate makes the row wait out its backoff
+// instead of being re-fetched on the very next dispatch tick.
 func (r *GORMOutboxRepository) MarkRetrying(ctx context.Context, id uuid.UUID, lastError string) error {
+	var m OutboxMessageModel
+	if err := r.db.WithContext(ctx).Select("retry_count").Where("id = ?", id).First(&m).Error; err != nil {
+		return err
+	}
+	nextRetryAt := time.Now().UTC().Add(domain.Backoff(m.RetryCount+1, r.retryBackoffBase, r.retryBackoffCap))
 	return r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
 		Where("id = ?", id).
 		Updates(map[string]any{
-			"status":      string(domain.OutboxStatusRetrying),
-			"retry_count": gorm.Expr("retry_count + 1"),
-			"last_error":  lastError,
+			"status":        string(domain.OutboxStatusRetrying),
+			"retry_count":   gorm.Expr("retry_count + 1"),
+			"last_error":    lastError,
+			"next_retry_at": nextRetryAt,
 		}).Error
 }
 
@@ -89,6 +112,55 @@ func (r *GORMOutboxRepository) DeleteOldPublished(ctx context.Context, olderThan
 	return r.db.WithContext(ctx).
 		Where("status = ? AND published_at < ?", string(domain.OutboxStatusPublished), cutoff).
 		Delete(&OutboxMessageModel{}).Error
+}
+
+// CountPending returns the true count of NEW/RETRYING rows — Phase 5 Track
+// 2.B fix for the pending_count gauge being capped at batchSize.
+func (r *GORMOutboxRepository) CountPending(ctx context.Context) (int64, error) {
+	var n int64
+	err := r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
+		Where("status IN ?", []string{string(domain.OutboxStatusNew), string(domain.OutboxStatusRetrying)}).
+		Count(&n).Error
+	return n, err
+}
+
+// CountDeadLetter returns the count of DEAD_LETTER rows (Track 2.B).
+func (r *GORMOutboxRepository) CountDeadLetter(ctx context.Context) (int64, error) {
+	var n int64
+	err := r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
+		Where("status = ?", string(domain.OutboxStatusDeadLetter)).
+		Count(&n).Error
+	return n, err
+}
+
+// ReplayDeadLetters implements domain.DLQReplayer (Phase 5 Track 2.C):
+// resets DEAD_LETTER rows back to NEW so the existing dispatch loop picks
+// them up and republishes. method == "" replays across every method.
+func (r *GORMOutboxRepository) ReplayDeadLetters(ctx context.Context, method string, limit int) (int64, error) {
+	var ids []uuid.UUID
+	q := r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
+		Where("status = ?", string(domain.OutboxStatusDeadLetter))
+	if method != "" {
+		q = q.Where("payment_method = ?", method)
+	}
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	if err := q.Order("created_at ASC").Pluck("id", &ids).Error; err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	res := r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
+		Where("id IN ?", ids).
+		Updates(map[string]any{
+			"status":        string(domain.OutboxStatusNew),
+			"retry_count":   0,
+			"next_retry_at": nil,
+			"last_error":    "",
+		})
+	return res.RowsAffected, res.Error
 }
 
 func toDomainOutbox(m OutboxMessageModel) *domain.OutboxMessage {
@@ -108,5 +180,6 @@ func toDomainOutbox(m OutboxMessageModel) *domain.OutboxMessage {
 		CreatedAt:      m.CreatedAt,
 		PublishedAt:    m.PublishedAt,
 		PaymentMethod:  m.PaymentMethod,
+		NextRetryAt:    m.NextRetryAt,
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
@@ -13,21 +14,43 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 )
 
 var tracer = otel.Tracer("usecase/consume")
 
+// supportedSchemaMajor is the major schemaVersion this consumer build
+// understands (Phase 5 Track 2.D) — kept in lockstep with
+// usecase/ingest.SchemaVersion, but usecase/consume must not import
+// usecase/ingest (use-cases don't depend on each other), so it's a small
+// independent constant instead.
+const supportedSchemaMajor = "1"
+
+// ErrUnknownSchemaVersion is returned when the message's schemaVersion
+// doesn't match supportedSchemaMajor — the caller (AMQPConsumer) treats this
+// like any other processing error, but it's exhausted to DLQ on the FIRST
+// attempt rather than retried, since retrying a structurally-incompatible
+// message can never succeed.
+var ErrUnknownSchemaVersion = errors.New("unknown schema version")
+
 type ProcessMessage struct {
-	paymentRepo domain.PaymentRepository
-	uow         domain.UnitOfWork
+	paymentRepo          domain.PaymentRepository
+	uow                  domain.UnitOfWork
+	unknownSchemaVersion metric.Int64Counter
 }
 
 func New(paymentRepo domain.PaymentRepository, uow domain.UnitOfWork) *ProcessMessage {
-	return &ProcessMessage{paymentRepo: paymentRepo, uow: uow}
+	meter := otel.GetMeterProvider().Meter("usecase/consume")
+	unknownSchemaVersion, err := meter.Int64Counter("consumer.unknown_schema_version_total")
+	if err != nil {
+		log.Printf("create consumer.unknown_schema_version_total counter: %v", err)
+	}
+	return &ProcessMessage{paymentRepo: paymentRepo, uow: uow, unknownSchemaVersion: unknownSchemaVersion}
 }
 
 type payloadDTO struct {
+	SchemaVersion     string          `json:"schemaVersion"`
 	PaymentID         string          `json:"paymentId"`
 	EventID           string          `json:"eventId"`
 	ProviderName      string          `json:"providerName"`
@@ -51,6 +74,18 @@ func (uc *ProcessMessage) Execute(ctx context.Context, messageID string, body []
 	var dto payloadDTO
 	if err := json.Unmarshal(body, &dto); err != nil {
 		return recordRedactedError(span, fmt.Errorf("unmarshal payload: %w", err))
+	}
+
+	span.SetAttributes(attribute.String("schema_version", dto.SchemaVersion))
+	// Same major version → proceed as today. Unknown/newer major version →
+	// don't crash-loop trying to parse a structurally-incompatible payload;
+	// record the operator signal and reject (the caller dead-letters on the
+	// first attempt for this specific error — see AMQPConsumer.handle).
+	if dto.SchemaVersion != "" && dto.SchemaVersion != supportedSchemaMajor {
+		if uc.unknownSchemaVersion != nil {
+			uc.unknownSchemaVersion.Add(ctx, 1, metric.WithAttributes(attribute.String("schema_version", dto.SchemaVersion)))
+		}
+		return recordRedactedError(span, fmt.Errorf("%w: %q (supported: %q)", ErrUnknownSchemaVersion, dto.SchemaVersion, supportedSchemaMajor))
 	}
 
 	paymentID, err := uuid.Parse(dto.PaymentID)

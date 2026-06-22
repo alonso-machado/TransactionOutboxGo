@@ -16,14 +16,15 @@ import (
 var tracer = otel.Tracer("usecase/outbox")
 
 type DispatchOutbox struct {
-	outboxRepo     domain.OutboxRepository
-	publisher      domain.Publisher
-	batchSize      int
-	maxRetries     int
-	interval       time.Duration
-	pruneAfter     time.Duration
-	publishedTotal metric.Int64Counter
-	pendingCount   metric.Int64Gauge
+	outboxRepo      domain.OutboxRepository
+	publisher       domain.Publisher
+	batchSize       int
+	maxRetries      int
+	interval        time.Duration
+	pruneAfter      time.Duration
+	publishedTotal  metric.Int64Counter
+	pendingCount    metric.Int64Gauge
+	deadLetterCount metric.Int64Gauge
 }
 
 func New(
@@ -41,15 +42,20 @@ func New(
 	if err != nil {
 		log.Printf("create outbox.pending_count gauge: %v", err)
 	}
+	deadLetterCount, err := meter.Int64Gauge("outbox.dead_letter_count")
+	if err != nil {
+		log.Printf("create outbox.dead_letter_count gauge: %v", err)
+	}
 	return &DispatchOutbox{
-		outboxRepo:     outboxRepo,
-		publisher:      publisher,
-		batchSize:      batchSize,
-		maxRetries:     maxRetries,
-		interval:       interval,
-		pruneAfter:     pruneAfter,
-		publishedTotal: publishedTotal,
-		pendingCount:   pendingCount,
+		outboxRepo:      outboxRepo,
+		publisher:       publisher,
+		batchSize:       batchSize,
+		maxRetries:      maxRetries,
+		interval:        interval,
+		pruneAfter:      pruneAfter,
+		publishedTotal:  publishedTotal,
+		pendingCount:    pendingCount,
+		deadLetterCount: deadLetterCount,
 	}
 }
 
@@ -122,7 +128,20 @@ func (d *DispatchOutbox) dispatch(ctx context.Context) {
 		attribute.Int("retrying_count", retryingCount),
 		attribute.Int("dead_letter_count", deadLetterCount),
 	)
+	// Record the TRUE backlog (Phase 5 Track 2.B) — len(msgs) is capped at
+	// batchSize, so a 10,000-row backlog would otherwise read as a flat 50.
 	if d.pendingCount != nil {
-		d.pendingCount.Record(ctx, int64(len(msgs)))
+		if count, err := d.outboxRepo.CountPending(ctx); err != nil {
+			log.Printf("outbox count pending error: %v", err)
+		} else {
+			d.pendingCount.Record(ctx, count)
+		}
+	}
+	if d.deadLetterCount != nil {
+		if count, err := d.outboxRepo.CountDeadLetter(ctx); err != nil {
+			log.Printf("outbox count dead-letter error: %v", err)
+		} else {
+			d.deadLetterCount.Record(ctx, count)
+		}
 	}
 }

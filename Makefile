@@ -3,15 +3,53 @@ COMPOSE_FILE := docker-compose.yml
 COMPOSE      := podman compose -f $(COMPOSE_FILE)
 GO           := podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine
 
-.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer seed-card lint swag test-unit test-integration coverage observability-up
+.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer seed-card lint swag test-unit test-integration coverage observability-up migrate migrate-down replay-dead drain-dlq
 
 ## ── Docker Compose ────────────────────────────────────────────────────────────
 
-up:
+up: migrate
 	$(COMPOSE) up --build -d
 
 down:
 	$(COMPOSE) down -v
+
+# Phase 5 Track 1: golang-migrate as a container, not the app, applies
+# migrations/*.up.sql against the compose Postgres before `up` brings up the
+# app services. Connects on localhost using compose's published Postgres
+# port, so Postgres must already be up — `make up`'s dependency on this
+# target starts it first via the one-shot `migrate` compose service.
+POSTGRES_USER     ?= outbox
+POSTGRES_PASSWORD ?= outbox
+POSTGRES_PORT     ?= 5432
+POSTGRES_DB       ?= outbox
+MIGRATE_DSN := postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable
+
+migrate:
+	$(COMPOSE) up --build -d postgres
+	podman run --rm -v "$(CURDIR)/migrations:/migrations" --network host \
+		migrate/migrate -path=/migrations -database "$(MIGRATE_DSN)" up
+
+migrate-down:
+	podman run --rm -v "$(CURDIR)/migrations:/migrations" --network host \
+		migrate/migrate -path=/migrations -database "$(MIGRATE_DSN)" down 1
+
+# Phase 5 Track 2.C — DLQ replay convenience targets. METHOD="" (default)
+# replays across every method for replay-dead; drain-dlq requires METHOD.
+# --network host + localhost DSNs so this reaches the compose Postgres/
+# RabbitMQ published ports, same pattern as test-integration.
+LIMIT ?= 100
+ADMIN_DATABASE_URL := postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable
+ADMIN_RABBITMQ_URL  := amqp://$${RABBITMQ_USER:-guest}:$${RABBITMQ_PASSWORD:-guest}@localhost:$${RABBITMQ_AMQP_PORT:-5672}/
+
+replay-dead:
+	podman run --rm --network host -v "$(CURDIR):/app" -w /app \
+		-e DATABASE_URL="$(ADMIN_DATABASE_URL)" -e RABBITMQ_URL="$(ADMIN_RABBITMQ_URL)" \
+		golang:1.26-alpine go run ./cmd/outbox-admin replay-dead --method "$(METHOD)" --limit "$(LIMIT)"
+
+drain-dlq:
+	podman run --rm --network host -v "$(CURDIR):/app" -w /app \
+		-e DATABASE_URL="$(ADMIN_DATABASE_URL)" -e RABBITMQ_URL="$(ADMIN_RABBITMQ_URL)" \
+		golang:1.26-alpine go run ./cmd/outbox-admin drain-dlq --method "$(METHOD)"
 
 # Minimal subset for working on dashboards without the full stack: the app
 # services (so there's something to scrape) plus Prometheus/Grafana/the

@@ -39,9 +39,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("database: %v", err)
 	}
-	if err := persistence.AutoMigrate(db); err != nil {
-		log.Fatalf("migrate: %v", err)
-	}
+	// Schema migrations are no longer applied here — see
+	// cmd/ingestion-api/main.go's comment; Phase 5 Track 1 moved them to
+	// migrations/, applied via `make migrate` / the compose `migrate` service.
 
 	method, ok := rmq.MethodForQueue(cfg.PaymentQueue)
 	if !ok {
@@ -58,7 +58,7 @@ func main() {
 	paymentRepo := persistence.NewPaymentRepository(db)
 
 	processUC := consume.New(paymentRepo, uow)
-	consumer := messaging.NewConsumer(conn, processUC, method, cfg.PrefetchCount, cfg.MaxDeliveries)
+	consumer := messaging.NewConsumer(conn, processUC, method, cfg.PrefetchCount, cfg.MaxDeliveries, cfg.RetryBackoffBase, cfg.RetryBackoffCap)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
