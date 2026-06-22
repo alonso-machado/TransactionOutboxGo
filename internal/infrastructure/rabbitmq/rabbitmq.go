@@ -18,8 +18,21 @@ const (
 // exchange black hole (published, matched by no binding, silently dropped).
 var Methods = []string{"PIX", "BOLETO", "TRANSFER", "CARTAO_CREDITO", "CARTAO_DEBITO"}
 
-func Connect(url string) (*amqp.Connection, error) {
-	return amqp.Dial(url)
+// Connect dials the AMQP broker. tlsEnabled is the PCI-DSS encryption-in-
+// transit toggle (Phase 5 Track 5.B, config.Config.RabbitMQTLS) — when true
+// and url uses the plain amqp:// scheme, it's switched to amqps:// before
+// dialing (Amazon MQ in cloud requires amqps://; local/compose stays
+// amqp://). If url already specifies a scheme other than "amqp", it's left
+// untouched.
+func Connect(url string, tlsEnabled bool) (*amqp.Connection, error) {
+	return amqp.Dial(withAMQPS(url, tlsEnabled))
+}
+
+func withAMQPS(url string, tlsEnabled bool) string {
+	if tlsEnabled && strings.HasPrefix(url, "amqp://") {
+		return "amqps://" + strings.TrimPrefix(url, "amqp://")
+	}
+	return url
 }
 
 // IsValidMethod reports whether method (expected upper-case) has a bound queue.

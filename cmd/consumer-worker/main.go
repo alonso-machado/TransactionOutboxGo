@@ -35,7 +35,7 @@ func main() {
 		}
 	}()
 
-	db, err := database.Connect(cfg.DatabaseURL)
+	db, err := database.Connect(cfg.DatabaseURL, cfg.DBSSLMode)
 	if err != nil {
 		log.Fatalf("database: %v", err)
 	}
@@ -48,7 +48,7 @@ func main() {
 		log.Fatalf("PAYMENT_QUEUE %q is not a known queue (expected one of: %v)", cfg.PaymentQueue, rmq.Methods)
 	}
 
-	conn, err := rmq.Connect(cfg.RabbitMQURL)
+	conn, err := rmq.Connect(cfg.RabbitMQURL, cfg.RabbitMQTLS)
 	if err != nil {
 		log.Fatalf("rabbitmq: %v", err)
 	}

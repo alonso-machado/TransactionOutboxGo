@@ -50,6 +50,17 @@ func installWorkloads(ctx *pulumi.Context, cfg *stackConfig, cluster *clusterSta
 				"databaseUrl": data.databaseURL,
 				"rabbitmqUrl": data.rabbitmqURL,
 			},
+			// Phase 5 Track 5.A: cloud sources DATABASE_URL/RABBITMQ_URL from
+			// AWS Secrets Manager via ESO's ExternalSecret CRs (templates/
+			// externalsecret.yaml) instead of the static Secret rendered
+			// from "secret" above. Local/compose (values.yaml's default,
+			// externalSecrets.enabled: false) keeps the static Secret.
+			"externalSecrets": pulumi.Map{
+				"enabled":            pulumi.Bool(true),
+				"region":             pulumi.String(cfg.awsRegion),
+				"databaseSecretName": pulumi.String(data.dbSecretName),
+				"rabbitmqSecretName": pulumi.String(data.rabbitmqSecretName),
+			},
 			// Phase 4 Track 4: Argo Rollouts controller is installed
 			// (main.go) — render Rollout/AnalysisTemplate instead of plain
 			// Deployment/HPA.

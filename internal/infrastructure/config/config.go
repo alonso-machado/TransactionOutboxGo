@@ -37,6 +37,15 @@ type Config struct {
 	RateLimitRate    float64  `envconfig:"RATE_LIMIT_RATE" default:"50"`
 	RateLimitBurst   int      `envconfig:"RATE_LIMIT_BURST" default:"100"`
 	TrustedProxies   []string `envconfig:"TRUSTED_PROXIES"`
+
+	// PCI-DSS encryption-in-transit toggles (Phase 5 Track 5.B). Both default
+	// to the plaintext local posture (`make up`/compose) so nothing changes
+	// for the demo; cloud deploys (Pulumi) set these to enforce TLS.
+	// DBSSLMode is honored by database.Connect (appended as the Postgres
+	// `sslmode` DSN param); RabbitMQTLS is honored by rabbitmq.Connect
+	// (switches the AMQP URL scheme from amqp:// to amqps://).
+	DBSSLMode   string `envconfig:"DB_SSL_MODE" default:"disable"`
+	RabbitMQTLS bool   `envconfig:"RABBITMQ_TLS" default:"false"`
 }
 
 func Load() (*Config, error) {

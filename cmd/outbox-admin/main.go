@@ -73,7 +73,7 @@ func runReplayDead(cfg *config.Config, args []string) {
 		log.Fatalf("unknown method %q (expected one of: %v)", *method, rmq.Methods)
 	}
 
-	db, err := database.Connect(cfg.DatabaseURL)
+	db, err := database.Connect(cfg.DatabaseURL, cfg.DBSSLMode)
 	if err != nil {
 		log.Fatalf("database: %v", err)
 	}
@@ -100,7 +100,7 @@ func runDrainDLQ(cfg *config.Config, args []string) {
 		log.Fatalf("--method is required and must be one of: %v", rmq.Methods)
 	}
 
-	conn, err := rmq.Connect(cfg.RabbitMQURL)
+	conn, err := rmq.Connect(cfg.RabbitMQURL, cfg.RabbitMQTLS)
 	if err != nil {
 		log.Fatalf("rabbitmq: %v", err)
 	}

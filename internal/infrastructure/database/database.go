@@ -3,6 +3,7 @@ package database
 import (
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/uptrace/opentelemetry-go-extra/otelgorm"
@@ -11,7 +12,27 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-func Connect(dsn string) (*gorm.DB, error) {
+// withSSLMode appends `sslmode=<mode>` to dsn unless the caller already set
+// one explicitly. PCI-DSS encryption-in-transit posture (Phase 5 Track 5.B):
+// local/compose defaults to "disable" (DB_SSL_MODE's own default), cloud
+// (Pulumi's RDS DATABASE_URL — see infra/pulumi/data.go) sets "require" so
+// the connection is TLS-enforced.
+func withSSLMode(dsn, sslMode string) string {
+	if sslMode == "" || strings.Contains(dsn, "sslmode=") {
+		return dsn
+	}
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	return dsn + sep + "sslmode=" + sslMode
+}
+
+// Connect opens the GORM/Postgres connection pool. sslMode is the PCI-DSS
+// Track 5.B toggle (config.Config.DBSSLMode) — pass "" to leave dsn
+// untouched (e.g. when the caller already encoded sslmode itself).
+func Connect(dsn string, sslMode string) (*gorm.DB, error) {
+	dsn = withSSLMode(dsn, sslMode)
 	// ParameterizedQueries: true keeps GORM's own slow-query/error logger from
 	// printing bound values (CPF, barcodes, PIX ids, amounts, payer/recipient
 	// UUIDs) to stdout — it substitutes '?' for every parameter instead.

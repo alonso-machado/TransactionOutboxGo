@@ -116,7 +116,7 @@ func TestMain(m *testing.M) {
 	}
 	suite.amqpURI = amqpURL
 
-	db, err := database.Connect(dsn)
+	db, err := database.Connect(dsn, "")
 	if err != nil {
 		log.Printf("connect db: %v", err)
 		os.Exit(1)
@@ -133,7 +133,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	conn, err := rmq.Connect(amqpURL)
+	conn, err := rmq.Connect(amqpURL, false)
 	if err != nil {
 		log.Printf("connect amqp: %v", err)
 		os.Exit(1)
@@ -227,7 +227,7 @@ func newDispatchWithConn(conn *amqp.Connection, batchSize, maxRetries int, inter
 // simulate broker unavailability without affecting other tests.
 func amqpDial(t *testing.T) (*amqp.Connection, error) {
 	t.Helper()
-	return rmq.Connect(suite.amqpURI)
+	return rmq.Connect(suite.amqpURI, false)
 }
 
 // newConsumer wires a real AMQPConsumer + ProcessMessage against the shared

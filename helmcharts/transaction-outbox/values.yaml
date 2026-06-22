@@ -35,6 +35,13 @@ configMap:
     # ── Messaging topology ───────────────────────────────────────────────────
     RABBITMQ_MANAGEMENT_URL: "http://rabbitmq:15672"
 
+    # ── PCI-DSS encryption-in-transit (Phase 5 Track 5.B) ───────────────────
+    # Cloud (RDS/Amazon MQ) enforces TLS; the Pulumi values override
+    # (infra/pulumi/workloads.go) sets these true/"require" for the cloud
+    # target. Default here matches the plaintext local/compose posture.
+    DB_SSL_MODE: "disable"
+    RABBITMQ_TLS: "false"
+
 # PLACEHOLDER — do NOT use these values in any real environment. Real
 # DATABASE_URL / RABBITMQ_URL are injected by CI/CD (GitHub Actions secrets,
 # HashiCorp Vault, Sealed Secrets, etc.) at deploy time via
@@ -52,6 +59,20 @@ configMap:
 secret:
   databaseUrl: "CHANGE_ME"
   rabbitmqUrl: "CHANGE_ME"
+
+# External Secrets Operator (Phase 5 Track 5.A). False by default — local/
+# compose and any bare cluster without ESO installed keep using the static
+# Secret above (templates/secret.yaml). The cloud target
+# (infra/pulumi/workloads.go, after infra/pulumi/externalsecrets.go installs
+# ESO + its IRSA role) sets this true and supplies region/the two Secrets
+# Manager entry names ESO's ExternalSecret CR (templates/externalsecret.yaml)
+# syncs from — see infra/pulumi/data.go for where those entries are created
+# and populated.
+externalSecrets:
+  enabled: false
+  region: "us-east-1"
+  databaseSecretName: "transaction-outbox/dev/database-url"
+  rabbitmqSecretName: "transaction-outbox/dev/rabbitmq-url"
 
 # Phase 5 Track 3.B/3.C — PgBouncer (transaction-pooling mode) + its
 # pgbouncer-exporter sidecar, in front of RDS. Mirrors docker-compose.yml's

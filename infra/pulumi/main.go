@@ -54,7 +54,16 @@ func main() {
 			return err
 		}
 
-		workloadDeps := []pulumi.Resource{kedaRelease, argoRollouts, albController}
+		// Phase 5 Track 5.A: External Secrets Operator must be installed
+		// (and its CRDs ready) before the app chart renders any
+		// ExternalSecret resource (workloads.go sets externalSecrets.enabled
+		// true below).
+		esoRelease, _, err := installExternalSecretsOperator(ctx, cluster, k8sProvider)
+		if err != nil {
+			return err
+		}
+
+		workloadDeps := []pulumi.Resource{kedaRelease, argoRollouts, albController, esoRelease}
 		if err := installWorkloads(ctx, cfg, cluster, data, k8sProvider, workloadDeps); err != nil {
 			return err
 		}

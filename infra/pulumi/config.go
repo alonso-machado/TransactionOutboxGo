@@ -10,7 +10,20 @@ import (
 // README.md for how dbPassword/rabbitmqPassword (always secret, never
 // defaulted) are expected to be configured before `pulumi up`.
 type stackConfig struct {
-	environment          string
+	environment string
+	// awsRegion backs the chart's externalSecret.region value
+	// (helmcharts/transaction-outbox/templates/externalsecret.yaml's
+	// SecretStore — Phase 5 Track 5.A). Set this to the same region as the
+	// stack's `aws:region` config (see Pulumi.dev.yaml/Pulumi.prod.yaml) —
+	// kept as its own `transaction-outbox:awsRegion` key rather than reading
+	// the provider's own config back out, since the Go SDK's
+	// provider-config introspection varies across pulumi-aws versions.
+	awsRegion string
+	// drRegion (Phase 5 Track 5.C) is the destination region AWS Backup
+	// copies RDS recovery points into (data.go's newBackupPlan). Left unset,
+	// recovery points are still taken but never copied cross-region — see
+	// the warning newBackupPlan logs in that case and docs/runbook.md.
+	drRegion             string
 	nodeInstanceType     string
 	nodeDesiredCapacity  int
 	nodeMinCapacity      int
@@ -44,6 +57,8 @@ func loadConfig(ctx *pulumi.Context) *stackConfig {
 	c := config.New(ctx, "transaction-outbox")
 	return &stackConfig{
 		environment:            c.Get("environment"),
+		awsRegion:              c.Get("awsRegion"),
+		drRegion:               c.Get("drRegion"),
 		nodeInstanceType:       c.Get("nodeInstanceType"),
 		nodeDesiredCapacity:    c.GetInt("nodeDesiredCapacity"),
 		nodeMinCapacity:        c.GetInt("nodeMinCapacity"),

@@ -46,7 +46,7 @@ func main() {
 		}
 	}()
 
-	db, err := database.Connect(cfg.DatabaseURL)
+	db, err := database.Connect(cfg.DatabaseURL, cfg.DBSSLMode)
 	if err != nil {
 		log.Fatalf("database: %v", err)
 	}
@@ -55,7 +55,7 @@ func main() {
 	// `make migrate` / the migrate/migrate compose service before the app
 	// starts (see docker-compose.yml's `migrate` service).
 
-	conn, err := rmq.Connect(cfg.RabbitMQURL)
+	conn, err := rmq.Connect(cfg.RabbitMQURL, cfg.RabbitMQTLS)
 	if err != nil {
 		log.Fatalf("rabbitmq: %v", err)
 	}

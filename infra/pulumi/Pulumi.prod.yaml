@@ -1,5 +1,8 @@
 config:
   aws:region: us-east-1
+  # Kept in sync with aws:region above — see config.go's comment on why this
+  # is its own key rather than reading the provider's region back out.
+  transaction-outbox:awsRegion: us-east-1
   transaction-outbox:environment: prod
   transaction-outbox:nodeInstanceType: t3.large
   transaction-outbox:nodeDesiredCapacity: 3
