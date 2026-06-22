@@ -18,13 +18,16 @@ Three hard gates, in order: **build → lint → unit-tests**. Any one failing
 stops everything downstream for that service — `upload` and `deploy` never
 run if `unit-tests` (or anything before it) is red.
 
-`lint` checks two different things, not just Go: `golangci-lint` for the code,
-then [`actionlint`](https://github.com/rhysd/actionlint) (via
+`lint` checks three different things, not just Go: `golangci-lint` for the
+code, [`actionlint`](https://github.com/rhysd/actionlint) (via
 `reviewdog/action-actionlint`) for the workflow YAML itself — both these
-files included. A broken expression, an undefined secret reference, bad
-shell syntax in a `run:` step, or a deprecated action input (this is how the
-deprecated `fail_on_error` input on the actionlint step itself got caught
-while writing it) fails the same gate a Go compile error would.
+files included — and `helm lint` against `helmcharts/transaction-outbox`
+(the chart the `deploy` job installs, via Track 4's Pulumi program). A
+broken expression, an undefined secret reference, bad shell syntax in a
+`run:` step, a deprecated action input (this is how the deprecated
+`fail_on_error` input on the actionlint step itself got caught while writing
+it), or a broken chart template/values schema all fail the same gate a Go
+compile error would.
 
 `integration-tests` (the TestContainers suite) is a **safety measure, not a
 release gate**: it needs `unit-tests` to reuse the gate result, but nothing

@@ -281,15 +281,17 @@ build  →  lint (GATE)  →  unit-tests (GATE)  →  upload (ECR/Docker Hub)  �
 
 - **`build`** (gate 1) — `go build ./cmd/<service>/...` plus `./internal/...`
   (the shared packages that service imports). Fails ⇒ stop.
-- **`lint`** (gate 2) — two checks, not just Go: `golangci/golangci-lint-action@v6`
+- **`lint`** (gate 2) — three checks, not just Go: `golangci/golangci-lint-action@v6`
   over the whole module (golangci-lint doesn't meaningfully scope by binary;
   lint findings in shared `internal/` code are relevant to both services
-  anyway), **then** `reviewdog/action-actionlint@v1` over `.github/workflows/`
+  anyway); `reviewdog/action-actionlint@v1` over `.github/workflows/`
   (catches a broken pipeline — bad expression, undefined secret reference,
   wrong shell syntax, deprecated action input — the same way golangci-lint
-  catches broken Go; each workflow file is linted by itself). `needs: build`.
-  A finding from **either** check **fails the workflow** ⇒ stop. **Runs
-  before the unit tests.**
+  catches broken Go; each workflow file is linted by itself); and
+  `helm lint helmcharts/transaction-outbox` (catches a broken K8s
+  manifest/values schema before the Track 4 `deploy` job ever tries to
+  install it). `needs: build`. A finding from **any** of the three **fails
+  the workflow** ⇒ stop. **Runs before the unit tests.**
 - **`unit-tests`** (gate 3) — `go test -race ./internal/...` (the non-
   `integration`-tagged tests). `needs: lint`. A failure **fails the workflow**
   ⇒ stop. **Runs after lint.**
@@ -371,6 +373,8 @@ jobs:
       - uses: golangci/golangci-lint-action@v6
       - uses: reviewdog/action-actionlint@v1   # lints .github/workflows/*.yml itself
         with: { github_token: "${{ secrets.GITHUB_TOKEN }}", fail_level: error }
+      - uses: azure/setup-helm@v4
+      - run: helm lint helmcharts/transaction-outbox   # lints the Track 4 chart
 
   unit-tests:           # GATE 3 — after lint
     needs: lint

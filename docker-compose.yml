@@ -8,13 +8,15 @@ x-consumer-worker-base: &consumer-worker-base
     dockerfile: Dockerfile
     args:
       SERVICE: consumer-worker
+  # jaeger is NOT a dependency here — the OTLP/HTTP exporter
+  # (internal/infrastructure/telemetry) fails open if nothing's listening at
+  # OTEL_EXPORTER_OTLP_ENDPOINT (traces are just dropped, not fatal), so a
+  # partial `up` that skips jaeger (see `make loadtest-up`) still works.
   depends_on:
     postgres:
       condition: service_healthy
     rabbitmq:
       condition: service_healthy
-    jaeger:
-      condition: service_started
   networks:
     - outbox
   restart: unless-stopped
@@ -97,13 +99,14 @@ services:
     ports:
       - "${APP_PORT:-8080}:8080"
       - "${METRICS_PORT:-9090}:9090"
+    # jaeger is NOT a dependency here — see consumer-worker's note above;
+    # this lets `make loadtest-up` bring up a minimal subset of this same
+    # compose file without dragging Jaeger along.
     depends_on:
       postgres:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-      jaeger:
-        condition: service_started
     networks:
       - outbox
     restart: unless-stopped

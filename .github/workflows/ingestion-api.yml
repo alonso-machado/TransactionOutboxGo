@@ -62,6 +62,11 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           fail_level: error
+      # Lints the Helm chart this service's deploy job (Track 4) installs —
+      # catches a broken K8s manifest/values schema the same way
+      # golangci-lint/actionlint catch broken Go/YAML.
+      - uses: azure/setup-helm@v4
+      - run: helm lint helmcharts/transaction-outbox
 
   unit-tests:
     name: unit-tests (gate 3)

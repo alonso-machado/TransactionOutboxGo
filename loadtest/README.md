@@ -12,13 +12,14 @@ mix them up:
 ## 6.1 — Latency baseline
 
 ```bash
-make loadtest TARGET_URL=http://localhost:8080
-make loadtest-report TARGET_URL=http://localhost:8080   # + summary.json
+make loadtest-up
+make loadtest TARGET_URL=http://localhost:8080 VUS=20
+make loadtest-report TARGET_URL=http://localhost:8080 VUS=20   # + summary.json
 ```
 
-Two 5-minute phases at 100 VUs: Phase A round-robins all 5 methods, Phase B
-hits PIX only. **Pin every consumer to 1 replica first** — on local compose
-each `consumer-<method>` service already runs a single instance (leave it);
+Two 5-minute phases at `VUS` virtual users: Phase A round-robins all 5
+methods, Phase B hits PIX only. **Pin every consumer to 1 replica first** —
+both compose files already run a single instance per consumer (leave it);
 on Kubernetes, set the KEDA `ScaledObject`'s `minReplicaCount`/
 `maxReplicaCount` to 1, or annotate it `autoscaling.keda.sh/paused-replicas: "1"`.
 
@@ -45,9 +46,12 @@ out-of-band — k6 only produces the load.
 
 ## 6.3 — Consumer-worker in isolation
 
-Needs a custom k6 binary (xk6-amqp + xk6-sql):
+Needs a custom k6 binary (xk6-amqp + xk6-sql). `make loadtest-up`'s single
+PIX consumer is exactly what this test wants by default (`METHOD=PIX`) —
+use it instead of the full stack here too.
 
 ```bash
+make loadtest-up
 make k6-ext-build
 make loadtest-consumer METHOD=PIX N=100000 \
   RABBITMQ_URL=amqp://guest:guest@localhost:5672/ \
@@ -58,7 +62,10 @@ Publishes `N` messages straight onto `payments.<method>.queue` (the exact
 shape `DispatchOutbox`'s publisher puts on the wire — bypassing
 ingestion-api entirely), then polls `payments` until the batch is drained.
 Reports `messages_persisted`, `consume_to_persist_latency` (p95/p99), and
-the standard k6 summary for the publish side.
+the standard k6 summary for the publish side. On a small machine, drop `N`
+well below the 100000 default (e.g. `N=5000`) — it's a one-instance consumer
+draining a single queue, not a throughput ceiling worth measuring on
+4 cores.
 
 - `SCENARIO=drain` (default) — clean throughput number, every message a
   distinct `paymentId`/`source_message_id`.

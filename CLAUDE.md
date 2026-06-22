@@ -20,6 +20,7 @@ Payments domain:
 Full design (Phase 1 — core system): [`.claude/plan.md`](.claude/plan.md)
 Phase 2 plan (OTel · Swagger · TestContainers · K8s+KEDA): [`.claude/plan-phase2.md`](.claude/plan-phase2.md)
 Phase 3 plan (per-method queues · card payments · CI/CD · Pulumi/AWS · k6): [`.claude/plan-phase3.md`](.claude/plan-phase3.md)
+Phase 4 plan (leaky-bucket rate limiter · canary deploys · Grafana · TimescaleDB): [`.claude/plan-phase4.md`](.claude/plan-phase4.md)
 User-facing docs: [`README.md`](README.md)
 
 ---
@@ -190,13 +191,15 @@ service never triggers, gates, or redeploys the other. Both follow the same
 gate order:
 
 ```
-build → lint (golangci-lint + actionlint, GATE) → unit-tests (GATE) → upload (ECR) → deploy (pulumi up)
-                                                              └── integration-tests (optional, flag-gated, never blocks)
+build → lint (golangci-lint + actionlint + helm lint, GATE) → unit-tests (GATE) → upload (ECR) → deploy (pulumi up)
+                                                                        └── integration-tests (optional, flag-gated, never blocks)
 ```
 
-`lint` runs **two** checks: `golangci-lint` over the Go code, and
-`actionlint` over the workflow YAML itself (catches a broken pipeline the
-same way golangci-lint catches broken Go). `integration-tests` (the
+`lint` runs **three** checks: `golangci-lint` over the Go code, `actionlint`
+over the workflow YAML itself (catches a broken pipeline the same way
+golangci-lint catches broken Go), and `helm lint` over
+`helmcharts/transaction-outbox` (catches a broken K8s manifest/values schema
+before the Track 4 `deploy` job ever tries to install it). `integration-tests` (the
 TestContainers suite) is a safety measure only — off by default, triggered
 via `workflow_dispatch` or a `ci:integration` PR label, and never wired into
 anything `upload`/`deploy` depends on. See

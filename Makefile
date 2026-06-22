@@ -131,17 +131,29 @@ k8s-template:
 
 ## ── k6 load tests (Track 6) ─────────────────────────────────────────────────────
 
-.PHONY: loadtest loadtest-report loadtest-autoscale k6-ext-build loadtest-consumer
+.PHONY: loadtest-up loadtest loadtest-report loadtest-autoscale k6-ext-build loadtest-consumer
 
-# 6.1 — two-phase latency baseline (P95/P99). Pin every consumer to 1
-# replica/queue first (KEDA paused-replicas annotation, or compose default).
+# Minimal-footprint subset of the SAME docker-compose.yml for running k6 on
+# a small machine: one Postgres + one RabbitMQ + ingestion-api + a single
+# consumer-worker bound to PIX only — no Jaeger, no other 4 consumers.
+# `up <services>` only starts what's named here plus their depends_on
+# (jaeger is deliberately not a dependency of either service — see
+# docker-compose.yml's comments — so it's correctly excluded). Use the full
+# `make up` instead when you need every method actually consumed.
+# Tear down with the regular `make down` — same compose project either way.
+loadtest-up:
+	$(COMPOSE) up --build -d postgres rabbitmq ingestion-api consumer-pix
+
+# 6.1 — two-phase latency baseline (P95/P99). VUS defaults to 100 (the
+# original two-phase design) but override it down for a small machine, e.g.
+# `make loadtest VUS=20` on a 4-core box — see loadtest/README.md.
 loadtest:
-	podman run --rm -i -e TARGET_URL=$(TARGET_URL) -v "$(CURDIR)/loadtest:/lt" -w /lt \
+	podman run --rm -i -e TARGET_URL=$(TARGET_URL) -e VUS=$(VUS) -v "$(CURDIR)/loadtest:/lt" -w /lt \
 		grafana/k6 run k6-baseline.js
 
 # Same as `loadtest`, but archives the full default summary to JSON.
 loadtest-report:
-	podman run --rm -i -e TARGET_URL=$(TARGET_URL) -v "$(CURDIR)/loadtest:/lt" -w /lt \
+	podman run --rm -i -e TARGET_URL=$(TARGET_URL) -e VUS=$(VUS) -v "$(CURDIR)/loadtest:/lt" -w /lt \
 		grafana/k6 run --summary-export=summary.json k6-baseline.js
 
 # 6.2 — floods one method's queue (METHOD=PIX default) to trigger KEDA

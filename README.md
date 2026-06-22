@@ -440,8 +440,8 @@ Two independent GitHub Actions workflows, one per microservice —
 [`ingestion-api.yml`](.github/workflows/ingestion-api.yml) and
 [`consumer-worker.yml`](.github/workflows/consumer-worker.yml) — so a change
 scoped to one service never triggers, gates, or redeploys the other. Both
-follow: **Build → lint (golangci-lint + actionlint) → Unit Tests → Upload
-(ECR, OIDC-authenticated) → Deploy (`pulumi up`)**, with an optional
+follow: **Build → lint (golangci-lint + actionlint + helm lint) → Unit Tests
+→ Upload (ECR, OIDC-authenticated) → Deploy (`pulumi up`)**, with an optional
 flag-gated Integration Tests (TestContainers) job that's a safety measure
 only — it never blocks Upload/Deploy. See
 [`.github/workflows/README.md`](.github/workflows/README.md) for the full
