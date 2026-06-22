@@ -53,6 +53,12 @@ func main() {
 	if err := persistence.AutoMigrate(db); err != nil {
 		log.Fatalf("migrate: %v", err)
 	}
+	// ingestion-api owns the TimescaleDB migration — it has the DB pool
+	// first, and consumer-worker only ever writes to these tables, never
+	// creates them.
+	if err := persistence.MigrateTimescale(db); err != nil {
+		log.Fatalf("migrate timescale: %v", err)
+	}
 
 	conn, err := rmq.Connect(cfg.RabbitMQURL)
 	if err != nil {

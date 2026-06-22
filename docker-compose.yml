@@ -33,7 +33,13 @@ services:
   # ── Infrastructure ──────────────────────────────────────────────────────────
 
   postgres:
-    image: postgres:17
+    # Phase 4 Track 2: TimescaleDB's own Postgres-18 image ships the
+    # extension preloaded via shared_preload_libraries — plain postgres
+    # can't run `CREATE EXTENSION timescaledb` at all. Same env vars/healthcheck
+    # as before, drop-in replacement. Timescale's tag tracks the PG MAJOR
+    # version only (pg18), not the exact minor (18.4) — "latest-pg18" always
+    # resolves to the current minor patch of PG 18.
+    image: timescale/timescaledb:latest-pg18
     environment:
       POSTGRES_USER:     ${POSTGRES_USER:-outbox}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-outbox}

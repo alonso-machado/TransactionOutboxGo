@@ -337,7 +337,7 @@ scans (no explicit `occurred_at` index needed — that's the partition key).
 ### Docker / image change
 
 - `docker-compose.yml`: swap `image: postgres:17` →
-  `image: timescale/timescaledb:latest-pg17` (Timescale's Postgres-17 image ships
+  `image: timescale/timescaledb:latest-pg18` (Timescale's Postgres-18 image ships
   the extension preloaded via `shared_preload_libraries`). No other compose change
   — same env vars, same healthcheck.
 - Cloud (Pulumi `data.go`): RDS Postgres **does not** offer the full TimescaleDB

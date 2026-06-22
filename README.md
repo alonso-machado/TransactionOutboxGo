@@ -32,7 +32,7 @@ acknowledges the client, and a separate relay reliably forwards it to the broker
 | HTTP framework | Gin (`github.com/gin-gonic/gin`) | latest |
 | ORM | GORM (`gorm.io/gorm` + `gorm.io/driver/postgres`) | latest |
 | Message broker | RabbitMQ (`rabbitmq:4.3-management`, **quorum queues**) | **4.3.2** |
-| Database | PostgreSQL | **17** |
+| Database | PostgreSQL (`timescale/timescaledb:latest-pg18` — TimescaleDB, Phase 4 Track 2) | **18** |
 | AMQP client | `github.com/rabbitmq/amqp091-go` | latest |
 | Config | `github.com/kelseyhightower/envconfig` | latest |
 | Local orchestration | Podman Compose | — |
@@ -63,7 +63,7 @@ flowchart LR
         H -. "in-process" .- R
     end
 
-    subgraph DB[(PostgreSQL 17)]
+    subgraph DB[(PostgreSQL 18 / TimescaleDB)]
         OBX[[outbox_messages]]
         PAY[[payments]]
     end
@@ -321,8 +321,56 @@ key = sha256( http_method + sha256(provider.name:eventId) + Idempotency-Key? )
   merged.
 
 The same key is the outbox `UNIQUE` constraint and the RabbitMQ `MessageId`. The
-consumer's dedup is independent: the `payments.source_message_id` `UNIQUE`
-constraint absorbs redelivered messages.
+consumer's dedup is independent — as of Phase 4 Track 2, it's a **two-column**
+`UNIQUE(source_message_id, occurred_at)` constraint on each per-method
+hypertable (was a single-column `UNIQUE(source_message_id)` on the old plain
+`payments` table). See [TimescaleDB](#timescaledb-per-method-hypertables)
+below for why the dedup key gained a column and why redelivery safety still
+holds.
+
+---
+
+## TimescaleDB: per-method hypertables
+
+`payments` is now **five TimescaleDB hypertables** — `payments_pix`,
+`payments_boleto`, `payments_transfer`, `payments_cartao_credito`,
+`payments_cartao_debito` — each chunked at a **1-day interval** on
+`occurred_at`, plus a `payments` **`VIEW` = `UNION ALL`** of all five so
+ad-hoc "all payments" queries (and the Grafana infra dashboard's SQL) keep
+working against one name. Writes always target the concrete per-method
+table ([`internal/adapter/persistence/payment_repo.go`](internal/adapter/persistence/payment_repo.go));
+the migration itself is raw, idempotent SQL run at `ingestion-api` startup
+([`MigrateTimescale`](internal/adapter/persistence/migrate.go)) — GORM's
+`AutoMigrate` can't create extensions, hypertables, or partition-aware
+indexes.
+
+**Why `occurred_at`, not `created_at`, is the partition column — the
+load-bearing decision here:** TimescaleDB requires every `UNIQUE` index on a
+hypertable to include the partitioning column. Partitioning by `created_at`
+(insert time) would force the dedup key to be
+`(source_message_id, created_at)` — but a RabbitMQ redelivery of the same
+message gets a *new* `created_at` on each insert attempt, so that tuple would
+differ between the original and the redelivery, `ON CONFLICT DO NOTHING`
+would never fire, and the consumer would silently double-insert. `occurred_at`
+comes from the wire payload and is identical across redeliveries, so
+`(source_message_id, occurred_at)` is stable and dedup still holds — verified
+by [`TestTimescale_RedeliveryDedupsOnSourceMessageIDAndOccurredAt`](tests/integration/timescale_test.go).
+
+Per-method tables over a single multi-dimensional hypertable: TimescaleDB's
+hash-space partitioning doesn't map cleanly to 5 named methods, and a
+hypertable can't be a partition of a native `LIST`-partitioned parent — see
+`.claude/plan-phase4.md` Track 2 for the full comparison.
+
+```sql
+\d+ payments_pix              -- confirms it's a hypertable, 1-day chunks
+SELECT * FROM payments;       -- the UNION ALL view, reads across all 5
+SELECT show_chunks('payments_pix');
+```
+
+**Cloud:** RDS's TimescaleDB extension support is the one open question
+captured in `.claude/plan-phase4.md` — if the target RDS engine version
+doesn't offer it, the fallback is self-managed TimescaleDB on EKS or
+Timescale Cloud. Local dev is unaffected either way.
 
 ---
 

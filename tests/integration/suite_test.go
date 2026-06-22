@@ -6,6 +6,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,7 +44,9 @@ func TestMain(m *testing.M) {
 	ctx := context.Background()
 
 	pgC, err := tcpostgres.Run(ctx,
-		"postgres:17-alpine",
+		// Phase 4 Track 2: the suite needs the timescaledb extension to
+		// exercise MigrateTimescale below — plain postgres can't run it.
+		"timescale/timescaledb:latest-pg18",
 		tcpostgres.WithDatabase("outbox_test"),
 		tcpostgres.WithUsername("outbox"),
 		tcpostgres.WithPassword("outbox"),
@@ -90,6 +93,10 @@ func TestMain(m *testing.M) {
 		log.Printf("automigrate: %v", err)
 		os.Exit(1)
 	}
+	if err := persistence.MigrateTimescale(db); err != nil {
+		log.Printf("migrate timescale: %v", err)
+		os.Exit(1)
+	}
 
 	conn, err := rmq.Connect(amqpURL)
 	if err != nil {
@@ -118,12 +125,18 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// truncateAll resets both tables and purges every method's queue + DLQ
+// truncateAll resets outbox_messages and every per-method payments_<method>
+// hypertable (payments itself is a UNION ALL view as of Phase 4 Track 2 —
+// TRUNCATE can't target a view), and purges every method's queue + DLQ
 // between tests, preserving the shared container pair and RabbitMQ topology
 // for speed.
 func truncateAll(t *testing.T) {
 	t.Helper()
-	if err := suite.db.Exec("TRUNCATE TABLE payments, outbox_messages").Error; err != nil {
+	tables := []string{"outbox_messages"}
+	for _, method := range rmq.Methods {
+		tables = append(tables, "payments_"+strings.ToLower(method))
+	}
+	if err := suite.db.Exec("TRUNCATE TABLE " + strings.Join(tables, ", ")).Error; err != nil {
 		t.Fatalf("truncate tables: %v", err)
 	}
 	for _, method := range rmq.Methods {

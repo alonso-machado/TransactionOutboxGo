@@ -26,7 +26,7 @@ type dataStack struct {
 	rabbitmqURL      pulumi.StringOutput
 }
 
-// newData provisions RDS PostgreSQL 17 and Amazon MQ for RabbitMQ, both
+// newData provisions RDS PostgreSQL 18 and Amazon MQ for RabbitMQ, both
 // with PubliclyAccessible=false and a dedicated security group whose only
 // ingress rule sources from the EKS node security group — neither resource
 // is reachable from outside the cluster's own worker nodes, let alone the
@@ -92,7 +92,7 @@ func newData(ctx *pulumi.Context, cfg *stackConfig, net *network, cluster *clust
 
 	db, err := rds.NewInstance(ctx, "transaction-outbox-db", &rds.InstanceArgs{
 		Engine:              pulumi.String("postgres"),
-		EngineVersion:       pulumi.String("17"),
+		EngineVersion:       pulumi.String("18"),
 		InstanceClass:       pulumi.String(cfg.dbInstanceClass),
 		AllocatedStorage:    pulumi.Int(20),
 		DbName:              pulumi.String(dbName),
