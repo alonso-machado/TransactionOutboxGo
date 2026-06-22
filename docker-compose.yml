@@ -55,11 +55,18 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    # rabbitmq_prometheus ships in the image but isn't enabled by default on
+    # the -management tag — enable it before the server starts (Track 3).
+    command: >
+      bash -c "rabbitmq-plugins enable --offline rabbitmq_prometheus &&
+               exec rabbitmq-server"
     ports:
       - "${RABBITMQ_AMQP_PORT:-5672}:5672"
       - "${RABBITMQ_MGMT_PORT:-15672}:15672"
+      - "${RABBITMQ_PROMETHEUS_PORT:-15692}:15692"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+      - ./observability/rabbitmq/rabbitmq.conf:/etc/rabbitmq/conf.d/90-prometheus.conf:ro
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
@@ -96,7 +103,10 @@ services:
       OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-ingestion-api}"
       OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-jaeger:4318}"
       METRICS_PORT: "${METRICS_PORT:-9090}"
-      RATE_LIMIT_ENABLED: "${RATE_LIMIT_ENABLED:-true}"
+      # Off by default locally — k6 load tests and seed scripts hit this from
+      # a single source IP and would otherwise get throttled by their own
+      # traffic. Cloud (Helm values) sets this true explicitly.
+      RATE_LIMIT_ENABLED: "${RATE_LIMIT_ENABLED:-false}"
       RATE_LIMIT_RATE: "${RATE_LIMIT_RATE:-50}"
       RATE_LIMIT_BURST: "${RATE_LIMIT_BURST:-100}"
       # Empty locally: no ALB in front of compose, so c.ClientIP() falls back
@@ -171,11 +181,61 @@ services:
     ports:
       - "9095:9095"
 
+  # ── Observability (Phase 4 Track 3) ───────────────────────────────────────
+
+  postgres_exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:latest
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@postgres:5432/${POSTGRES_DB:-outbox}?sslmode=disable"
+    command:
+      - "--extend.query-path=/etc/postgres-exporter/queries.yaml"
+    volumes:
+      - ./observability/postgres-exporter/queries.yaml:/etc/postgres-exporter/queries.yaml:ro
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - outbox
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9096:9090"
+    networks:
+      - outbox
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - outbox
+    restart: unless-stopped
+
 # ── Volumes & Networks ────────────────────────────────────────────────────────
 
 volumes:
   postgres_data:
   rabbitmq_data:
+  prometheus_data:
+  grafana_data:
 
 networks:
   outbox:

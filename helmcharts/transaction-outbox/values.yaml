@@ -45,6 +45,30 @@ secret:
   databaseUrl: "CHANGE_ME"
   rabbitmqUrl: "CHANGE_ME"
 
+# Argo Rollouts canary (Phase 4 Track 4). Off by default — Argo Rollouts'
+# CRDs/controller don't exist in plain docker-compose or a bare cluster, so
+# with this false the chart renders plain Deployments/HPA exactly as before.
+# The cloud target (infra/pulumi/workloads.go) sets this true via --set.
+canary:
+  enabled: false
+  ingestionApi:
+    # Manual at the start, then time-gated — see .claude/plan-phase4.md Track 4.
+    # setWeight 0 + an indefinite pause is what makes every deploy land at 0%
+    # and wait; the canary:true header (ingress-canary-header.yaml) routes to
+    # it regardless of weight, so it's testable even while paused at 0%.
+    promotionStepDuration: 20m
+    analysis:
+      # Background AnalysisTemplate query — Track 3's Prometheus, scoped to
+      # this Rollout's canary Service. Auto-aborts if the canary's 5xx ratio
+      # exceeds this threshold.
+      prometheusAddress: "http://prometheus.transaction-outbox.svc.cluster.local:9090"
+      errorRateThreshold: "0.05"
+      interval: 1m
+  consumerWorker:
+    # After 1h sitting at 5% with no manual action, skip straight to 100% —
+    # no 20/50 intermediate steps (see plan doc for why).
+    soakDuration: 1h
+
 ingestionApi:
   replicas: 1
   # Empty by default (schedules on any node) — the cloud target
@@ -54,6 +78,12 @@ ingestionApi:
   service:
     type: ClusterIP
     annotations: {}
+  # ALB Ingress (Phase 4 Track 1's front-door change, also Track 4's
+  # prerequisite for request-weighted canary splitting). False locally/bare
+  # clusters where the AWS Load Balancer Controller isn't installed.
+  ingress:
+    enabled: false
+    wafAclArn: ""
   resources:
     requests:
       cpu: "100m"

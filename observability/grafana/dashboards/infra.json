@@ -1,0 +1,177 @@
+{
+  "title": "infra (RabbitMQ + Postgres/Timescale)",
+  "uid": "infra",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["transaction-outbox", "infra"],
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "RabbitMQ — per-queue depth (queues + DLQs)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "description": "A poison spike on one method's DLQ (e.g. payments.cartao_credito.dlq) is isolated from the others — Phase 3's per-method queue split",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rabbitmq_queue_messages{queue=~\"payments\\\\..*\"}",
+          "legendFormat": "{{queue}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "RabbitMQ — publish / deliver / ack rates",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(rabbitmq_queue_messages_published_total{queue=~\"payments\\\\..*\"}[1m]))",
+          "legendFormat": "publish/s"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(rabbitmq_queue_messages_delivered_total{queue=~\"payments\\\\..*\"}[1m]))",
+          "legendFormat": "deliver/s"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(rabbitmq_queue_messages_acked_total{queue=~\"payments\\\\..*\"}[1m]))",
+          "legendFormat": "ack/s"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "RabbitMQ — unacked / consumer count per queue",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rabbitmq_queue_messages_unacked{queue=~\"payments\\\\..*\"}",
+          "legendFormat": "unacked {{queue}}"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rabbitmq_queue_consumers{queue=~\"payments\\\\..*\"}",
+          "legendFormat": "consumers {{queue}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "RabbitMQ — connections / channels / memory / disk alarms",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rabbitmq_connections",
+          "legendFormat": "connections"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rabbitmq_channels",
+          "legendFormat": "channels"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rabbitmq_alarms_memory_used_watermark{} or rabbitmq_resident_memory_limit_bytes",
+          "legendFormat": "memory_alarm"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rabbitmq_disk_space_available_bytes",
+          "legendFormat": "disk_available_bytes"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Postgres — connections vs max_connections",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(pg_stat_activity_count)",
+          "legendFormat": "connections"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "pg_settings_max_connections",
+          "legendFormat": "max_connections"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Postgres — TPS (commits + rollbacks)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(pg_stat_database_xact_commit[1m])) + sum(rate(pg_stat_database_xact_rollback[1m]))",
+          "legendFormat": "tps"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Postgres — cache hit ratio / deadlocks / longest transaction / DB size",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(pg_stat_database_blks_hit[5m])) / (sum(rate(pg_stat_database_blks_hit[5m])) + sum(rate(pg_stat_database_blks_read[5m])))",
+          "legendFormat": "cache_hit_ratio"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(pg_stat_database_deadlocks[5m]))",
+          "legendFormat": "deadlocks/s"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max(pg_stat_activity_max_tx_duration)",
+          "legendFormat": "longest_txn_seconds"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "pg_database_size_bytes",
+          "legendFormat": "db_size_bytes {{datname}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "TimescaleDB — chunks per hypertable (Phase 4 Track 2, once enabled)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 40 },
+      "description": "Populated once Track 2's per-method hypertables + the postgres-exporter custom query (observability/postgres-exporter/queries.yaml) are enabled. Empty until then.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "timescaledb_chunks_total_chunks",
+          "legendFormat": "{{hypertable_name}}"
+        }
+      ]
+    }
+  ]
+}

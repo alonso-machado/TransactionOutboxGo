@@ -2,4 +2,4 @@ apiVersion: v2
 name: transaction-outbox
 description: Transactional Outbox pattern for a Payments domain — ingestion-api plus one consumer-worker per payment method, autoscaled via KEDA.
 type: application
-version: 0.1.0
+version: 0.2.0

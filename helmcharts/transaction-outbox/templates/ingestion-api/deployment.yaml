@@ -1,3 +1,7 @@
+{{- if not .Values.canary.enabled }}
+# Plain rolling Deployment — used when canary.enabled is false (local/bare
+# clusters without the Argo Rollouts controller). See rollout.yaml for the
+# canary.enabled=true path, which replaces this resource one-for-one.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -58,3 +62,4 @@ spec:
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
+{{- end }}

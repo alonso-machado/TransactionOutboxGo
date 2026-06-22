@@ -1,0 +1,112 @@
+{
+  "title": "consumer-worker",
+  "uid": "consumer-worker",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["transaction-outbox", "consumer-worker"],
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s",
+  "templating": {
+    "list": [
+      {
+        "name": "method",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(consumer_messages_processed_total, payment_method)",
+        "current": { "text": "All", "value": "$__all" },
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Throughput by method / outcome",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (payment_method, outcome) (rate(consumer_messages_processed_total{payment_method=~\"$method\"}[1m]))",
+          "legendFormat": "{{payment_method}} / {{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Retry attempts rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (payment_method) (rate(consumer_retry_attempts_total{payment_method=~\"$method\"}[1m]))",
+          "legendFormat": "{{payment_method}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Retry depth (by retry_count)",
+      "type": "heatmap",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (retry_count) (rate(consumer_retry_attempts_total{payment_method=~\"$method\"}[5m]))",
+          "legendFormat": "retry_count={{retry_count}}",
+          "format": "heatmap"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Poison / DLQ rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (payment_method) (rate(consumer_messages_processed_total{payment_method=~\"$method\", outcome=\"poison_dlq\"}[1m]))",
+          "legendFormat": "{{payment_method}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Queue backlog (ready messages, per method)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "description": "Cross-referenced from the RabbitMQ exporter — queue depth per payments.<method>.queue",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rabbitmq_queue_messages_ready{queue=~\"payments\\\\..*\\\\.queue\"}",
+          "legendFormat": "{{queue}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Consumer instances up per method",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "description": "Static 1/method in compose; in cloud this tracks KEDA-driven pod count per Rollout/Deployment (Phase 4 Track 4)",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (method) (up{job=\"consumer-worker\"})",
+          "legendFormat": "{{method}}"
+        }
+      ]
+    }
+  ]
+}

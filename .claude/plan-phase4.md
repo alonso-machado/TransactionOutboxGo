@@ -512,48 +512,124 @@ per Phase 3 Track 4). Document `kubectl port-forward svc/grafana 3000` for acces
 
 ---
 
-## Track 4 — Canary Deployments (0% → 5% → 20% → 50% → 100%, manual-gated)
+## Track 4 — Canary Deployments (manual at the start, then time-gated)
 
 ### Goal
 
-Every deploy of a service rolls out **progressively**: it lands at **0%** (new
-version present but taking no traffic), and a human must **manually approve** each
-promotion **0→5→20→50→100**. No step advances automatically.
+Every deploy of a service rolls out **progressively**, starting at **0%** (new
+version present but taking no traffic). The two services diverge from there —
+this is a deliberate revision from a uniform manual-every-step design (see below):
+
+- **ingestion-api:** 0% → human promotes → 5% → human promotes → from there the
+  remaining steps (20% → 50% → 100%) advance **automatically every 20 minutes**,
+  *unless* a background error-rate analysis (Track 3's Prometheus) regresses, in
+  which case the rollout **auto-aborts**. A human can also manually advance faster
+  or abort at any point.
+- **consumer-worker:** 0% → human promotes → 5% → after **1 hour** at 5% with no
+  manual action, it advances **directly to 100%** (no 20/50 intermediate steps —
+  a queue consumer's "blast radius" concern is adequately bounded by the 1-hour
+  soak at 5%, so the extra steps just add latency to a full rollout without much
+  extra safety here).
+- **Testing the canary at 0% (or any weight) deliberately:** requests carrying the
+  header `canary: true` are *always* routed to the canary pods regardless of the
+  current weight — see "Header-based forced routing" below. This is what makes a
+  0%-weight canary useful: you can hit the literal new version on demand before
+  any real traffic does, without waiting for a promote.
 
 ### Decision: Argo Rollouts (not Flagger, not raw Deployments)
 
-- **Argo Rollouts** models exactly this with a `Rollout` resource whose
-  `strategy.canary.steps` interleave `setWeight` and **`pause: {}`** (an
-  *indefinite* pause — it holds until an operator runs
-  `kubectl argo rollouts promote` or clicks Promote in the dashboard). That's the
-  literal "manual approval at every step." **Chosen.**
-- **Flagger** is rejected for the headline requirement: Flagger is built around
-  *automated*, metric-driven promotion (it advances on its own when analysis
-  passes). Manual gating fights its grain. (Argo Rollouts *can* also do automated
-  analysis — see the optional gate below — but defaults to manual when you use
-  bare `pause: {}`.)
-- Raw `Deployment` `RollingUpdate` can't express weighted canary steps or pause
-  gates at all.
+- **Argo Rollouts** models the gated steps with a `Rollout` resource whose
+  `strategy.canary.steps` mixes **`pause: {}`** (an *indefinite* pause — holds
+  until an operator runs `kubectl argo rollouts promote`) for the manual part,
+  and **`pause: {duration: 20m}`** / **`pause: {duration: 1h}`** (a *timed* pause
+  — auto-resumes) for the automatic part. A `strategy.canary.analysis` background
+  AnalysisTemplate runs continuously once real traffic starts and can auto-abort
+  the whole rollout — that's the "if errors did not go up you can go further"
+  half of the requirement; the timed pauses are the "20 minutes each part" half.
+  **Chosen.**
+- **Flagger** is rejected: it's built around *fully automated*, metric-driven
+  promotion from step zero — it doesn't have a clean way to express "manual for
+  the first two steps, then automatic," which is exactly what's needed here.
+- Raw `Deployment` `RollingUpdate` can't express weighted canary steps, pause
+  gates, or header-based routing at all.
 
-### The step definition (both services)
+### Step definitions (now per-service, not shared)
+
+**ingestion-api:**
 
 ```yaml
 strategy:
   canary:
     steps:
-      - pause: {}          # lands at 0% — canary RS created, 0 traffic, WAIT for approval
+      - setWeight: 0
+      - pause: {}                 # MANUAL — lands at 0%, test via the canary:true header
       - setWeight: 5
-      - pause: {}          # WAIT  → approve to leave 5%
+      - pause: {}                 # MANUAL — approve to leave 5% and go automatic
       - setWeight: 20
-      - pause: {}          # WAIT
+      - pause: { duration: 20m }  # AUTO — promotes after 20m unless analysis fails
       - setWeight: 50
-      - pause: {}          # WAIT
-      - setWeight: 100     # full promotion (implicit once weight 100 + scaled up)
+      - pause: { duration: 20m }  # AUTO
+      - setWeight: 100            # AUTO — full promotion
+    analysis:
+      templates:
+        - templateName: ingestion-api-error-rate
+      startingStep: 2             # background analysis starts once weight leaves 0%
 ```
 
-The leading `- pause: {}` is what makes **every deploy start at 0% and block** —
-the new ReplicaSet exists but serves nothing until the first manual promote. Each
-subsequent `pause: {}` is the gate before the *next* percentage.
+**consumer-worker** (per method, pod-proportion semantics — see below):
+
+```yaml
+strategy:
+  canary:
+    steps:
+      - setWeight: 0
+      - pause: {}                 # MANUAL — lands at 0%
+      - setWeight: 5
+      - pause: { duration: 1h }   # AUTO — after 1h at 5%, skip straight to 100%
+      - setWeight: 100
+```
+
+The leading `setWeight: 0` + indefinite `pause: {}` is what makes **every deploy
+start at 0% and block** — the new ReplicaSet exists but (for ingestion-api) takes
+no weighted traffic and (for consumer-worker) processes no messages until the
+first manual promote.
+
+### Header-based forced routing to the canary (ingestion-api only)
+
+Argo Rollouts' ALB integration manages exactly **one** weighted forwarding rule
+on the shared ALB (the rule it mutates on every `setWeight`) — it does not support
+header-match routing the way the Istio/SMI/Nginx/Traefik providers do. The
+standard workaround, and the one used here: put a **second, independent**
+`Ingress` object on the **same ALB** (same
+`alb.ingress.kubernetes.io/group.name`, lower `group.order` so it's evaluated
+*before* the Rollout-managed weighted rule) with a header-match condition that
+forwards unconditionally to the canary `Service`:
+
+```yaml
+metadata:
+  annotations:
+    alb.ingress.kubernetes.io/group.name: ingestion-api
+    alb.ingress.kubernetes.io/group.order: "1"     # evaluated before the weighted rule (order 10)
+    alb.ingress.kubernetes.io/conditions.canary-header: |
+      [{"field":"http-header","httpHeaderConfig":{"httpHeaderName":"canary","values":["true"]}}]
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api/v1/payments
+            pathType: Prefix
+            backend:
+              service:
+                name: ingestion-api-canary
+                port: { number: 8080 }
+```
+
+This Ingress is **not** touched by Argo Rollouts (it only owns the
+weighted-rule Ingress) — it's a static, always-100%-to-canary rule that exists
+independently of the current canary weight, which is exactly what's needed to
+exercise the canary at 0% before promoting anything. Requires
+`stableService`/`canaryService` to be named explicitly in
+`trafficRouting.alb` so there's a concrete canary `Service` to target.
 
 ### Traffic splitting: how the % is realized
 
@@ -632,11 +708,12 @@ Three options, document all, recommend the first two together:
    alongside the Phase 3 `deploy` job. The Phase 3 `deploy` job (`pulumi up`) just
    ships the new image → the Rollout auto-pauses at 0% → this promote workflow
    drives it up.
-3. **Optional automated analysis gate** — an Argo `AnalysisTemplate` querying the
-   Track 3 **Prometheus** (e.g. 5xx rate, P99 latency, the 429 rate) attached to
-   the canary so a failing metric **auto-aborts** even between manual approvals.
-   Kept optional — the requirement is manual approval; this is a safety net, not a
-   replacement.
+3. **Background analysis gate (ingestion-api, not optional anymore)** — an Argo
+   `AnalysisTemplate` querying Track 3's **Prometheus** for the canary's 5xx rate
+   runs continuously from `startingStep` onward and auto-aborts the rollout if it
+   regresses versus stable — this is what backs the "if errors did not go up you
+   can go further" half of the per-service step definitions above. It runs
+   alongside, not instead of, the manual/timed `pause` steps.
 
 ### Verification
 

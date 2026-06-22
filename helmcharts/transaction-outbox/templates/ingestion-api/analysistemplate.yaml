@@ -1,0 +1,35 @@
+{{- if .Values.canary.enabled }}
+# Background analysis referenced by rollout.yaml's strategy.canary.analysis.
+# Runs continuously once the canary takes real weighted traffic and
+# auto-aborts the Rollout if the canary's own 5xx ratio crosses the
+# threshold — the metrics come from Track 3's Prometheus, scoped to the
+# canary Service so a regression on the new version doesn't get diluted by
+# the (presumably healthy) stable fleet's traffic.
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: ingestion-api-error-rate
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+spec:
+  args:
+    - name: canary-service
+  metrics:
+    - name: error-rate
+      interval: {{ .Values.canary.ingestionApi.analysis.interval }}
+      successCondition: result[0] <= {{ .Values.canary.ingestionApi.analysis.errorRateThreshold }}
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: {{ .Values.canary.ingestionApi.analysis.prometheusAddress }}
+          query: >
+            sum(rate(http_server_request_duration_seconds_count{
+              service="{{ "{{" }}args.canary-service{{ "}}" }}",
+              http_response_status_code=~"5.."
+            }[5m]))
+            /
+            clamp_min(sum(rate(http_server_request_duration_seconds_count{
+              service="{{ "{{" }}args.canary-service{{ "}}" }}"
+            }[5m])), 1)
+{{- end }}

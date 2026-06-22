@@ -3,7 +3,7 @@ COMPOSE_FILE := docker-compose.yml
 COMPOSE      := podman compose -f $(COMPOSE_FILE)
 GO           := podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine
 
-.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer seed-card lint swag test-unit test-integration coverage
+.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer seed-card lint swag test-unit test-integration coverage observability-up
 
 ## ── Docker Compose ────────────────────────────────────────────────────────────
 
@@ -12,6 +12,13 @@ up:
 
 down:
 	$(COMPOSE) down -v
+
+# Minimal subset for working on dashboards without the full stack: the app
+# services (so there's something to scrape) plus Prometheus/Grafana/the
+# postgres exporter. Grafana: http://localhost:3000 (admin/admin by default,
+# see GRAFANA_ADMIN_USER/PASSWORD in .env.example).
+observability-up:
+	$(COMPOSE) up --build -d postgres rabbitmq ingestion-api consumer-pix prometheus grafana postgres_exporter
 
 logs:
 	$(COMPOSE) logs -f

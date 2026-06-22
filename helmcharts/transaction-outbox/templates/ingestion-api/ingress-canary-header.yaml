@@ -1,0 +1,42 @@
+{{- if and .Values.ingestionApi.ingress.enabled .Values.canary.enabled }}
+# Static header-based forced routing to the canary, independent of the
+# current Rollout weight (see .claude/plan-phase4.md Track 4 — "Header-based
+# forced routing"). Argo Rollouts' ALB integration only manages one weighted
+# rule (ingress.yaml); it has no setHeaderRoute equivalent for ALB the way it
+# does for Istio/Nginx/Traefik, so this rule lives in its own Ingress object
+# on the SAME ALB (group.name) with a lower group.order so the AWS Load
+# Balancer Controller evaluates it first. This is NOT touched by Argo
+# Rollouts — it always forwards 100% to the canary Service regardless of
+# weight, which is what makes a 0%-weight canary testable on demand.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ingestion-api-canary-header
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: ingestion-api
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    alb.ingress.kubernetes.io/group.name: ingestion-api
+    alb.ingress.kubernetes.io/group.order: "1"
+    # Keyed by the backend service name of the path rule below it applies
+    # to (AWS LB Controller convention: conditions.<service-name>), not an
+    # arbitrary label.
+    alb.ingress.kubernetes.io/conditions.ingestion-api-canary: |
+      [{"field":"http-header","httpHeaderConfig":{"httpHeaderName":"canary","values":["true"]}}]
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api/v1/payments
+            pathType: Prefix
+            backend:
+              service:
+                name: ingestion-api-canary
+                port:
+                  number: 8080
+{{- end }}

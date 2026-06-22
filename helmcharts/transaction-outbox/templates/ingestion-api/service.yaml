@@ -1,3 +1,6 @@
+# Doubles as the Rollout's stableService when canary.enabled (rollout.yaml) —
+# Argo Rollouts mutates this Service's selector to track the stable
+# ReplicaSet at runtime; its own selector below is just the initial value.
 apiVersion: v1
 kind: Service
 metadata:

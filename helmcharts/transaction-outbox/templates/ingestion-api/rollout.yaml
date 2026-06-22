@@ -1,0 +1,92 @@
+{{- if .Values.canary.enabled }}
+# Argo Rollout — replaces deployment.yaml one-for-one when canary.enabled.
+# Pod template is identical to the plain Deployment; only the controller
+# kind and the rollout strategy differ. See .claude/plan-phase4.md Track 4
+# for the step rationale (manual at 0%/5%, then automatic every 20m, with a
+# background error-rate analysis that can auto-abort).
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: ingestion-api
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: ingestion-api
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.ingestionApi.replicas }}
+  selector:
+    matchLabels:
+      app: ingestion-api
+  template:
+    metadata:
+      labels:
+        app: ingestion-api
+    spec:
+      {{- with .Values.ingestionApi.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ingestion-api
+          image: {{ .Values.image.ingestionApi }}
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          envFrom:
+            - configMapRef:
+                name: transaction-outbox-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: DATABASE_URL
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: RABBITMQ_URL
+          resources:
+            {{- toYaml .Values.ingestionApi.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+  strategy:
+    canary:
+      stableService: ingestion-api
+      canaryService: ingestion-api-canary
+      trafficRouting:
+        alb:
+          ingress: ingestion-api
+          servicePort: 8080
+      analysis:
+        templates:
+          - templateName: ingestion-api-error-rate
+        args:
+          - name: canary-service
+            value: ingestion-api-canary
+        # Background analysis starts once weight leaves 0% (step index 2,
+        # 0-based, in the steps list below — the setWeight:5 step).
+        startingStep: 2
+      steps:
+        - setWeight: 0
+        - pause: {}                                                    # MANUAL — 0%, test via the canary:true header
+        - setWeight: 5
+        - pause: {}                                                    # MANUAL — approve to leave 5% and go automatic
+        - setWeight: 20
+        - pause: { duration: {{ .Values.canary.ingestionApi.promotionStepDuration }} }   # AUTO
+        - setWeight: 50
+        - pause: { duration: {{ .Values.canary.ingestionApi.promotionStepDuration }} }   # AUTO
+        - setWeight: 100                                               # AUTO — full promotion
+{{- end }}

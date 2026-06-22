@@ -10,6 +10,13 @@ metadata:
 spec:
   scaleTargetRef:
     name: consumer-{{ .name }}
+    {{- if $.Values.canary.enabled }}
+    # Re-pointed from Deployment to Rollout (Phase 4 Track 4) — missing this
+    # is the one non-obvious wiring detail that silently breaks autoscaling
+    # when converting to canary.
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    {{- end }}
   minReplicaCount: {{ $.Values.consumerWorker.keda.minReplicaCount }} # scale to zero when idle
   maxReplicaCount: {{ $.Values.consumerWorker.keda.maxReplicaCount }}
   pollingInterval: {{ $.Values.consumerWorker.keda.pollingInterval }} # seconds between queue checks

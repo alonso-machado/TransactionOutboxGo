@@ -1,0 +1,24 @@
+{{- if .Values.canary.enabled }}
+# Argo Rollouts mutates this Service's selector to track the canary
+# ReplicaSet at runtime — referenced as canaryService in rollout.yaml and as
+# the forced-routing target in ingress-canary-header.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingestion-api-canary
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: ingestion-api
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app: ingestion-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+{{- end }}

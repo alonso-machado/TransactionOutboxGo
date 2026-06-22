@@ -1,0 +1,45 @@
+{{- if .Values.ingestionApi.ingress.enabled }}
+# ALB Ingress — the front door (Phase 4 Track 1: NLB -> ALB so the app can
+# read the real client IP via X-Forwarded-For, and so AWS WAF has something
+# to attach to). When canary.enabled, Argo Rollouts also owns this object's
+# weighted forward-action annotation, flipping it between stable/canary
+# target groups on every setWeight step.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ingestion-api
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: ingestion-api
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    # Same ALB as ingress-canary-header.yaml's header-match rule; a higher
+    # group.order number means this weighted rule is evaluated AFTER it.
+    alb.ingress.kubernetes.io/group.name: ingestion-api
+    alb.ingress.kubernetes.io/group.order: "10"
+    {{- with .Values.ingestionApi.ingress.wafAclArn }}
+    alb.ingress.kubernetes.io/wafv2-acl-arn: {{ . }}
+    {{- end }}
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api/v1/payments
+            pathType: Prefix
+            backend:
+              service:
+                name: ingestion-api
+                port:
+                  number: 8080
+          - path: /healthz
+            pathType: Exact
+            backend:
+              service:
+                name: ingestion-api
+                port:
+                  number: 8080
+{{- end }}
