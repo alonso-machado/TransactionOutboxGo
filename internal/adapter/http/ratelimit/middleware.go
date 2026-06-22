@@ -1,12 +1,11 @@
 package ratelimit
 
 import (
-	"context"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/alonsomachado/transaction-outbox-go/internal/observability"
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel"
 )
@@ -15,10 +14,7 @@ import (
 // leaky-bucket meter backed by store. It does not read the request body.
 func Middleware(store BucketStore, rate float64, burst int) gin.HandlerFunc {
 	meter := otel.GetMeterProvider().Meter("adapter/http/ratelimit")
-	rejectedTotal, err := meter.Int64Counter("ingestion.ratelimit_rejected_total")
-	if err != nil {
-		slog.ErrorContext(context.Background(), "create ingestion.ratelimit_rejected_total counter failed", "err", err.Error())
-	}
+	rejectedTotal := observability.Int64Counter(meter, "ingestion.ratelimit_rejected_total")
 
 	return func(c *gin.Context) {
 		key := c.ClientIP()
@@ -29,9 +25,7 @@ func Middleware(store BucketStore, rate float64, burst int) gin.HandlerFunc {
 		if !allowed {
 			c.Header("Retry-After", fmt.Sprintf("%d", int(retryAfter.Seconds())))
 			c.Header("X-RateLimit-Remaining", "0")
-			if rejectedTotal != nil {
-				rejectedTotal.Add(c.Request.Context(), 1)
-			}
+			rejectedTotal.Add(c.Request.Context(), 1)
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
 			return
 		}

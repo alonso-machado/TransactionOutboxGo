@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"time"
 
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain/pii"
+	"github.com/alonsomachado/transaction-outbox-go/internal/observability"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -20,15 +20,8 @@ import (
 
 var tracer = otel.Tracer("usecase/consume")
 
-// supportedSchemaMajor is the major schemaVersion this consumer build
-// understands (Phase 5 Track 2.D) — kept in lockstep with
-// usecase/ingest.SchemaVersion, but usecase/consume must not import
-// usecase/ingest (use-cases don't depend on each other), so it's a small
-// independent constant instead.
-const supportedSchemaMajor = "1"
-
 // ErrUnknownSchemaVersion is returned when the message's schemaVersion
-// doesn't match supportedSchemaMajor — the caller (AMQPConsumer) treats this
+// doesn't match domain.SchemaVersion — the caller (AMQPConsumer) treats this
 // like any other processing error, but it's exhausted to DLQ on the FIRST
 // attempt rather than retried, since retrying a structurally-incompatible
 // message can never succeed.
@@ -42,11 +35,11 @@ type ProcessMessage struct {
 
 func New(paymentRepo domain.PaymentRepository, uow domain.UnitOfWork) *ProcessMessage {
 	meter := otel.GetMeterProvider().Meter("usecase/consume")
-	unknownSchemaVersion, err := meter.Int64Counter("consumer.unknown_schema_version_total")
-	if err != nil {
-		slog.ErrorContext(context.Background(), "create consumer.unknown_schema_version_total counter failed", "err", err.Error())
+	return &ProcessMessage{
+		paymentRepo:          paymentRepo,
+		uow:                  uow,
+		unknownSchemaVersion: observability.Int64Counter(meter, "consumer.unknown_schema_version_total"),
 	}
-	return &ProcessMessage{paymentRepo: paymentRepo, uow: uow, unknownSchemaVersion: unknownSchemaVersion}
 }
 
 type payloadDTO struct {
@@ -81,11 +74,9 @@ func (uc *ProcessMessage) Execute(ctx context.Context, messageID string, body []
 	// don't crash-loop trying to parse a structurally-incompatible payload;
 	// record the operator signal and reject (the caller dead-letters on the
 	// first attempt for this specific error — see AMQPConsumer.handle).
-	if dto.SchemaVersion != "" && dto.SchemaVersion != supportedSchemaMajor {
-		if uc.unknownSchemaVersion != nil {
-			uc.unknownSchemaVersion.Add(ctx, 1, metric.WithAttributes(attribute.String("schema_version", dto.SchemaVersion)))
-		}
-		return recordRedactedError(span, fmt.Errorf("%w: %q (supported: %q)", ErrUnknownSchemaVersion, dto.SchemaVersion, supportedSchemaMajor))
+	if dto.SchemaVersion != "" && dto.SchemaVersion != domain.SchemaVersion {
+		uc.unknownSchemaVersion.Add(ctx, 1, metric.WithAttributes(attribute.String("schema_version", dto.SchemaVersion)))
+		return recordRedactedError(span, fmt.Errorf("%w: %q (supported: %q)", ErrUnknownSchemaVersion, dto.SchemaVersion, domain.SchemaVersion))
 	}
 
 	paymentID, err := uuid.Parse(dto.PaymentID)
@@ -94,11 +85,11 @@ func (uc *ProcessMessage) Execute(ctx context.Context, messageID string, body []
 	}
 	span.SetAttributes(attribute.String("payment_id", paymentID.String()))
 
-	payerID, err := parseOptionalUUID(dto.PayerID)
+	payerID, err := domain.ParseOptionalUUID(dto.PayerID)
 	if err != nil {
 		return recordRedactedError(span, fmt.Errorf("parse payerId: %w", err))
 	}
-	recipientID, err := parseOptionalUUID(dto.RecipientID)
+	recipientID, err := domain.ParseOptionalUUID(dto.RecipientID)
 	if err != nil {
 		return recordRedactedError(span, fmt.Errorf("parse recipientId: %w", err))
 	}
@@ -140,15 +131,4 @@ func recordRedactedError(span trace.Span, err error) error {
 	span.RecordError(errors.New(pii.Redact(err.Error())))
 	span.SetStatus(codes.Error, pii.Redact(err.Error()))
 	return err
-}
-
-func parseOptionalUUID(s *string) (*uuid.UUID, error) {
-	if s == nil || *s == "" {
-		return nil, nil
-	}
-	id, err := uuid.Parse(*s)
-	if err != nil {
-		return nil, err
-	}
-	return &id, nil
 }

@@ -42,6 +42,34 @@ type PaymentEventRequestDTO struct {
 	OccurredAt time.Time      `json:"occurredAt"`
 }
 
+// decodeEnvelope builds the typed envelope from a body already parsed into a
+// raw map, so the request body is unmarshalled only once (the handler also
+// needs the raw map to extract the dynamic method-specific sibling object). A
+// missing key leaves its field at the zero value for Validate to reject; a
+// present-but-malformed value is reported here.
+func decodeEnvelope(raw map[string]json.RawMessage) (PaymentEventRequestDTO, error) {
+	var dto PaymentEventRequestDTO
+	fields := []struct {
+		key string
+		dst any
+	}{
+		{"eventId", &dto.EventID},
+		{"provider", &dto.Provider},
+		{"payment", &dto.Payment},
+		{"occurredAt", &dto.OccurredAt},
+	}
+	for _, f := range fields {
+		val, ok := raw[f.key]
+		if !ok {
+			continue
+		}
+		if err := json.Unmarshal(val, f.dst); err != nil {
+			return dto, fmt.Errorf("invalid %s: %w", f.key, err)
+		}
+	}
+	return dto, nil
+}
+
 func (dto PaymentEventRequestDTO) Validate() error {
 	switch {
 	case dto.EventID == "":

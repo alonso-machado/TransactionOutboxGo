@@ -18,12 +18,6 @@ import (
 
 var tracer = otel.Tracer("usecase/ingest")
 
-// SchemaVersion is the outbox payload / RabbitMQ message envelope's major
-// version (Phase 5 Track 2.D) — carried in the body and as a message
-// header so the consumer can reject an unknown/newer version to DLQ instead
-// of crash-looping on a parse error.
-const SchemaVersion = "1"
-
 type IngestPayment struct {
 	outboxRepo domain.OutboxRepository
 	uow        domain.UnitOfWork
@@ -91,7 +85,7 @@ func (uc *IngestPayment) Execute(ctx context.Context, req Request) (*Response, e
 	}
 
 	payload, err := json.Marshal(outboxPayload{
-		SchemaVersion:     SchemaVersion,
+		SchemaVersion:     domain.SchemaVersion,
 		PaymentID:         paymentID,
 		EventID:           req.EventID,
 		ProviderName:      req.ProviderName,
@@ -127,7 +121,7 @@ func (uc *IngestPayment) Execute(ctx context.Context, req Request) (*Response, e
 	for k, v := range req.Headers {
 		headers[k] = v
 	}
-	headers["schemaVersion"] = SchemaVersion
+	headers["schemaVersion"] = domain.SchemaVersion
 
 	msg := &domain.OutboxMessage{
 		ID:             paymentID,

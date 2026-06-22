@@ -11,6 +11,7 @@ import (
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain/pii"
 	rmq "github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/rabbitmq"
+	"github.com/alonsomachado/transaction-outbox-go/internal/observability"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/consume"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"go.opentelemetry.io/otel"
@@ -50,14 +51,6 @@ func NewConsumer(conn *amqp.Connection, processMsg *consume.ProcessMessage, meth
 		retryBackoffCap = 5 * time.Minute
 	}
 	meter := otel.GetMeterProvider().Meter("adapter/messaging")
-	messagesTotal, err := meter.Int64Counter("consumer.messages_processed_total")
-	if err != nil {
-		slog.ErrorContext(context.Background(), "create consumer.messages_processed_total counter failed", "err", err.Error())
-	}
-	retryAttempts, err := meter.Int64Counter("consumer.retry_attempts_total")
-	if err != nil {
-		slog.ErrorContext(context.Background(), "create consumer.retry_attempts_total counter failed", "err", err.Error())
-	}
 	return &AMQPConsumer{
 		conn:             conn,
 		processMsg:       processMsg,
@@ -66,8 +59,8 @@ func NewConsumer(conn *amqp.Connection, processMsg *consume.ProcessMessage, meth
 		maxDeliveries:    maxDeliveries,
 		retryBackoffBase: retryBackoffBase,
 		retryBackoffCap:  retryBackoffCap,
-		messagesTotal:    messagesTotal,
-		retryAttempts:    retryAttempts,
+		messagesTotal:    observability.Int64Counter(meter, "consumer.messages_processed_total"),
+		retryAttempts:    observability.Int64Counter(meter, "consumer.retry_attempts_total"),
 	}
 }
 
@@ -138,7 +131,7 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 	)
 	defer span.End()
 
-	if c.retryAttempts != nil && isRetry {
+	if isRetry {
 		c.retryAttempts.Add(ctx, 1, c.metricAttrs(attribute.Int("retry_count", retryCount)))
 	}
 
@@ -154,9 +147,7 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 		if errors.Is(err, consume.ErrUnknownSchemaVersion) {
 			slog.ErrorContext(ctx, "unknown schema version — rejecting to DLQ", "message_id", d.MessageId)
 			span.SetAttributes(attribute.String("outcome", "unknown_schema_version"))
-			if c.messagesTotal != nil {
-				c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "unknown_schema_version")))
-			}
+			c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "unknown_schema_version")))
 			_ = d.Reject(false)
 			return
 		}
@@ -164,9 +155,7 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 		if retryCount+1 >= c.maxDeliveries {
 			slog.ErrorContext(ctx, "poison message — rejecting to DLQ", "message_id", d.MessageId, "attempts", retryCount+1)
 			span.SetAttributes(attribute.String("outcome", "poison_dlq"))
-			if c.messagesTotal != nil {
-				c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "poison_dlq")))
-			}
+			c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "poison_dlq")))
 			_ = d.Reject(false)
 			return
 		}
@@ -176,15 +165,11 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 			_ = d.Nack(false, true)
 			return
 		}
-		if c.messagesTotal != nil {
-			c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "retry_scheduled")))
-		}
+		c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "retry_scheduled")))
 		_ = d.Ack(false)
 		return
 	}
-	if c.messagesTotal != nil {
-		c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "ack")))
-	}
+	c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "ack")))
 	_ = d.Ack(false)
 }
 

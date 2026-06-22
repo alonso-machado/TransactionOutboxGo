@@ -7,11 +7,23 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain/pii"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ingest"
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
+
+// propagatedHeaders is the allowlist of inbound request headers copied onto
+// the outbox row and the RabbitMQ message. Copying every header would persist
+// and publish credentials (Authorization, Cookie, ...) — only correlation and
+// idempotency metadata is allowed to travel with the message.
+var propagatedHeaders = []string{
+	"Idempotency-Key",
+	"X-Request-Id",
+	"Traceparent",
+	"Tracestate",
+	"Baggage",
+}
 
 type PaymentHandler struct {
 	ingest *ingest.IngestPayment
@@ -46,8 +58,18 @@ func (h *PaymentHandler) Handle(c *gin.Context) {
 		return
 	}
 
-	var dto PaymentEventRequestDTO
-	if err := json.Unmarshal(body, &dto); err != nil {
+	// Parse the body once into a raw map: the typed envelope is decoded from
+	// it, and the method-specific details live in a top-level sibling object
+	// named after the lowercase method (e.g. "pix": {...}), extracted
+	// generically so adding a new method never requires a schema change here.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": pii.Redact(err.Error())})
+		return
+	}
+
+	dto, err := decodeEnvelope(raw)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": pii.Redact(err.Error())})
 		return
 	}
@@ -55,24 +77,17 @@ func (h *PaymentHandler) Handle(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": pii.Redact(err.Error())})
 		return
 	}
-
-	// The payment method's details live in a top-level sibling object named
-	// after the lowercase method (e.g. "pix": {...}) — extract it generically
-	// so adding a new method never requires a schema change here.
-	var raw map[string]json.RawMessage
-	_ = json.Unmarshal(body, &raw)
-
 	if err := dto.ValidateMethod(raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": pii.Redact(err.Error())})
 		return
 	}
 
-	payerID, err := parseOptionalUUID(dto.Payment.PayerID)
+	payerID, err := domain.ParseOptionalUUID(dto.Payment.PayerID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payment.payerId"})
 		return
 	}
-	recipientID, err := parseOptionalUUID(dto.Payment.RecipientID)
+	recipientID, err := domain.ParseOptionalUUID(dto.Payment.RecipientID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payment.recipientId"})
 		return
@@ -89,9 +104,11 @@ func (h *PaymentHandler) Handle(c *gin.Context) {
 		methodDetails = masked
 	}
 
-	headers := make(map[string]string, len(c.Request.Header))
-	for k := range c.Request.Header {
-		headers[k] = c.GetHeader(k)
+	headers := make(map[string]string, len(propagatedHeaders))
+	for _, name := range propagatedHeaders {
+		if v := c.GetHeader(name); v != "" {
+			headers[name] = v
+		}
 	}
 
 	resp, err := h.ingest.Execute(c.Request.Context(), ingest.Request{
@@ -126,17 +143,6 @@ func (h *PaymentHandler) Handle(c *gin.Context) {
 		IdempotencyKey: resp.IdempotencyKey,
 		Status:         status,
 	})
-}
-
-func parseOptionalUUID(s *string) (*uuid.UUID, error) {
-	if s == nil || *s == "" {
-		return nil, nil
-	}
-	id, err := uuid.Parse(*s)
-	if err != nil {
-		return nil, err
-	}
-	return &id, nil
 }
 
 // toMinorUnits converts a decimal currency amount (e.g. 100.50) to integer

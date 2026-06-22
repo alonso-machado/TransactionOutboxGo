@@ -7,6 +7,7 @@ import (
 
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain/pii"
+	"github.com/alonsomachado/transaction-outbox-go/internal/observability"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -34,18 +35,6 @@ func New(
 	interval, pruneAfter time.Duration,
 ) *DispatchOutbox {
 	meter := otel.GetMeterProvider().Meter("usecase/outbox")
-	publishedTotal, err := meter.Int64Counter("outbox.published_total")
-	if err != nil {
-		slog.ErrorContext(context.Background(), "create outbox.published_total counter failed", "err", err.Error())
-	}
-	pendingCount, err := meter.Int64Gauge("outbox.pending_count")
-	if err != nil {
-		slog.ErrorContext(context.Background(), "create outbox.pending_count gauge failed", "err", err.Error())
-	}
-	deadLetterCount, err := meter.Int64Gauge("outbox.dead_letter_count")
-	if err != nil {
-		slog.ErrorContext(context.Background(), "create outbox.dead_letter_count gauge failed", "err", err.Error())
-	}
 	return &DispatchOutbox{
 		outboxRepo:      outboxRepo,
 		publisher:       publisher,
@@ -53,9 +42,9 @@ func New(
 		maxRetries:      maxRetries,
 		interval:        interval,
 		pruneAfter:      pruneAfter,
-		publishedTotal:  publishedTotal,
-		pendingCount:    pendingCount,
-		deadLetterCount: deadLetterCount,
+		publishedTotal:  observability.Int64Counter(meter, "outbox.published_total"),
+		pendingCount:    observability.Int64Gauge(meter, "outbox.pending_count"),
+		deadLetterCount: observability.Int64Gauge(meter, "outbox.dead_letter_count"),
 	}
 }
 
@@ -154,9 +143,7 @@ func (d *DispatchOutbox) dispatch(ctx context.Context) {
 		// Per-message, not batched, so the counter carries a `method`
 		// dimension — a Grafana panel can show publish rate per method,
 		// feeding capacity planning for the per-method KEDA limits.
-		if d.publishedTotal != nil {
-			d.publishedTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("method", msg.PaymentMethod)))
-		}
+		d.publishedTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("method", msg.PaymentMethod)))
 	}
 
 	span.SetAttributes(
@@ -167,18 +154,14 @@ func (d *DispatchOutbox) dispatch(ctx context.Context) {
 	)
 	// Record the TRUE backlog (Phase 5 Track 2.B) — len(msgs) is capped at
 	// batchSize, so a 10,000-row backlog would otherwise read as a flat 50.
-	if d.pendingCount != nil {
-		if count, err := d.outboxRepo.CountPending(ctx); err != nil {
-			slog.ErrorContext(ctx, "outbox count pending error", "err", err.Error())
-		} else {
-			d.pendingCount.Record(ctx, count)
-		}
+	if count, err := d.outboxRepo.CountPending(ctx); err != nil {
+		slog.ErrorContext(ctx, "outbox count pending error", "err", err.Error())
+	} else {
+		d.pendingCount.Record(ctx, count)
 	}
-	if d.deadLetterCount != nil {
-		if count, err := d.outboxRepo.CountDeadLetter(ctx); err != nil {
-			slog.ErrorContext(ctx, "outbox count dead-letter error", "err", err.Error())
-		} else {
-			d.deadLetterCount.Record(ctx, count)
-		}
+	if count, err := d.outboxRepo.CountDeadLetter(ctx); err != nil {
+		slog.ErrorContext(ctx, "outbox count dead-letter error", "err", err.Error())
+	} else {
+		d.deadLetterCount.Record(ctx, count)
 	}
 }
