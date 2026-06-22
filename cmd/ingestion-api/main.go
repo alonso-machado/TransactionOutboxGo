@@ -17,6 +17,7 @@ import (
 	"time"
 
 	handler "github.com/alonsomachado/transaction-outbox-go/internal/adapter/http"
+	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/http/ratelimit"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/messaging"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/persistence"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/config"
@@ -85,10 +86,28 @@ func main() {
 	)
 
 	paymentHandler := handler.NewPaymentHandler(ingestUC)
-	router := handler.NewRouter(paymentHandler, cfg.OtelServiceName, cfg.SwaggerEnabled)
+
+	rateLimitStore := ratelimit.NewInMemoryStore(10 * time.Minute)
+
+	router := handler.NewRouter(paymentHandler, cfg.OtelServiceName, cfg.SwaggerEnabled, handler.RouterConfig{
+		TrustedProxies:   cfg.TrustedProxies,
+		RateLimitEnabled: cfg.RateLimitEnabled,
+		RateLimitStore:   rateLimitStore,
+		RateLimitRate:    cfg.RateLimitRate,
+		RateLimitBurst:   cfg.RateLimitBurst,
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	if cfg.RateLimitEnabled {
+		janitorStop := make(chan struct{})
+		go rateLimitStore.Janitor(janitorStop, time.Minute)
+		go func() {
+			<-ctx.Done()
+			close(janitorStop)
+		}()
+	}
 
 	go dispatchUC.Run(ctx)
 

@@ -155,7 +155,7 @@ func newIngest() *ingest.IngestPayment {
 // against the shared DB, mirroring cmd/ingestion-api/main.go's DI.
 func newRouter() *gin.Engine {
 	h := handler.NewPaymentHandler(newIngest())
-	return handler.NewRouter(h, "ingestion-api-test", false)
+	return handler.NewRouter(h, "ingestion-api-test", false, handler.RouterConfig{})
 }
 
 // newDispatch wires a DispatchOutbox use case against the shared DB and a

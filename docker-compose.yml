@@ -96,6 +96,12 @@ services:
       OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-ingestion-api}"
       OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-jaeger:4318}"
       METRICS_PORT: "${METRICS_PORT:-9090}"
+      RATE_LIMIT_ENABLED: "${RATE_LIMIT_ENABLED:-true}"
+      RATE_LIMIT_RATE: "${RATE_LIMIT_RATE:-50}"
+      RATE_LIMIT_BURST: "${RATE_LIMIT_BURST:-100}"
+      # Empty locally: no ALB in front of compose, so c.ClientIP() falls back
+      # to the direct RemoteAddr (correct without an XFF-injecting proxy).
+      TRUSTED_PROXIES: "${TRUSTED_PROXIES:-}"
     ports:
       - "${APP_PORT:-8080}:8080"
       - "${METRICS_PORT:-9090}:9090"

@@ -20,6 +20,12 @@ type Config struct {
 	OtelEndpoint      string `envconfig:"OTEL_EXPORTER_OTLP_ENDPOINT" default:"localhost:4318"`
 	MetricsPort       string `envconfig:"METRICS_PORT" default:"9090"`
 	SwaggerEnabled    bool   `envconfig:"SWAGGER_ENABLED" default:"false"`
+
+	// Rate limiting (ingestion-api only) — Phase 4 Track 1.
+	RateLimitEnabled bool     `envconfig:"RATE_LIMIT_ENABLED" default:"true"`
+	RateLimitRate    float64  `envconfig:"RATE_LIMIT_RATE" default:"50"`
+	RateLimitBurst   int      `envconfig:"RATE_LIMIT_BURST" default:"100"`
+	TrustedProxies   []string `envconfig:"TRUSTED_PROXIES"`
 }
 
 func Load() (*Config, error) {
