@@ -21,6 +21,7 @@ Full design (Phase 1 — core system): [`.claude/plan.md`](.claude/plan.md)
 Phase 2 plan (OTel · Swagger · TestContainers · K8s+KEDA): [`.claude/plan-phase2.md`](.claude/plan-phase2.md)
 Phase 3 plan (per-method queues · card payments · CI/CD · Pulumi/AWS · k6): [`.claude/plan-phase3.md`](.claude/plan-phase3.md)
 Phase 4 plan (leaky-bucket rate limiter · canary deploys · Grafana · TimescaleDB): [`.claude/plan-phase4.md`](.claude/plan-phase4.md)
+Phase 5 plan (versioned migrations · retry backoff · DLQ replay · LISTEN/NOTIFY · connection pooling · Loki/Tempo/alerting · External Secrets · PCI/DR): [`.claude/plan-phase5.md`](.claude/plan-phase5.md)
 User-facing docs: [`README.md`](README.md)
 
 ---
