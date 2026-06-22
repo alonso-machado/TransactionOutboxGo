@@ -1,0 +1,47 @@
+# Promtail scrapes every container's JSON-formatted stdout (Phase 5 Track
+# 4.A's slog JSON handler) via Docker-API service discovery and ships them to
+# Loki. docker_sd_configs talks to the engine's Docker-compatible API socket
+# — works against Podman too since Podman exposes the same API shape, but
+# the socket path differs from Docker Desktop's default:
+#   - Docker Desktop:        unix:///var/run/docker.sock
+#   - Podman (rootless, Linux/WSL): unix:///run/user/<uid>/podman/podman.sock
+#   - Podman Desktop (Windows/macOS): the Podman machine's forwarded socket,
+#     typically surfaced at npipe/unix path printed by `podman machine inspect`.
+# docker-compose.yml mounts the host's Podman socket into this container at
+# /var/run/docker.sock so the default below "just works" — adjust the volume
+# mount in docker-compose.yml if your Podman socket lives elsewhere.
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # __meta_docker_container_name includes a leading "/" — strip it so the
+      # "service" log label and the Prometheus "service" metric label match.
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: service
+      - source_labels: ["__meta_docker_container_log_stream"]
+        target_label: stream
+    pipeline_stages:
+      # Every container in this stack logs structured JSON
+      # (internal/infrastructure/logging) — parse it so trace_id/level/msg
+      # become real Loki labels/fields instead of opaque text, and so the
+      # Grafana derived-field regex (datasources/tempo.yml) can match
+      # trace_id reliably.
+      - json:
+          expressions:
+            level: level
+            trace_id: trace_id
+      - labels:
+          level:

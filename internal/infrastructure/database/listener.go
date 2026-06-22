@@ -2,7 +2,7 @@ package database
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -52,7 +52,7 @@ func (l *Listener) Run(ctx context.Context) {
 			return
 		}
 		if err := l.listenOnce(ctx); err != nil {
-			log.Printf("outbox notify listener: %v (retrying in %s)", err, backoff)
+			slog.ErrorContext(ctx, "outbox notify listener error", "err", err.Error(), "retry_in", backoff.String())
 		}
 		select {
 		case <-ctx.Done():

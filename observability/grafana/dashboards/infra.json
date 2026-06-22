@@ -172,6 +172,111 @@
           "legendFormat": "{{hypertable_name}}"
         }
       ]
+    },
+    {
+      "id": 9,
+      "title": "PgBouncer — clients waiting for a connection",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 48 },
+      "description": "The headline tile (Phase 5 Track 4.D) — non-zero means the pool is too small for the current KEDA fan-out. Pairs with the PgBouncerClientsWaiting alert (observability/prometheus/rules/alerts.yml).",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "pgbouncer_pools_client_waiting_connections",
+          "legendFormat": "cl_waiting {{pool_name}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "PgBouncer — max client wait time",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
+      "description": "How long the unluckiest queued client waited (maxwait) — pairs with the waiting-clients panel above.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "pgbouncer_pools_client_maxwait_seconds",
+          "legendFormat": "maxwait {{pool_name}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "PgBouncer — server connections (active / idle / used)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
+      "description": "Actual upstream Postgres connections PgBouncer is holding open — shows the multiplexing win (many clients -> few server conns).",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "pgbouncer_pools_server_active_connections",
+          "legendFormat": "active {{pool_name}}"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "pgbouncer_pools_server_idle_connections",
+          "legendFormat": "idle {{pool_name}}"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "pgbouncer_pools_server_used_connections",
+          "legendFormat": "used {{pool_name}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "PgBouncer — client connections (active)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 64 },
+      "description": "Inbound load from ingestion-api + the 5xN consumer-worker replicas.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "pgbouncer_pools_client_active_connections",
+          "legendFormat": "active {{pool_name}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "PgBouncer — pooling efficiency (client-active ÷ server-active)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 64 },
+      "description": "The collapse ratio PgBouncer buys — the justification panel for running a pooler at all. Higher is better multiplexing.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "pgbouncer_pools_client_active_connections / pgbouncer_pools_server_active_connections",
+          "legendFormat": "efficiency {{pool_name}}"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "PgBouncer — avg query / wait time",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 72 },
+      "description": "Latency added by pooling itself — should stay near zero unless the pool is saturated.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "pgbouncer_stats_avg_query_time",
+          "legendFormat": "avg_query_time {{database}}"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "pgbouncer_stats_avg_wait_time",
+          "legendFormat": "avg_wait_time {{database}}"
+        }
+      ]
     }
   ]
 }

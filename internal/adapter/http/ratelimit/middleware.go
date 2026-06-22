@@ -1,8 +1,9 @@
 package ratelimit
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -16,7 +17,7 @@ func Middleware(store BucketStore, rate float64, burst int) gin.HandlerFunc {
 	meter := otel.GetMeterProvider().Meter("adapter/http/ratelimit")
 	rejectedTotal, err := meter.Int64Counter("ingestion.ratelimit_rejected_total")
 	if err != nil {
-		log.Printf("create ingestion.ratelimit_rejected_total counter: %v", err)
+		slog.ErrorContext(context.Background(), "create ingestion.ratelimit_rejected_total counter failed", "err", err.Error())
 	}
 
 	return func(c *gin.Context) {

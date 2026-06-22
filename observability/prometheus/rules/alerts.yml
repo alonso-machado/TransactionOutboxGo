@@ -1,0 +1,147 @@
+# Phase 5 Track 4.C — Prometheus alerting rules. Loaded via
+# observability/prometheus/prometheus.yml's `rule_files: ["rules/*.yml"]` and
+# evaluated locally; Alertmanager (observability/alertmanager/alertmanager.yml)
+# routes firing alerts to the configured receiver.
+#
+# Metric names below are verified against the actual instrumentation code on
+# main as of Phase 5 Track 4 (NOT the pre-Track-2/3 worktree this was ported
+# from) — see each alert's comment for the source file/line.
+groups:
+  - name: transaction-outbox.outbox
+    rules:
+      # internal/usecase/outbox/dispatch.go: meter.Int64Gauge("outbox.pending_count")
+      # -> Prometheus exporter name "outbox_pending_count" (OTel dots become
+      # underscores on Prometheus export). Phase 5 Track 2.B fixed this gauge
+      # to record the TRUE backlog (CountPending), not the batch-capped count
+      # — deriv() over 5m flags a backlog that keeps growing pass over pass.
+      - alert: OutboxBacklogGrowing
+        expr: deriv(outbox_pending_count[5m]) > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Outbox pending count has been rising for 5+ minutes"
+          description: "outbox.pending_count has had a positive derivative for at least 5 minutes — the dispatcher is falling behind RabbitMQ/DB pressure. Check consumer-worker health and outbox dispatch logs (service=ingestion-api)."
+
+      # internal/usecase/outbox/dispatch.go: meter.Int64Gauge("outbox.dead_letter_count")
+      # (added by Phase 5 Track 2.B) -> Prometheus exporter name
+      # "outbox_dead_letter_count".
+      - alert: OutboxDeadLetterPresent
+        expr: outbox_dead_letter_count > 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "Outbox has dead-lettered messages"
+          description: "outbox.dead_letter_count > 0 — at least one outbox message exhausted OUTBOX_MAX_RETRIES and was marked DEAD_LETTER. Requires manual replay (see cmd/outbox-admin's replay-dead command) or investigation."
+
+  - name: transaction-outbox.rabbitmq
+    rules:
+      # rabbitmq_queue_messages is the rabbitmq_prometheus plugin's own
+      # metric (already scraped — observability/prometheus/prometheus.yml's
+      # "rabbitmq" job), same metric the infra.json dashboard's panel 1 uses,
+      # filtered to *.dlq queues (declared per-method —
+      # internal/infrastructure/rabbitmq).
+      - alert: RabbitMQDLQDepth
+        expr: rabbitmq_queue_messages{queue=~"payments\\..*\\.dlq"} > 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "A payments DLQ has messages ({{ $labels.queue }})"
+          description: "{{ $labels.queue }} has {{ $value }} message(s) — these were rejected after MAX_DELIVERIES attempts (internal/adapter/messaging/consumer.go's poison_dlq path) and need manual replay (see cmd/outbox-admin's drain-dlq command) or inspection."
+
+  - name: transaction-outbox.ingest-slo
+    rules:
+      # otelgin.Middleware (internal/adapter/http/router.go) only emits
+      # TRACING spans — it does not export an HTTP request duration/count
+      # histogram to Prometheus. There is currently no
+      # http_server_*_count{code=~"5.."} (or any other) metric for ingestion-api
+      # request outcomes anywhere in this codebase. This multi-window,
+      # multi-burn-rate pair is written against the metric name a future
+      # HTTP metrics middleware (e.g. an otelhttp/promhttp counter on the Gin
+      # router) is expected to expose — it is a documented gap, not a
+      # functioning alert, until that instrumentation is added.
+      - alert: IngestErrorBudgetBurnFast
+        expr: |
+          (
+            sum(rate(http_server_requests_total{service="ingestion-api",code=~"5.."}[5m]))
+            /
+            sum(rate(http_server_requests_total{service="ingestion-api"}[5m]))
+          ) > (14.4 * (1 - 0.999))
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "ingestion-api fast-burn: 5xx rate threatens the 99.9% SLO"
+          description: "5xx ratio over the last 5m implies the 30-day error budget would be exhausted in ~2 days at this rate. NOT YET WIRED: requires an HTTP request counter on ingestion-api (otelgin only emits traces today)."
+      - alert: IngestErrorBudgetBurnSlow
+        expr: |
+          (
+            sum(rate(http_server_requests_total{service="ingestion-api",code=~"5.."}[1h]))
+            /
+            sum(rate(http_server_requests_total{service="ingestion-api"}[1h]))
+          ) > (6 * (1 - 0.999))
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "ingestion-api slow-burn: sustained 5xx rate eating the 99.9% SLO"
+          description: "5xx ratio over the last 1h implies the 30-day error budget would be exhausted in ~5 days at this rate. NOT YET WIRED: requires an HTTP request counter on ingestion-api (otelgin only emits traces today)."
+
+  - name: transaction-outbox.consumer
+    rules:
+      # internal/adapter/messaging/consumer.go: meter.Int64Counter("consumer.messages_processed_total")
+      # with attribute "outcome" = "poison_dlq" | "retry_scheduled" | "ack",
+      # plus "payment_method"/"payment_queue"/"routing_key" — exported as
+      # consumer_messages_processed_total{outcome="poison_dlq", ...}.
+      - alert: ConsumerPoisonRate
+        expr: sum(rate(consumer_messages_processed_total{outcome="poison_dlq"}[5m])) by (payment_method) > 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Consumer is poison-dead-lettering messages ({{ $labels.payment_method }})"
+          description: "consumer.messages_processed_total{outcome=\"poison_dlq\"} rate > 0 for payment_method={{ $labels.payment_method }} over the last 5m — messages are exhausting MAX_DELIVERIES and landing in the DLQ. Pairs with RabbitMQDLQDepth."
+
+      # internal/usecase/consume/process.go: meter.Int64Counter("consumer.unknown_schema_version_total")
+      # (added by Phase 5 Track 2.D) -> Prometheus exporter name
+      # "consumer_unknown_schema_version_total".
+      - alert: UnknownSchemaVersion
+        expr: consumer_unknown_schema_version_total > 0
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Consumer received a message with an unknown schema version"
+          description: "consumer.unknown_schema_version_total > 0 — a message's envelope schemaVersion wasn't recognized by this consumer build. Check for a producer/consumer version skew during a rollout."
+
+  - name: transaction-outbox.ratelimit
+    rules:
+      # internal/adapter/http/ratelimit/middleware.go: meter.Int64Counter("ingestion.ratelimit_rejected_total")
+      # -> Prometheus export name "ingestion_ratelimit_rejected_total".
+      - alert: RateLimitRejectSpike
+        expr: sum(rate(ingestion_ratelimit_rejected_total[5m])) > 5
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "ingestion-api is rejecting a sustained volume of requests on the rate limiter"
+          description: "ingestion.ratelimit_rejected_total rate has exceeded 5/s for 5+ minutes — either a client is misbehaving (retry storm) or RATE_LIMIT_RATE/RATE_LIMIT_BURST are tuned too low for current legitimate traffic."
+
+  - name: transaction-outbox.pgbouncer
+    rules:
+      # pgbouncer-exporter's SHOW POOLS-derived gauge (Phase 5 Track 3.C;
+      # exporter container declared in docker-compose.yml's
+      # pgbouncer-exporter service, scraped via the "pgbouncer" job in
+      # observability/prometheus/prometheus.yml). cl_waiting > 0 means
+      # PgBouncer's pool is saturated and clients are queueing for a server
+      # connection.
+      - alert: PgBouncerClientsWaiting
+        expr: pgbouncer_pools_client_waiting_connections > 0
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "PgBouncer clients are waiting for a server connection"
+          description: "pgbouncer_pools_client_waiting_connections > 0 for 2+ minutes on pool {{ $labels.pool_name }} (or db {{ $labels.database }}) — the pool is too small for the current KEDA fan-out. Consider raising default_pool_size or pool_size."

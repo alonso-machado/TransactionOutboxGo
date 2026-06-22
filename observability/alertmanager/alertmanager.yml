@@ -1,0 +1,31 @@
+# Phase 5 Track 4.C — single route + single receiver, documented as a
+# placeholder. Swap the webhook_configs URL below for a real Slack
+# incoming-webhook ("https://hooks.slack.com/services/...") or a PagerDuty
+# integration (use pagerduty_configs with a routing/service key instead) before
+# relying on this in anything beyond a local/demo stack.
+route:
+  receiver: default
+  group_by: ["alertname"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Fast-burn SLO alerts and DLQ/poison alerts page sooner than the
+    # group_interval default — see prometheus/rules/alerts.yml's "page"
+    # severity label on the fast-burn-rate / dead-letter / poison alerts.
+    - matchers:
+        - severity = "page"
+      group_wait: 10s
+      repeat_interval: 1h
+      receiver: default
+
+receivers:
+  - name: default
+    webhook_configs:
+      # PLACEHOLDER — replace with your real Slack/PagerDuty/email endpoint.
+      # e.g. Slack: use a Slack incoming webhook URL with slack_configs
+      # instead of webhook_configs, or point this at an internal router
+      # (e.g. an n8n/Zapier inbound webhook) that fans out to your actual
+      # on-call tooling.
+      - url: "http://localhost:9999/replace-with-your-real-webhook"
+        send_resolved: true

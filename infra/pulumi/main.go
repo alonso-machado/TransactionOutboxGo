@@ -1,8 +1,8 @@
 // Pulumi program for the Transaction Outbox Go monorepo's AWS target
-// (Track 4 of Phase 3): VPC → EKS → ECR/RDS/Amazon MQ/Secrets Manager →
-// KEDA operator → the existing helmcharts/transaction-outbox chart.
+// (Track 4 of Phase 3): VPC â†’ EKS â†’ ECR/RDS/Amazon MQ/Secrets Manager â†’
+// KEDA operator â†’ the existing helmcharts/transaction-outbox chart.
 //
-// This program does not author Kubernetes workload manifests — the chart
+// This program does not author Kubernetes workload manifests â€” the chart
 // already renders one consumer Deployment + KEDA ScaledObject per payment
 // method from its own values.yaml (see workloads.go).
 package main
@@ -41,8 +41,8 @@ func main() {
 		}
 
 		// Phase 4 Track 4: Argo Rollouts controller + (Track 1) the AWS Load
-		// Balancer Controller must both be installed — and their CRDs/
-		// webhooks ready — before the app chart applies any Rollout,
+		// Balancer Controller must both be installed â€” and their CRDs/
+		// webhooks ready â€” before the app chart applies any Rollout,
 		// AnalysisTemplate, or ALB-annotated Ingress resources.
 		argoRollouts, err := installArgoRollouts(ctx, k8sProvider)
 		if err != nil {
@@ -60,6 +60,14 @@ func main() {
 		// true below).
 		esoRelease, _, err := installExternalSecretsOperator(ctx, cluster, k8sProvider)
 		if err != nil {
+			return err
+		}
+
+		// Phase 5 Track 4: Loki/Tempo/Alertmanager/PrometheusRule cloud
+		// counterpart of the docker-compose observability stack. Not a
+		// dependency of installWorkloads -- the app deploys fine whether or
+		// not observability is up, same as tempo/jaeger locally.
+		if _, err := installObservability(ctx, k8sProvider); err != nil {
 			return err
 		}
 

@@ -31,6 +31,10 @@ type Config struct {
 	OtelEndpoint    string `envconfig:"OTEL_EXPORTER_OTLP_ENDPOINT" default:"localhost:4318"`
 	MetricsPort     string `envconfig:"METRICS_PORT" default:"9090"`
 	SwaggerEnabled  bool   `envconfig:"SWAGGER_ENABLED" default:"false"`
+	// LogFormat selects the slog handler (internal/infrastructure/logging) —
+	// "json" for production/containers, "text" for a human-readable local
+	// console. Phase 5 Track 4.A.
+	LogFormat string `envconfig:"LOG_FORMAT" default:"json"`
 
 	// Rate limiting (ingestion-api only) — Phase 4 Track 1.
 	RateLimitEnabled bool     `envconfig:"RATE_LIMIT_ENABLED" default:"true"`

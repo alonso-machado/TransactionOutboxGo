@@ -2,7 +2,7 @@ package outbox
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
@@ -36,15 +36,15 @@ func New(
 	meter := otel.GetMeterProvider().Meter("usecase/outbox")
 	publishedTotal, err := meter.Int64Counter("outbox.published_total")
 	if err != nil {
-		log.Printf("create outbox.published_total counter: %v", err)
+		slog.ErrorContext(context.Background(), "create outbox.published_total counter failed", "err", err.Error())
 	}
 	pendingCount, err := meter.Int64Gauge("outbox.pending_count")
 	if err != nil {
-		log.Printf("create outbox.pending_count gauge: %v", err)
+		slog.ErrorContext(context.Background(), "create outbox.pending_count gauge failed", "err", err.Error())
 	}
 	deadLetterCount, err := meter.Int64Gauge("outbox.dead_letter_count")
 	if err != nil {
-		log.Printf("create outbox.dead_letter_count gauge: %v", err)
+		slog.ErrorContext(context.Background(), "create outbox.dead_letter_count gauge failed", "err", err.Error())
 	}
 	return &DispatchOutbox{
 		outboxRepo:      outboxRepo,
@@ -101,7 +101,7 @@ func (d *DispatchOutbox) Run(ctx context.Context, trigger <-chan struct{}) {
 			d.dispatch(ctx)
 		case <-pruneTicker.C:
 			if err := d.outboxRepo.DeleteOldPublished(ctx, d.pruneAfter); err != nil {
-				log.Printf("outbox prune error: %v", err)
+				slog.ErrorContext(ctx, "outbox prune error", "err", err.Error())
 			}
 		case <-trigger:
 			if debounce == nil {
@@ -122,7 +122,7 @@ func (d *DispatchOutbox) dispatch(ctx context.Context) {
 
 	msgs, err := d.outboxRepo.FetchPending(ctx, d.batchSize)
 	if err != nil {
-		log.Printf("outbox fetch error: %s", pii.Redact(err.Error()))
+		slog.ErrorContext(ctx, "outbox fetch error", "err", pii.Redact(err.Error()))
 		span.RecordError(err)
 		span.SetStatus(codes.Error, pii.Redact(err.Error()))
 		return
@@ -133,23 +133,23 @@ func (d *DispatchOutbox) dispatch(ctx context.Context) {
 	for _, msg := range msgs {
 		if err := d.publisher.Publish(ctx, msg); err != nil {
 			reason := pii.Redact(err.Error())
-			log.Printf("outbox publish error for %s: %s", msg.IdempotencyKey, reason)
+			slog.ErrorContext(ctx, "outbox publish error", "idempotency_key", msg.IdempotencyKey, "err", reason)
 			if msg.RetryCount+1 >= d.maxRetries {
 				deadLetterCount++
 				if markErr := d.outboxRepo.MarkDeadLetter(ctx, msg.ID, reason); markErr != nil {
-					log.Printf("outbox mark dead-letter error: %v", markErr)
+					slog.ErrorContext(ctx, "outbox mark dead-letter error", "err", markErr.Error())
 				}
 			} else {
 				retryingCount++
 				if retryErr := d.outboxRepo.MarkRetrying(ctx, msg.ID, reason); retryErr != nil {
-					log.Printf("outbox mark retrying error: %v", retryErr)
+					slog.ErrorContext(ctx, "outbox mark retrying error", "err", retryErr.Error())
 				}
 			}
 			continue
 		}
 		publishedCount++
 		if markErr := d.outboxRepo.MarkPublished(ctx, msg.ID, time.Now().UTC()); markErr != nil {
-			log.Printf("outbox mark published error: %v", markErr)
+			slog.ErrorContext(ctx, "outbox mark published error", "err", markErr.Error())
 		}
 		// Per-message, not batched, so the counter carries a `method`
 		// dimension — a Grafana panel can show publish rate per method,
@@ -169,14 +169,14 @@ func (d *DispatchOutbox) dispatch(ctx context.Context) {
 	// batchSize, so a 10,000-row backlog would otherwise read as a flat 50.
 	if d.pendingCount != nil {
 		if count, err := d.outboxRepo.CountPending(ctx); err != nil {
-			log.Printf("outbox count pending error: %v", err)
+			slog.ErrorContext(ctx, "outbox count pending error", "err", err.Error())
 		} else {
 			d.pendingCount.Record(ctx, count)
 		}
 	}
 	if d.deadLetterCount != nil {
 		if count, err := d.outboxRepo.CountDeadLetter(ctx); err != nil {
-			log.Printf("outbox count dead-letter error: %v", err)
+			slog.ErrorContext(ctx, "outbox count dead-letter error", "err", err.Error())
 		} else {
 			d.deadLetterCount.Record(ctx, count)
 		}

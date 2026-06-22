@@ -5,11 +5,11 @@ package telemetry
 import (
 	"context"
 	"fmt"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
 
+	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/logging"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -27,8 +27,9 @@ type Shutdown func(ctx context.Context) error
 
 // Setup initialises a TracerProvider (OTLP/HTTP exporter), a MeterProvider
 // (Prometheus exporter served on metricsPort at /metrics), W3C TraceContext
-// propagation, and a slog default logger that injects trace_id/span_id.
-func Setup(ctx context.Context, serviceName, otlpEndpoint, metricsPort string) (Shutdown, error) {
+// propagation, and a slog default logger (internal/infrastructure/logging)
+// that injects trace_id/span_id.
+func Setup(ctx context.Context, serviceName, otlpEndpoint, metricsPort, logFormat string) (Shutdown, error) {
 	res, err := resource.Merge(resource.Default(), resource.NewWithAttributes(
 		semconv.SchemaURL,
 		semconv.ServiceName(serviceName),
@@ -59,16 +60,17 @@ func Setup(ctx context.Context, serviceName, otlpEndpoint, metricsPort string) (
 	)
 	otel.SetMeterProvider(mp)
 
+	logger := logging.NewLogger(serviceName, logFormat, os.Stdout)
+	slog.SetDefault(logger)
+
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	metricsSrv := &http.Server{Addr: ":" + metricsPort, Handler: mux}
 	go func() {
 		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("metrics server: %v", err)
+			logger.ErrorContext(ctx, "metrics server error", "err", err.Error())
 		}
 	}()
-
-	slog.SetDefault(slog.New(newTraceHandler(slog.NewJSONHandler(os.Stdout, nil))))
 
 	return func(ctx context.Context) error {
 		if err := metricsSrv.Shutdown(ctx); err != nil {

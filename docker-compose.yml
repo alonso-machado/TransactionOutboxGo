@@ -8,10 +8,10 @@ x-consumer-worker-base: &consumer-worker-base
     dockerfile: Dockerfile
     args:
       SERVICE: consumer-worker
-  # jaeger is NOT a dependency here — the OTLP/HTTP exporter
+  # tempo is NOT a dependency here — the OTLP/HTTP exporter
   # (internal/infrastructure/telemetry) fails open if nothing's listening at
   # OTEL_EXPORTER_OTLP_ENDPOINT (traces are just dropped, not fatal), so a
-  # partial `up` that skips jaeger (see `make loadtest-up`) still works.
+  # partial `up` that skips tempo (see `make loadtest-up`) still works.
   depends_on:
     postgres:
       condition: service_healthy
@@ -36,7 +36,12 @@ x-consumer-worker-env: &consumer-worker-env
   MAX_DELIVERIES: "${RABBITMQ_MAX_REDELIVERIES:-5}"
   RETRY_BACKOFF_BASE: "${RETRY_BACKOFF_BASE:-1s}"
   RETRY_BACKOFF_CAP: "${RETRY_BACKOFF_CAP:-5m}"
-  OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-jaeger:4318}"
+  # Phase 5 Track 4.B: traces now land in Tempo instead of Jaeger — same
+  # OTLP/HTTP protocol, just a different receiver container. The Go config
+  # default (internal/infrastructure/config) stays the bare "localhost:4318";
+  # compose always overrides it, same pattern as before.
+  OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-tempo:4318}"
+  LOG_FORMAT: "${LOG_FORMAT:-json}"
 
 services:
 
@@ -91,13 +96,23 @@ services:
     networks:
       - outbox
 
-  jaeger:
-    image: jaegertracing/all-in-one:latest
+  # Phase 5 Track 4.B: replaces the Jaeger all-in-one container. Traces land
+  # in the same Grafana as the Phase 4 dashboards and the Track 4.A Loki
+  # logs, giving native trace<->logs<->metrics correlation instead of a
+  # separate Jaeger UI.
+  tempo:
+    image: grafana/tempo:latest
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo_data:/var/tempo
     ports:
-      - "16686:16686"   # UI
+      - "3200:3200"     # Tempo HTTP API (Grafana datasource talks to this)
       - "4318:4318"     # OTLP HTTP receiver
+      - "4317:4317"     # OTLP gRPC receiver
     networks:
       - outbox
+    restart: unless-stopped
 
   # Phase 5 Track 1: one-shot golang-migrate container that applies
   # migrations/*.up.sql before any app service starts — replaces the
@@ -193,8 +208,9 @@ services:
       RETRY_BACKOFF_BASE: "${RETRY_BACKOFF_BASE:-1s}"
       RETRY_BACKOFF_CAP: "${RETRY_BACKOFF_CAP:-5m}"
       OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-ingestion-api}"
-      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-jaeger:4318}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-tempo:4318}"
       METRICS_PORT: "${METRICS_PORT:-9090}"
+      LOG_FORMAT: "${LOG_FORMAT:-json}"
       # Off by default locally — k6 load tests and seed scripts hit this from
       # a single source IP and would otherwise get throttled by their own
       # traffic. Cloud (Helm values) sets this true explicitly.
@@ -207,9 +223,9 @@ services:
     ports:
       - "${APP_PORT:-8080}:8080"
       - "${METRICS_PORT:-9090}:9090"
-    # jaeger is NOT a dependency here — see consumer-worker's note above;
+    # tempo is NOT a dependency here — see consumer-worker's note above;
     # this lets `make loadtest-up` bring up a minimal subset of this same
-    # compose file without dragging Jaeger along.
+    # compose file without dragging Tempo along.
     depends_on:
       postgres:
         condition: service_healthy
@@ -298,11 +314,69 @@ services:
 
   prometheus:
     image: prom/prometheus:latest
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
     volumes:
       - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/rules:/etc/prometheus/rules:ro
       - prometheus_data:/prometheus
     ports:
       - "9096:9090"
+    depends_on:
+      - alertmanager
+    networks:
+      - outbox
+    restart: unless-stopped
+
+  # Phase 5 Track 4.C — receives firing alerts from Prometheus and routes
+  # them to the configured receiver. See
+  # observability/alertmanager/alertmanager.yml for the (placeholder)
+  # webhook target.
+  alertmanager:
+    image: prom/alertmanager:latest
+    volumes:
+      - ./observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    ports:
+      - "9093:9093"
+    networks:
+      - outbox
+    restart: unless-stopped
+
+  # Phase 5 Track 4.A — log aggregation. Promtail (below) ships every
+  # container's structured JSON stdout here; Grafana's Loki datasource
+  # (observability/grafana/provisioning/datasources/loki.yml) reads it back
+  # and derived-field-links trace_id into Tempo.
+  loki:
+    image: grafana/loki:latest
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    volumes:
+      - ./observability/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    networks:
+      - outbox
+    restart: unless-stopped
+
+  # Phase 5 Track 4.A — scrapes every other container's stdout via the
+  # engine's Docker-compatible API and pushes to Loki. The socket mount below
+  # assumes a Docker Desktop-style /var/run/docker.sock; if you're on a
+  # Podman setup where that path isn't present on the host, point this at
+  # your Podman machine's own socket instead (see the long comment in
+  # observability/promtail/promtail-config.yaml for exact paths per
+  # platform), e.g.:
+  #   - /run/user/1000/podman/podman.sock:/var/run/docker.sock:ro
+  promtail:
+    image: grafana/promtail:latest
+    command: ["-config.file=/etc/promtail/promtail-config.yaml"]
+    volumes:
+      - ./observability/promtail/promtail-config.yaml:/etc/promtail/promtail-config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
     networks:
       - outbox
     restart: unless-stopped
@@ -321,6 +395,8 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+      - loki
+      - tempo
     networks:
       - outbox
     restart: unless-stopped
@@ -332,6 +408,9 @@ volumes:
   rabbitmq_data:
   prometheus_data:
   grafana_data:
+  tempo_data:
+  loki_data:
+  alertmanager_data:
 
 networks:
   outbox:

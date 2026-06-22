@@ -1,0 +1,28 @@
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      # Trace -> logs: jump from a span straight to its Loki log lines via
+      # the same trace_id (Promtail's pipeline_stages extract it as a
+      # label/field — observability/promtail/promtail-config.yaml).
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"
+        filterByTraceID: true
+        tags: ["service"]
+      # Trace -> metrics: jump from a span to the matching Prometheus
+      # service metrics, so a slow span can be cross-checked against its
+      # service's own dashboards.
+      tracesToMetrics:
+        datasourceUid: prometheus
+        tags:
+          - key: service
+      serviceMap:
+        datasourceUid: prometheus

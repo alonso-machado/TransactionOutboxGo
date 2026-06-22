@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
@@ -44,7 +44,7 @@ func New(paymentRepo domain.PaymentRepository, uow domain.UnitOfWork) *ProcessMe
 	meter := otel.GetMeterProvider().Meter("usecase/consume")
 	unknownSchemaVersion, err := meter.Int64Counter("consumer.unknown_schema_version_total")
 	if err != nil {
-		log.Printf("create consumer.unknown_schema_version_total counter: %v", err)
+		slog.ErrorContext(context.Background(), "create consumer.unknown_schema_version_total counter failed", "err", err.Error())
 	}
 	return &ProcessMessage{paymentRepo: paymentRepo, uow: uow, unknownSchemaVersion: unknownSchemaVersion}
 }

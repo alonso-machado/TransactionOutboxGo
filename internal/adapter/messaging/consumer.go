@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -52,11 +52,11 @@ func NewConsumer(conn *amqp.Connection, processMsg *consume.ProcessMessage, meth
 	meter := otel.GetMeterProvider().Meter("adapter/messaging")
 	messagesTotal, err := meter.Int64Counter("consumer.messages_processed_total")
 	if err != nil {
-		log.Printf("create consumer.messages_processed_total counter: %v", err)
+		slog.ErrorContext(context.Background(), "create consumer.messages_processed_total counter failed", "err", err.Error())
 	}
 	retryAttempts, err := meter.Int64Counter("consumer.retry_attempts_total")
 	if err != nil {
-		log.Printf("create consumer.retry_attempts_total counter: %v", err)
+		slog.ErrorContext(context.Background(), "create consumer.retry_attempts_total counter failed", "err", err.Error())
 	}
 	return &AMQPConsumer{
 		conn:             conn,
@@ -143,7 +143,7 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 	}
 
 	if err := c.processMsg.Execute(ctx, d.MessageId, d.Body); err != nil {
-		log.Printf("process message %s error: %s — attempt %d", d.MessageId, pii.Redact(err.Error()), retryCount+1)
+		slog.ErrorContext(ctx, "process message error", "message_id", d.MessageId, "err", pii.Redact(err.Error()), "attempt", retryCount+1)
 		span.RecordError(errors.New(pii.Redact(err.Error())))
 		span.SetStatus(codes.Error, pii.Redact(err.Error()))
 
@@ -152,7 +152,7 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 		// straight to DLQ on the first attempt instead of burning through
 		// maxDeliveries (Phase 5 Track 2.D).
 		if errors.Is(err, consume.ErrUnknownSchemaVersion) {
-			log.Printf("unknown schema version for message %s — rejecting to DLQ", d.MessageId)
+			slog.ErrorContext(ctx, "unknown schema version — rejecting to DLQ", "message_id", d.MessageId)
 			span.SetAttributes(attribute.String("outcome", "unknown_schema_version"))
 			if c.messagesTotal != nil {
 				c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "unknown_schema_version")))
@@ -162,7 +162,7 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 		}
 
 		if retryCount+1 >= c.maxDeliveries {
-			log.Printf("poison message %s after %d attempts — rejecting to DLQ", d.MessageId, retryCount+1)
+			slog.ErrorContext(ctx, "poison message — rejecting to DLQ", "message_id", d.MessageId, "attempts", retryCount+1)
 			span.SetAttributes(attribute.String("outcome", "poison_dlq"))
 			if c.messagesTotal != nil {
 				c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "poison_dlq")))
@@ -172,7 +172,7 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 		}
 
 		if reErr := c.requeueWithRetryCount(d, retryCount+1); reErr != nil {
-			log.Printf("requeue message %s error: %v — falling back to broker requeue", d.MessageId, reErr)
+			slog.ErrorContext(ctx, "requeue message error — falling back to broker requeue", "message_id", d.MessageId, "err", reErr.Error())
 			_ = d.Nack(false, true)
 			return
 		}

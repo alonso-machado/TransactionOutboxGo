@@ -9,7 +9,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,6 +22,7 @@ import (
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/persistence"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/config"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/database"
+	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/logging"
 	rmq "github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/rabbitmq"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/telemetry"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ingest"
@@ -29,26 +30,35 @@ import (
 )
 
 func main() {
+	ctx := context.Background()
+	// Startup logger: telemetry.Setup (which installs the trace-correlating
+	// default logger) needs cfg first, so config-load failures use a bare
+	// logger with no trace correlation — there's no span yet anyway.
+	startupLog := logging.NewLogger("startup", "json", os.Stdout)
+
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		startupLog.ErrorContext(ctx, "config load failed", "err", err.Error())
+		os.Exit(1)
 	}
 
-	telemetryShutdown, err := telemetry.Setup(context.Background(), cfg.OtelServiceName, cfg.OtelEndpoint, cfg.MetricsPort)
+	telemetryShutdown, err := telemetry.Setup(ctx, cfg.OtelServiceName, cfg.OtelEndpoint, cfg.MetricsPort, cfg.LogFormat)
 	if err != nil {
-		log.Fatalf("telemetry: %v", err)
+		startupLog.ErrorContext(ctx, "telemetry setup failed", "err", err.Error())
+		os.Exit(1)
 	}
 	defer func() {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
 		if err := telemetryShutdown(shutdownCtx); err != nil {
-			log.Printf("telemetry shutdown: %v", err)
+			slog.ErrorContext(shutdownCtx, "telemetry shutdown error", "err", err.Error())
 		}
 	}()
 
 	db, err := database.Connect(cfg.DatabaseURL, cfg.DBSSLMode)
 	if err != nil {
-		log.Fatalf("database: %v", err)
+		slog.ErrorContext(ctx, "database connect failed", "err", err.Error())
+		os.Exit(1)
 	}
 	// Schema migrations are no longer applied here — Phase 5 Track 1 moved
 	// them to versioned golang-migrate files under migrations/, applied by
@@ -57,19 +67,22 @@ func main() {
 
 	conn, err := rmq.Connect(cfg.RabbitMQURL, cfg.RabbitMQTLS)
 	if err != nil {
-		log.Fatalf("rabbitmq: %v", err)
+		slog.ErrorContext(ctx, "rabbitmq connect failed", "err", err.Error())
+		os.Exit(1)
 	}
 	defer func() { _ = conn.Close() }()
 
 	ch, err := conn.Channel()
 	if err != nil {
-		log.Fatalf("rabbitmq channel: %v", err)
+		slog.ErrorContext(ctx, "rabbitmq channel failed", "err", err.Error())
+		os.Exit(1)
 	}
 	if err := rmq.DeclareTopology(ch); err != nil {
-		log.Fatalf("rabbitmq topology: %v", err)
+		slog.ErrorContext(ctx, "rabbitmq topology failed", "err", err.Error())
+		os.Exit(1)
 	}
 	if err := ch.Close(); err != nil {
-		log.Printf("close topology channel: %v", err)
+		slog.ErrorContext(ctx, "close topology channel error", "err", err.Error())
 	}
 
 	uow := persistence.NewUnitOfWork(db)
@@ -124,9 +137,10 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("ingestion-api listening on :%s", cfg.HTTPPort)
+		slog.InfoContext(ctx, "ingestion-api listening", "port", cfg.HTTPPort)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http server: %v", err)
+			slog.ErrorContext(ctx, "http server error", "err", err.Error())
+			os.Exit(1)
 		}
 	}()
 
@@ -134,12 +148,12 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("shutting down...")
+	slog.InfoContext(ctx, "shutting down...")
 	cancel()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("graceful shutdown: %v", err)
+		slog.ErrorContext(shutdownCtx, "graceful shutdown error", "err", err.Error())
 	}
 }

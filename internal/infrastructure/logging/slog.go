@@ -1,11 +1,32 @@
-package telemetry
+// Package logging provides the project-wide structured logger: a stdlib
+// log/slog JSON (or text) handler wrapped so every *Context call
+// automatically carries trace_id/span_id from the active OTel span — Phase 5
+// Track 4.A. Pure stdlib + otel/trace, so it's safe to import from any layer
+// (including domain/usecase) per CLAUDE.md's dependency rule.
+package logging
 
 import (
 	"context"
+	"io"
 	"log/slog"
 
 	"go.opentelemetry.io/otel/trace"
 )
+
+// NewLogger builds the standard application logger: a JSON (or text)
+// handler wrapped with trace correlation, with a "service" attribute on
+// every line. format is typically Config.LogFormat ("json" or "text");
+// anything other than "text" defaults to JSON.
+func NewLogger(service, format string, w io.Writer) *slog.Logger {
+	var base slog.Handler
+	if format == "text" {
+		base = slog.NewTextHandler(w, nil)
+	} else {
+		base = slog.NewJSONHandler(w, nil)
+	}
+	handler := newTraceHandler(base).WithAttrs([]slog.Attr{slog.String("service", service)})
+	return slog.New(handler)
+}
 
 // traceHandler wraps an slog.Handler and injects trace_id/span_id attributes
 // from the active span in ctx, so every log line correlates with its trace.

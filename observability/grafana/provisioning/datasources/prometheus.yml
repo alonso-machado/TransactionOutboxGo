@@ -8,3 +8,11 @@ datasources:
     url: http://prometheus:9090
     isDefault: true
     editable: false
+    jsonData:
+      # Exemplars on the otelgin HTTP histogram (or any future histogram)
+      # carry a trace_id label — this lets a Grafana panel jump straight from
+      # a latency spike's exemplar dot into the matching Tempo trace
+      # (Phase 5 Track 4.B).
+      exemplarTraceIdDestinations:
+        - datasourceUid: tempo
+          name: trace_id

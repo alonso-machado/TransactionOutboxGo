@@ -2,6 +2,15 @@ global:
   scrape_interval: 5s
   evaluation_interval: 5s
 
+# Phase 5 Track 4.C — alert rules + where to send firing alerts.
+rule_files:
+  - "rules/*.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
   - job_name: ingestion-api
     static_configs:
@@ -39,3 +48,12 @@ scrape_configs:
       - targets: ["postgres_exporter:9187"]
         labels:
           service: postgres
+
+  # Phase 5 Track 4.D — PgBouncer pool metrics, feeding the infra.json
+  # dashboard's PgBouncer row + the PgBouncerClientsWaiting alert
+  # (rules/alerts.yml). The pgbouncer-exporter container itself is a Track
+  # 3.C addition (docker-compose.yml).
+  - job_name: pgbouncer
+    static_configs:
+      - targets: ["pgbouncer-exporter:9127"]
+        labels: { service: pgbouncer }

@@ -1,0 +1,40 @@
+# Minimal single-binary Tempo config for local dev (Phase 5 Track 4.B,
+# replacing the Jaeger all-in-one container). Receives the same OTLP/HTTP
+# traffic the Go services already emit via
+# internal/infrastructure/telemetry (OTEL_EXPORTER_OTLP_ENDPOINT now points
+# at tempo:4318 in docker-compose.yml instead of jaeger:4318).
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+ingester:
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 48h
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/traces
+    wal:
+      path: /var/tempo/wal
+
+# Lets Grafana's Tempo datasource query span metrics / service-graph derived
+# from traces if/when that's enabled later; harmless no-op until then.
+metrics_generator:
+  registry:
+    external_labels:
+      source: tempo
+  storage:
+    path: /var/tempo/generator/wal

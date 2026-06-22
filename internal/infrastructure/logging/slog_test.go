@@ -1,4 +1,4 @@
-package telemetry
+package logging
 
 import (
 	"bytes"
@@ -71,5 +71,23 @@ func TestTraceHandler_Enabled_DelegatesToNext(t *testing.T) {
 	}
 	if !h.Enabled(context.Background(), slog.LevelWarn) {
 		t.Fatal("expected Warn to be enabled")
+	}
+}
+
+func TestNewLogger_JSONFormat_WritesServiceAttr(t *testing.T) {
+	var buf bytes.Buffer
+	logger := NewLogger("my-service", "json", &buf)
+	logger.Info("hi")
+	if !strings.Contains(buf.String(), `"service":"my-service"`) {
+		t.Fatalf("expected service attribute, got %q", buf.String())
+	}
+}
+
+func TestNewLogger_TextFormat(t *testing.T) {
+	var buf bytes.Buffer
+	logger := NewLogger("my-service", "text", &buf)
+	logger.Info("hi")
+	if !strings.Contains(buf.String(), "service=my-service") {
+		t.Fatalf("expected service attribute, got %q", buf.String())
 	}
 }
