@@ -28,9 +28,9 @@ func NewPaymentRepository(db *gorm.DB) *GORMPaymentRepository {
 // the shared "payments" name — that's the read-side UNION ALL view; GORM
 // can't route a single static TableName() per row, so the table is
 // resolved explicitly here.
-func (r *GORMPaymentRepository) Save(ctx context.Context, uow domain.UnitOfWork, p *domain.Payment) error {
+func (r *GORMPaymentRepository) Save(ctx context.Context, uow domain.UnitOfWork, p *domain.Payment) (bool, error) {
 	db := TxFromContext(ctx, r.db)
-	return db.Table(tableFor(p.Method)).Clauses(clause.OnConflict{
+	tx := db.Table(tableFor(p.Method)).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "source_message_id"}, {Name: "occurred_at"}},
 		DoNothing: true,
 	}).Create(&PaymentModel{
@@ -49,5 +49,9 @@ func (r *GORMPaymentRepository) Save(ctx context.Context, uow domain.UnitOfWork,
 		OccurredAt:        p.OccurredAt,
 		CreatedAt:         p.CreatedAt,
 		UpdatedAt:         p.UpdatedAt,
-	}).Error
+	})
+	if tx.Error != nil {
+		return false, tx.Error
+	}
+	return tx.RowsAffected > 0, nil
 }

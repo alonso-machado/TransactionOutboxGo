@@ -31,6 +31,7 @@ type ProcessMessage struct {
 	paymentRepo          domain.PaymentRepository
 	uow                  domain.UnitOfWork
 	unknownSchemaVersion metric.Int64Counter
+	duplicateTotal       metric.Int64Counter
 }
 
 func New(paymentRepo domain.PaymentRepository, uow domain.UnitOfWork) *ProcessMessage {
@@ -39,6 +40,7 @@ func New(paymentRepo domain.PaymentRepository, uow domain.UnitOfWork) *ProcessMe
 		paymentRepo:          paymentRepo,
 		uow:                  uow,
 		unknownSchemaVersion: observability.Int64Counter(meter, "consumer.unknown_schema_version_total"),
+		duplicateTotal:       observability.Int64Counter(meter, "consumer.duplicate_total"),
 	}
 }
 
@@ -58,15 +60,22 @@ type payloadDTO struct {
 	OccurredAt        time.Time       `json:"occurredAt"`
 }
 
-// Execute is idempotent: PaymentRepository.Save uses ON CONFLICT (source_message_id)
-// DO NOTHING, so redelivering the same RabbitMQ message is a safe no-op.
-func (uc *ProcessMessage) Execute(ctx context.Context, messageID string, body []byte) error {
+// Execute is idempotent: PaymentRepository.Save uses ON CONFLICT
+// (source_message_id, occurred_at) DO NOTHING, so redelivering the same
+// RabbitMQ message is a safe no-op rather than an error — reported back via
+// created=false so the caller (AMQPConsumer) can tell a "duplicate" outcome
+// apart from a fresh "saved" one on its own trace/metrics. Every return path
+// also tags the "process.message" span's outcome attribute ("error" /
+// "unknown_schema_version" / "duplicate" / "saved"), so a single dimension
+// name distinguishes the kind of thing that happened across logs, metrics,
+// and traces.
+func (uc *ProcessMessage) Execute(ctx context.Context, messageID string, body []byte) (bool, error) {
 	ctx, span := tracer.Start(ctx, "process.message")
 	defer span.End()
 
 	var dto payloadDTO
 	if err := json.Unmarshal(body, &dto); err != nil {
-		return recordRedactedError(span, fmt.Errorf("unmarshal payload: %w", err))
+		return false, recordRedactedError(span, "error", fmt.Errorf("unmarshal payload: %w", err))
 	}
 
 	span.SetAttributes(attribute.String("schema_version", dto.SchemaVersion))
@@ -76,22 +85,22 @@ func (uc *ProcessMessage) Execute(ctx context.Context, messageID string, body []
 	// first attempt for this specific error — see AMQPConsumer.handle).
 	if dto.SchemaVersion != "" && dto.SchemaVersion != domain.SchemaVersion {
 		uc.unknownSchemaVersion.Add(ctx, 1, metric.WithAttributes(attribute.String("schema_version", dto.SchemaVersion)))
-		return recordRedactedError(span, fmt.Errorf("%w: %q (supported: %q)", ErrUnknownSchemaVersion, dto.SchemaVersion, domain.SchemaVersion))
+		return false, recordRedactedError(span, "unknown_schema_version", fmt.Errorf("%w: %q (supported: %q)", ErrUnknownSchemaVersion, dto.SchemaVersion, domain.SchemaVersion))
 	}
 
 	paymentID, err := uuid.Parse(dto.PaymentID)
 	if err != nil {
-		return recordRedactedError(span, fmt.Errorf("parse paymentId: %w", err))
+		return false, recordRedactedError(span, "error", fmt.Errorf("parse paymentId: %w", err))
 	}
 	span.SetAttributes(attribute.String("payment_id", paymentID.String()))
 
 	payerID, err := domain.ParseOptionalUUID(dto.PayerID)
 	if err != nil {
-		return recordRedactedError(span, fmt.Errorf("parse payerId: %w", err))
+		return false, recordRedactedError(span, "error", fmt.Errorf("parse payerId: %w", err))
 	}
 	recipientID, err := domain.ParseOptionalUUID(dto.RecipientID)
 	if err != nil {
-		return recordRedactedError(span, fmt.Errorf("parse recipientId: %w", err))
+		return false, recordRedactedError(span, "error", fmt.Errorf("parse recipientId: %w", err))
 	}
 
 	now := time.Now().UTC()
@@ -113,21 +122,30 @@ func (uc *ProcessMessage) Execute(ctx context.Context, messageID string, body []
 		UpdatedAt:         now,
 	}
 
-	err = uc.uow.Execute(ctx, func(ctx context.Context) error {
-		return uc.paymentRepo.Save(ctx, uc.uow, payment)
-	})
-	if err != nil {
-		span.SetAttributes(attribute.String("outcome", "error"))
-		return recordRedactedError(span, err)
+	var created bool
+	if err := uc.uow.Execute(ctx, func(ctx context.Context) error {
+		var saveErr error
+		created, saveErr = uc.paymentRepo.Save(ctx, uc.uow, payment)
+		return saveErr
+	}); err != nil {
+		return false, recordRedactedError(span, "error", err)
+	}
+
+	if !created {
+		uc.duplicateTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("method", payment.Method)))
+		span.SetAttributes(attribute.String("outcome", "duplicate"))
+		return false, nil
 	}
 	span.SetAttributes(attribute.String("outcome", "saved"))
-	return nil
+	return true, nil
 }
 
-// recordRedactedError masks any PII the underlying driver/library may have
-// embedded in err's message (e.g. a constraint-violation DETAIL line) before
-// attaching it to the span, then returns the original err for the caller.
-func recordRedactedError(span trace.Span, err error) error {
+// recordRedactedError tags the span's outcome attribute, masks any PII the
+// underlying driver/library may have embedded in err's message (e.g. a
+// constraint-violation DETAIL line) before attaching it to the span, then
+// returns the original err for the caller.
+func recordRedactedError(span trace.Span, outcome string, err error) error {
+	span.SetAttributes(attribute.String("outcome", outcome))
 	span.RecordError(errors.New(pii.Redact(err.Error())))
 	span.SetStatus(codes.Error, pii.Redact(err.Error()))
 	return err

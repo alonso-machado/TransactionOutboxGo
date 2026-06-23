@@ -345,6 +345,36 @@ hypertable (was a single-column `UNIQUE(source_message_id)` on the old plain
 below for why the dedup key gained a column and why redelivery safety still
 holds.
 
+### Consumer outcome taxonomy
+
+A duplicate delivery hitting that `UNIQUE` constraint is **not an error** —
+`PaymentRepository.Save` ([`payment_repo.go`](internal/adapter/persistence/payment_repo.go))
+reports it via a `created bool` return (mirroring how `OutboxRepository.Enqueue`
+already tells `IngestPayment` an `"accepted"` apart from a `"duplicate"`), so
+`ProcessMessage.Execute` ([`process.go`](internal/usecase/consume/process.go))
+and `AMQPConsumer.handle` ([`consumer.go`](internal/adapter/messaging/consumer.go))
+can tell it apart from both a fresh save and a genuine processing error,
+instead of lumping all three under one generic `ack`/error split. Every code
+path tags the **same `outcome` attribute name** — on the span, on the
+`consumer.messages_processed_total` metric, and (for the non-`ack`/`saved`
+cases) on a structured `slog` field — so all three OTel signals (traces,
+metrics, logs) agree on one vocabulary you can filter/group by in Jaeger,
+Grafana, or Loki alike:
+
+| `outcome` | Meaning | Retried? | Reaches DLQ? |
+|---|---|---|---|
+| `saved` / `ack` | Fresh row persisted | — | — |
+| `duplicate` | `(source_message_id, occurred_at)` already existed — a safe redelivery no-op | No — Ack'd immediately | No |
+| `retry_scheduled` | Transient processing error, requeued via the per-method `*.retry` queue with backoff | Yes, up to `MAX_DELIVERIES` | Eventually, if retries exhaust |
+| `poison_dlq` | `MAX_DELIVERIES` exhausted | No — terminal | Yes |
+| `unknown_schema_version` | `schemaVersion` newer/unrecognized — structurally can never succeed | No — DLQ'd on the **first** attempt | Yes |
+
+`duplicate` and `unknown_schema_version` never loop: both are decided by a
+condition that's independent of delivery count (a `DO NOTHING` conflict, or a
+version string that will never change on redelivery), so neither one ever
+enters the retry machinery in the first place — a duplicate is structurally
+incapable of reaching the DLQ.
+
 ---
 
 ## TimescaleDB: per-method hypertables
@@ -673,9 +703,11 @@ the same files serve local Grafana and cloud Grafana, so they never drift:
 - **ingestion-api** — request rate, P50/P95/P99 latency, 2xx/4xx/5xx
   breakdown, rate-limiter rejections, outbox publish rate/backlog, Go runtime
   metrics.
-- **consumer-worker** — per-method throughput/outcome (`ack`/
-  `retry_scheduled`/`poison_dlq`), retry depth, queue backlog, a `$method`
-  template variable to isolate one payment method.
+- **consumer-worker** — per-method throughput/outcome (`ack`/`duplicate`/
+  `retry_scheduled`/`poison_dlq`/`unknown_schema_version` — see
+  [Consumer outcome taxonomy](#consumer-outcome-taxonomy) below), retry
+  depth, queue backlog, a `$method` template variable to isolate one payment
+  method.
 - **infra** — RabbitMQ per-queue depth (queues *and* DLQs, so a poison spike
   on one method is visible without touching the others), Postgres connections/
   TPS/cache-hit-ratio/deadlocks.

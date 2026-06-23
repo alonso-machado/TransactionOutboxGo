@@ -135,7 +135,8 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 		c.retryAttempts.Add(ctx, 1, c.metricAttrs(attribute.Int("retry_count", retryCount)))
 	}
 
-	if err := c.processMsg.Execute(ctx, d.MessageId, d.Body); err != nil {
+	created, err := c.processMsg.Execute(ctx, d.MessageId, d.Body)
+	if err != nil {
 		slog.ErrorContext(ctx, "process message error", "message_id", d.MessageId, "err", pii.Redact(err.Error()), "attempt", retryCount+1)
 		span.RecordError(errors.New(pii.Redact(err.Error())))
 		span.SetStatus(codes.Error, pii.Redact(err.Error()))
@@ -145,7 +146,7 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 		// straight to DLQ on the first attempt instead of burning through
 		// maxDeliveries (Phase 5 Track 2.D).
 		if errors.Is(err, consume.ErrUnknownSchemaVersion) {
-			slog.ErrorContext(ctx, "unknown schema version — rejecting to DLQ", "message_id", d.MessageId)
+			slog.ErrorContext(ctx, "unknown schema version — rejecting to DLQ", "message_id", d.MessageId, "outcome", "unknown_schema_version")
 			span.SetAttributes(attribute.String("outcome", "unknown_schema_version"))
 			c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "unknown_schema_version")))
 			_ = d.Reject(false)
@@ -153,7 +154,7 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 		}
 
 		if retryCount+1 >= c.maxDeliveries {
-			slog.ErrorContext(ctx, "poison message — rejecting to DLQ", "message_id", d.MessageId, "attempts", retryCount+1)
+			slog.ErrorContext(ctx, "poison message — rejecting to DLQ", "message_id", d.MessageId, "attempts", retryCount+1, "outcome", "poison_dlq")
 			span.SetAttributes(attribute.String("outcome", "poison_dlq"))
 			c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "poison_dlq")))
 			_ = d.Reject(false)
@@ -165,11 +166,24 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 			_ = d.Nack(false, true)
 			return
 		}
+		span.SetAttributes(attribute.String("outcome", "retry_scheduled"))
 		c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "retry_scheduled")))
 		_ = d.Ack(false)
 		return
 	}
-	c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "ack")))
+
+	// A redelivery of an already-processed message lands here with
+	// created=false (the (source_message_id, occurred_at) UNIQUE constraint
+	// absorbed it as a no-op, not an error) — tagged "duplicate" rather than
+	// "ack" so it's visible as its own outcome, distinct from both a fresh
+	// save and any error/DLQ path above.
+	outcome := "ack"
+	if !created {
+		outcome = "duplicate"
+		slog.InfoContext(ctx, "duplicate message — already persisted, ack without retry", "message_id", d.MessageId, "outcome", "duplicate")
+	}
+	span.SetAttributes(attribute.String("outcome", outcome))
+	c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", outcome)))
 	_ = d.Ack(false)
 }
 

@@ -35,6 +35,12 @@ type Payment struct {
 // injected at the composition root (cmd/consumer-worker/main.go). Save is
 // idempotent: a duplicate SourceMessageID is silently ignored (ON CONFLICT
 // DO NOTHING), so the consumer can safely re-process redelivered messages.
+// created reports whether the row was newly inserted (false means a
+// redelivery of an already-processed message) — the caller (ProcessMessage)
+// surfaces this as a distinct "duplicate" outcome on its trace/metrics
+// instead of conflating it with a fresh "saved", the same way
+// OutboxRepository.Enqueue's created return lets IngestPayment tell
+// "accepted" apart from "duplicate".
 type PaymentRepository interface {
-	Save(ctx context.Context, uow UnitOfWork, p *Payment) error
+	Save(ctx context.Context, uow UnitOfWork, p *Payment) (created bool, err error)
 }

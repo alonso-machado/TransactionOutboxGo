@@ -70,6 +70,7 @@
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "description": "consumer_messages_processed_total{outcome=\"poison_dlq\"} — MAX_DELIVERIES exhausted on a genuine processing error; terminal, never auto-retried again. Non-zero here is an incident — see make replay-dead/drain-dlq.",
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -79,11 +80,26 @@
       ]
     },
     {
+      "id": 7,
+      "title": "Duplicate (redelivery dedup) rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "description": "consumer_messages_processed_total{outcome=\"duplicate\"} — a redelivered message whose (source_message_id, occurred_at) row already existed; absorbed as a no-op and Ack'd immediately, never retried or DLQ'd (see README's Consumer outcome taxonomy). Non-zero is informational, not necessarily an incident — but a sustained climb can mean a consumer is crash-looping before Ack.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (payment_method) (rate(consumer_messages_processed_total{payment_method=~\"$method\", outcome=\"duplicate\"}[1m]))",
+          "legendFormat": "{{payment_method}}"
+        }
+      ]
+    },
+    {
       "id": 5,
       "title": "Queue backlog (ready messages, per method)",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
       "description": "Cross-referenced from the RabbitMQ exporter — queue depth per payments.<method>.queue",
       "targets": [
         {
@@ -98,7 +114,7 @@
       "title": "Consumer instances up per method",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
       "description": "Static 1/method in compose; in cloud this tracks KEDA-driven pod count per Rollout/Deployment (Phase 4 Track 4)",
       "targets": [
         {
