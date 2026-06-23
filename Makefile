@@ -3,7 +3,7 @@ COMPOSE_FILE := docker-compose.yml
 COMPOSE      := podman compose -f $(COMPOSE_FILE)
 GO           := podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine
 
-.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer seed-card lint swag test-unit test-integration coverage observability-up migrate migrate-down replay-dead drain-dlq
+.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer seed-card lint swag test-unit test-integration coverage coverage-all observability-up migrate migrate-down replay-dead drain-dlq
 
 ## ── Docker Compose ────────────────────────────────────────────────────────────
 
@@ -67,10 +67,10 @@ build:
 	$(GO) go build ./...
 
 test:
-	$(GO) go test -race ./...
+	$(GO) sh -c "apk add --no-cache gcc musl-dev >/dev/null && go test -race ./..."
 
 test-unit:
-	$(GO) go test -race -coverprofile=coverage.out ./internal/...
+	$(GO) sh -c "apk add --no-cache gcc musl-dev >/dev/null && go test -race -coverprofile=unit.cov -coverpkg=./internal/... ./internal/..."
 
 # testcontainers-go needs to launch sibling Postgres/RabbitMQ containers from
 # inside this golang:1.26-alpine container — mount the Podman machine's own
@@ -90,12 +90,23 @@ test-integration:
 		-e TESTCONTAINERS_RYUK_DISABLED=true \
 		golang:1.26-alpine sh -c "apk add --no-cache gcc musl-dev >/dev/null && \
 			go test -tags=integration -race -timeout=300s \
-				-coverprofile=coverage.out \
+				-coverprofile=integration.cov \
 				-coverpkg=./internal/... \
 				./tests/integration/..."
 
 coverage:
-	$(GO) sh -c "go tool cover -html=coverage.out -o coverage.html && go tool cover -func=coverage.out | grep total"
+	$(GO) sh -c "go tool cover -html=unit.cov -o unit-coverage.html && go tool cover -func=unit.cov | grep total"
+
+# Merges the unit (test-unit) and integration (test-integration) coverage
+# profiles into one number for the whole internal/ tree — TestContainers
+# carries most of adapter/persistence, infrastructure/database, and
+# infrastructure/rabbitmq, which a unit-only profile can't reach, so reporting
+# either profile alone understates real coverage. gocovmerge is fetched ad hoc
+# via `go run pkg@version`, so it's never added to go.mod.
+coverage-all: test-unit test-integration
+	$(GO) sh -c "go run github.com/wadey/gocovmerge@latest unit.cov integration.cov > merged.cov && \
+		go tool cover -html=merged.cov -o merged-coverage.html && \
+		go tool cover -func=merged.cov | tail -1"
 
 tidy:
 	$(GO) go mod tidy

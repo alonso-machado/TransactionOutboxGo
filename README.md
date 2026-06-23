@@ -202,6 +202,14 @@ flowchart TB
 > GORM-tagged structs live **only** in `adapter/persistence`. Domain entities are
 > plain structs; repositories map between the two so inner layers stay framework-free.
 
+`internal/observability` is a small dependency-free leaf (same idea as
+`internal/domain/pii`): two helpers — `Int64Counter`/`Int64Gauge` — that wrap
+OTel metric-instrument construction and log the (spec-guaranteed-non-fatal)
+creation error once, so `usecase/outbox`, `usecase/consume`,
+`adapter/messaging`, and `adapter/http/ratelimit` don't each repeat the same
+"log the error, then nil-check every call site" boilerplate. Any layer may
+import it, the same way any layer may import `domain/pii`.
+
 ---
 
 ## Components
@@ -221,6 +229,15 @@ flowchart TB
 - **PostgreSQL** — stores `outbox_messages` and `payments`.
 - **RabbitMQ** — durable topic exchange (`payments.exchange`) + quorum queue
   (`payments.queue`) + dead-letter queue (`payments.dlq`).
+- **`outbox-admin`** — a one-shot maintenance CLI, **not** a third
+  long-running service (`DispatchOutbox` stays a goroutine inside
+  `ingestion-api`). Two subcommands, both driven by `make`:
+  `replay-dead --method PIX --limit 100` resets `DEAD_LETTER` outbox rows
+  back to `NEW` so the existing dispatch loop republishes them;
+  `drain-dlq --method PIX` moves messages sitting in `payments.pix.dlq` back
+  onto `payments.pix.queue`. Shares `DATABASE_URL`/`RABBITMQ_URL` with the two
+  services but never binds an HTTP port. See `make replay-dead` /
+  `make drain-dlq` and [`cmd/outbox-admin/main.go`](cmd/outbox-admin/main.go).
 
 ---
 
@@ -382,12 +399,15 @@ TransactionOutboxGo/
 ├── CLAUDE.md                  # guidance for Claude Code in this repo
 ├── cmd/
 │   ├── ingestion-api/         # HTTP server + DispatchOutbox goroutine (composition root)
-│   └── consumer-worker/       # RabbitMQ consumer (composition root)
+│   ├── consumer-worker/       # RabbitMQ consumer (composition root)
+│   └── outbox-admin/          # one-shot maintenance CLI: replay-dead / drain-dlq (not a 3rd service)
 ├── internal/
-│   ├── domain/                # entities (OutboxMessage, Payment) + ports (no framework imports)
+│   ├── domain/                # entities (OutboxMessage, Payment) + ports + SchemaVersion/ParseOptionalUUID/Backoff (no framework imports)
+│   ├── observability/         # tiny OTel metric-instrument helpers shared by usecase + adapter (no framework imports beyond the otel API)
 │   ├── usecase/                # ingest (IngestPayment) / outbox (DispatchOutbox) / consume (ProcessMessage)
 │   ├── adapter/                # http · persistence · messaging
-│   └── infrastructure/         # config · database · rabbitmq
+│   └── infrastructure/         # config · database · rabbitmq · telemetry · logging
+├── tests/integration/          # TestContainers suite (Postgres + RabbitMQ) — see Testing below
 ├── docker-compose.yml
 ├── Dockerfile
 └── Makefile
@@ -490,6 +510,67 @@ Expect `201 Created` with a `paymentId`, `idempotencyKey`, and `status: "accepte
 - **Per-method isolation:** `make seed-card` then check the RabbitMQ UI —
   the message lands only in `payments.cartao_credito.queue`; every other
   method's queue stays at 0.
+
+---
+
+## Testing
+
+Two suites, deliberately split by what they need to run:
+
+| Suite | Command | Needs | What it covers |
+|---|---|---|---|
+| Unit | `make test-unit` | nothing — pure Go | `usecase`/`adapter`/`domain` logic against hand-written fakes/mocks of the `domain` ports (`OutboxRepository`, `Publisher`, `UnitOfWork`, ...) |
+| Integration | `make test-integration` | Podman socket reachable from inside the test container (TestContainers) | The same code wired to **real** Postgres 17/TimescaleDB and RabbitMQ 4.3 containers — migrations, GORM repos, the AMQP publisher/consumer, `LISTEN`/`NOTIFY`, retry backoff, DLQ replay |
+
+Both are plain `go test`, gated behind the `integration` build tag for the
+second suite (`tests/integration/*_test.go` all start with
+`//go:build integration`) — `go build ./...` and `make test-unit` never touch
+them.
+
+### Integration suite (TestContainers)
+
+[`tests/integration/suite_test.go`](tests/integration/suite_test.go) spins up
+**one Postgres + one RabbitMQ container pair for the whole package**
+(`TestMain`), applies the real `migrations/` directory via `golang-migrate`
+(no `AutoMigrate`), and wires the actual `IngestPayment` / `DispatchOutbox` /
+`ProcessMessage` use-cases against them — `truncateAll` resets tables and
+purges every queue between tests instead of restarting containers, so the
+suite stays fast. It needs the Podman socket mounted into the test
+container (`make test-integration` does this for you — see the Makefile
+comment on why Ryuk is disabled for Podman) and runs in CI only when
+explicitly requested (`workflow_dispatch` or a `ci:integration` PR label —
+see [CI/CD](#cicd) below), since it's a safety net, not a release gate.
+
+It exercises things a pure-mock unit test structurally can't: the
+`FOR UPDATE SKIP LOCKED` dispatch query against concurrent dispatchers, the
+`payments.source_message_id` `UNIQUE` constraint actually rejecting a
+redelivered message, a poison message really landing in its method's DLQ
+after `MAX_DELIVERIES`, `ReplayDeadLetters` resetting real rows, the
+`LISTEN`/`NOTIFY` wakeup path (`internal/infrastructure/database.Listener`),
+and the TimescaleDB per-method hypertable dedup key from
+[TimescaleDB](#timescaledb-per-method-hypertables) above.
+
+### Coverage
+
+```bash
+make coverage-all   # runs test-unit + test-integration, merges the two
+                     # profiles (gocovmerge, fetched ad hoc — never added to
+                     # go.mod), prints the combined % and writes
+                     # merged-coverage.html
+```
+
+A unit-only number understates real coverage here on purpose: `adapter/persistence`,
+`infrastructure/database`, and `infrastructure/rabbitmq` are thin wrappers
+over GORM/pgx/amqp091 that are exercised against the **real** dependency in
+the integration suite rather than mocked in a unit test, so `make coverage-all`
+— not `make test-unit` alone — is the number that reflects this project's
+actual line coverage. Merged, `internal/` is at **~84%**, comfortably past
+the project's 80% target for `usecase`/`adapter`; the remaining gaps are
+intentionally-thin infrastructure wiring (`cmd/*/main.go`'s composition
+roots aren't covered by either suite — they're DI glue, asserted indirectly
+by every other test exercising the objects they wire together) and the OTLP
+trace-exporter path in `internal/infrastructure/telemetry` (network-bound,
+not worth a live collector dependency just for this).
 
 ---
 
