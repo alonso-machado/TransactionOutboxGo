@@ -1,0 +1,26 @@
+# One-shot migrate Job — same migrate/migrate image and migrations/ as
+# docker-compose.yml's `migrate` service, just sourced from a ConfigMap
+# since KIND has no host-path mount for this cluster.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: default
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: docker.io/migrate/migrate:latest
+          args:
+            - -path=/migrations
+            - -database
+            - postgres://outbox:outbox@postgres:5432/outbox?sslmode=disable
+            - up
+          volumeMounts:
+            - { name: migrations, mountPath: /migrations }
+      volumes:
+        - name: migrations
+          configMap: { name: migrations }

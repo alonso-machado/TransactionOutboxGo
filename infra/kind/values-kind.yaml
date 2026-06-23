@@ -1,0 +1,36 @@
+# Values override for local KIND load testing only — not part of the chart's
+# normal AWS/compose targets. Postgres/RabbitMQ are plain in-cluster
+# Deployments (infra/kind/postgres-rabbitmq.yaml), not RDS/Amazon MQ, so
+# every endpoint below is qualified to their Service in the "default"
+# namespace (the app's own namespace is "transaction-outbox" — unqualified
+# Service names only resolve within the same namespace).
+image:
+  ingestionApi: localhost/transaction-outbox-go/ingestion-api:kindtest
+  consumerWorker: localhost/transaction-outbox-go/consumer-worker:kindtest
+
+configMap:
+  data:
+    # KEDA's RabbitMQ scaler (templates/consumer-worker/scaledobject.yaml)
+    # reads this via hostFromEnv to query the management API for queue
+    # depth — RabbitMQ's management API always requires auth, and the
+    # chart's own default ("http://rabbitmq:15672") has no credentials
+    # embedded, so the scaler would get a 401 with it as-is. guest/guest is
+    # RabbitMQ's own default account, fine to embed for a throwaway local
+    # in-cluster broker.
+    RABBITMQ_MANAGEMENT_URL: "http://guest:guest@rabbitmq.default.svc.cluster.local:15672"
+    # This chart's own values.yaml has no RATE_LIMIT_ENABLED key at all, so
+    # the app falls back to its Go code's hardcoded default — which is
+    # "true" (only docker-compose's .env explicitly sets it false). A load
+    # test from one k6 source IP looks exactly like the abuse pattern this
+    # limiter exists to stop, and got ~97% of requests 429'd in the first
+    # run. Off here for the same reason it's off in docker-compose.
+    RATE_LIMIT_ENABLED: "false"
+    # Phase 5's outbox-dispatcher-is-the-real-bottleneck finding
+    # (loadtest/README.md's 6.1 results): batch=50/interval=500ms caps
+    # outbox->RabbitMQ publish at ~100 rows/sec regardless of insert rate.
+    # Bumped 4x to raise that ceiling for this run.
+    OUTBOX_DISPATCH_BATCH_SIZE: "200"
+
+secret:
+  databaseUrl: "postgres://outbox:outbox@postgres.default.svc.cluster.local:5432/outbox?sslmode=disable"
+  rabbitmqUrl: "amqp://guest:guest@rabbitmq.default.svc.cluster.local:5672/"
