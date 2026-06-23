@@ -219,15 +219,22 @@ loadtest-autoscale:
 	podman run --rm -i -e TARGET_URL=$(TARGET_URL) -e METHOD=$(METHOD) \
 		-v "$(CURDIR)/loadtest:/lt" -w /lt grafana/k6 run k6-autoscale.js
 
-# Builds the custom k6 binary (xk6-amqp + xk6-sql) that 6.3 needs.
+# Builds the custom k6 binary (xk6-amqp only) that 6.3 needs — xk6-sql is
+# deliberately not included; it only supports k6 v2 while xk6-amqp only
+# supports v1, and the two can't currently coexist in one binary (see
+# build/k6/Dockerfile's comment for the full story).
 k6-ext-build:
 	podman build -t k6-ext -f build/k6/Dockerfile .
 
-# 6.3 — publishes straight onto a per-method queue (bypassing
-# ingestion-api), measures consumer-worker's drain rate + consume->persist
-# latency. SCENARIO=drain (default) or SCENARIO=dedup. Points at a
-# load/test database only — DATABASE_URL must never be production.
+# 6.3 — publishes N messages at a fixed 100 VUs straight onto a per-method
+# queue (bypassing ingestion-api), mixed with DUP_FRACTION/SCHEMA_FRACTION
+# duplicate/bad-schema-version messages by default so one run exercises the
+# consumer's whole outcome taxonomy. Reports k6's own publish throughput;
+# consumer-worker's behavior (ack/duplicate/unknown_schema_version/...) is
+# read from its own /metrics, not from this command — see
+# loadtest/README.md's "Checking consumer behavior". --network host so the
+# default RABBITMQ_URL (localhost:5672) reaches the compose-published port.
 loadtest-consumer:
-	podman run --rm -i -e RABBITMQ_URL=$(RABBITMQ_URL) -e DATABASE_URL=$(DATABASE_URL) \
-		-e METHOD=$(METHOD) -e N=$(N) -e SCENARIO=$(SCENARIO) \
+	podman run --rm -i --network host -e RABBITMQ_URL=$(RABBITMQ_URL) \
+		-e METHOD=$(METHOD) -e N=$(N) -e DUP_FRACTION=$(DUP_FRACTION) -e SCHEMA_FRACTION=$(SCHEMA_FRACTION) \
 		-v "$(CURDIR)/loadtest:/lt" -w /lt k6-ext run k6-consumer.js

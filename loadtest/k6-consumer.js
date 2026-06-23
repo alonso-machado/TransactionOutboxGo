@@ -1,41 +1,47 @@
 // Test 6.3 — consumer-worker in isolation: publishes straight onto a
 // per-method RabbitMQ queue (bypassing ingestion-api/DispatchOutbox
-// entirely) and polls Postgres to measure the consumer's own drain rate and
-// consume->persist latency, DB write included.
+// entirely). k6 itself only does the AMQP publish side and reports its own
+// publish throughput/latency (k6-native metrics) — consumer-worker's own
+// behavior (ack / duplicate / retry_scheduled / poison_dlq /
+// unknown_schema_version) is read from ITS Prometheus /metrics endpoint
+// (consumer_messages_processed_total{outcome=...}), not from k6. Snapshot
+// that endpoint before and after the run and diff the counters — see
+// loadtest/README.md's "Checking consumer behavior" section for the exact
+// commands.
 //
-// Needs the custom k6 binary built from build/k6/Dockerfile (xk6-amqp +
-// xk6-sql). Two scenarios, selected via __ENV.SCENARIO:
-//   drain  (default) — publish N unique messages, measure persisted/sec.
-//   dedup             — publish N messages where a DUP_FRACTION carry
-//                        duplicate MessageId/source_message_id, assert the
-//                        final payments count == distinct keys published.
+// Needs the custom k6 binary from build/k6/Dockerfile (xk6-amqp).
 //
-// Points at a load/test database only — PGDATABASE must not be the prod
-// name (see README.md). The dedup scenario does NOT truncate automatically;
-// truncate the test DB yourself between runs if rerunning the same scenario.
+// Every run is a MIX of three message shapes by default, so a single
+// invocation naturally exercises all of the consumer's outcomes in one
+// pass (mirrors how redeliveries/bad-version messages actually show up in
+// production — mixed in with everything else, not as a separate batch):
+//   - the rest                  — unique, well-formed -> outcome=ack
+//   - DUP_FRACTION (10%)        — reuses a prior iteration's identity
+//                                 (MessageId/eventId) -> outcome=duplicate
+//   - SCHEMA_FRACTION (2%)      — carries an unrecognized schemaVersion,
+//                                 rejected straight to DLQ on the first
+//                                 attempt -> outcome=unknown_schema_version
+// Set either fraction to 0 to exclude that behavior from a run.
 import amqp from "k6/x/amqp";
-import sql from "k6/x/sql";
-import { Trend, Counter } from "k6/metrics";
-
-const persistLatency = new Trend("consume_to_persist_latency", true);
-const persisted = new Counter("messages_persisted");
-const dedupCollisions = new Counter("dedup_collisions");
+import { Counter } from "k6/metrics";
 
 const METHOD = __ENV.METHOD || "PIX";
 const N = Number(__ENV.N || 10000);
-const SCENARIO = __ENV.SCENARIO || "drain"; // "drain" | "dedup"
 const DUP_FRACTION = Number(__ENV.DUP_FRACTION || 0.1);
+const SCHEMA_FRACTION = Number(__ENV.SCHEMA_FRACTION || 0.02);
 const RABBITMQ_URL = __ENV.RABBITMQ_URL || "amqp://guest:guest@localhost:5672/";
-const DATABASE_URL = __ENV.DATABASE_URL || "postgres://outbox:outbox@localhost:5432/outbox?sslmode=disable";
 
-const db = sql.open("postgres", DATABASE_URL);
 amqp.start({ connection_url: RABBITMQ_URL });
+
+const messagesPublished = new Counter("messages_published");
+const duplicatesPublished = new Counter("duplicates_published");
+const badSchemaPublished = new Counter("bad_schema_published");
 
 export const options = {
   scenarios: {
     publish: {
       executor: "shared-iterations",
-      vus: 50,
+      vus: 100,
       iterations: N,
       maxDuration: "30m",
     },
@@ -46,8 +52,9 @@ export const options = {
 // DispatchOutbox's publisher actually puts on the wire) — top-level fields,
 // not nested under "payment" like the HTTP ingest DTO. See
 // tests/integration/consumer_test.go's consumerPayload for the reference.
-function buildOutboxPayload(method, paymentId, eventId) {
+function buildOutboxPayload(method, paymentId, eventId, schemaVersion) {
   return {
+    schemaVersion,
     paymentId,
     eventId,
     providerName: "LOADTEST",
@@ -88,56 +95,39 @@ export default function () {
   const paymentId = uuidv4Like(__ITER);
   let eventId = `evt-loadtest-${seed}`;
   let messageId = `msgid-loadtest-${seed}`;
+  let schemaVersion = "1";
 
-  if (SCENARIO === "dedup" && Math.random() < DUP_FRACTION) {
+  if (DUP_FRACTION > 0 && Math.random() < DUP_FRACTION) {
     // Reuse a previous iteration's identity so the consumer's
-    // ON CONFLICT (source_message_id) DO NOTHING dedup is exercised.
+    // (source_message_id, occurred_at) dedup is exercised -> outcome=duplicate.
     const dupOf = Math.max(0, __ITER - 1);
     eventId = `evt-loadtest-dup-${dupOf}`;
     messageId = `msgid-loadtest-dup-${dupOf}`;
+    duplicatesPublished.add(1);
+  } else if (SCHEMA_FRACTION > 0 && Math.random() < SCHEMA_FRACTION) {
+    // An unrecognized schemaVersion can never succeed on retry, so the
+    // consumer rejects it straight to DLQ on the first attempt ->
+    // outcome=unknown_schema_version.
+    schemaVersion = "999";
+    badSchemaPublished.add(1);
   }
 
-  const body = buildOutboxPayload(METHOD, paymentId, eventId);
-  const publishStart = Date.now();
+  const body = buildOutboxPayload(METHOD, paymentId, eventId, schemaVersion);
   amqp.publish({
     exchange: "payments.exchange",
-    routing_key: `payment.${METHOD.toLowerCase()}`,
+    // xk6-amqp's PublishOptions has no routing_key field — QueueName is
+    // passed straight through as the 2nd ("key") argument to the
+    // underlying amqp091-go Publish(exchange, key, ...) call, so it IS the
+    // routing key whenever Exchange is set (the field name only means
+    // literally "queue name" in the README's default-exchange example).
+    // Using routing_key here (as a first attempt did) is silently ignored
+    // -> empty routing key -> a topic exchange matches no binding -> the
+    // message vanishes with no error and no queue growth.
+    queue_name: `payment.${METHOD.toLowerCase()}`,
     message_id: messageId,
+    content_type: "application/json",
     body: JSON.stringify(body),
     persistent: true,
   });
-  body.__publishStart = publishStart;
-}
-
-export function teardown() {
-  // Poll until the batch is drained (or timeout), then report throughput
-  // and consume->persist latency for a sample of rows.
-  const deadline = Date.now() + 5 * 60 * 1000;
-  let count = 0;
-  while (Date.now() < deadline) {
-    const rows = sql.query(db, "SELECT count(*) AS n FROM payments");
-    count = rows[0] ? Number(rows[0].n) : 0;
-    if (SCENARIO === "dedup") {
-      const expected = Math.ceil(N * (1 - DUP_FRACTION));
-      if (count >= expected) break;
-    } else if (count >= N) {
-      break;
-    }
-  }
-  persisted.add(count);
-
-  if (SCENARIO === "dedup") {
-    const dupCount = N - Math.ceil(N * (1 - DUP_FRACTION));
-    dedupCollisions.add(dupCount);
-  }
-
-  const latencyRows = sql.query(
-    db,
-    "SELECT extract(epoch from (now() - created_at)) AS age_seconds FROM payments ORDER BY created_at DESC LIMIT 1000"
-  );
-  for (const row of latencyRows) {
-    persistLatency.add(Number(row.age_seconds) * 1000);
-  }
-
-  db.close();
+  messagesPublished.add(1);
 }

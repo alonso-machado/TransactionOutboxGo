@@ -62,7 +62,12 @@ services:
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # Postgres 18+ images store data in a pg_ctlcluster-compatible,
+      # major-version-specific subdirectory layout and refuse to start at all
+      # (even against an empty volume) if anything is mounted at the old
+      # single-version path /var/lib/postgresql/data — the single mount point
+      # must be the parent /var/lib/postgresql instead.
+      - postgres_data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-outbox} -d ${POSTGRES_DB:-outbox}"]
       interval: 5s
