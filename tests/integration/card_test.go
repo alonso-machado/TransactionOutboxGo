@@ -103,7 +103,7 @@ func TestCardE2E_FullPath_RoutesIsolatedAndMasksPAN(t *testing.T) {
 	dispatcher, _ := newDispatch(10, 5, 100*time.Millisecond, 24*time.Hour)
 	dispatchCtx, dispatchCancel := context.WithCancel(context.Background())
 	defer dispatchCancel()
-	go dispatcher.Run(dispatchCtx)
+	go dispatcher.Run(dispatchCtx, nil)
 
 	ok := waitFor(t, 10*time.Second, func() bool {
 		return countOutboxByStatus("PUBLISHED") == 1

@@ -115,6 +115,42 @@ func TestConsumer_PoisonMessage_RoutesToDeadLetterQueue(t *testing.T) {
 	require.Equal(t, int64(0), countPayments())
 }
 
+// Phase 5 Track 2.D: a message carrying an unrecognised schemaVersion can
+// never be parsed by this build, so the consumer must reject it straight to
+// the DLQ on the FIRST attempt (not burn through maxDeliveries) and keep
+// running. Exercises AMQPConsumer.handle's ErrUnknownSchemaVersion branch.
+func TestConsumer_UnknownSchemaVersion_RejectsToDLQOnFirstAttempt(t *testing.T) {
+	truncateAll(t)
+
+	msgID := "msgid-unknownschema-1"
+	body, _ := json.Marshal(map[string]any{
+		"schemaVersion":     "999", // unsupported major version
+		"paymentId":         "018f0000-0000-7000-8000-0000000000aa",
+		"eventId":           "evt-unknownschema-1",
+		"providerName":      "MERCADO_PAGO",
+		"providerPaymentId": "prov-unknownschema-1",
+		"amount":            10050,
+		"currency":          "BRL",
+		"method":            "PIX",
+		"occurredAt":        time.Now().UTC().Format(time.RFC3339),
+	})
+
+	publishRaw(t, msgID, body, nil)
+
+	// maxDeliveries high on purpose: an unknown schema must DLQ on attempt 1
+	// regardless, never retrying.
+	consumer := newConsumer("PIX", 10, 5)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go func() { _ = consumer.Run(ctx) }()
+
+	ok := waitFor(t, 9*time.Second, func() bool {
+		return dlqDepth(t) >= 1
+	})
+	require.True(t, ok, "expected unknown-schema message to be dead-lettered on the first attempt")
+	require.Equal(t, int64(0), countPayments())
+}
+
 func dlqDepth(t *testing.T) int {
 	t.Helper()
 	ch, err := suite.amqpConn.Channel()
