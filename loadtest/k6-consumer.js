@@ -1,5 +1,5 @@
-// Test 6.3 — consumer-worker in isolation: publishes straight onto a
-// per-method RabbitMQ queue (bypassing ingestion-api/DispatchOutbox
+// Test 6.3 — consumer-worker in isolation: publishes straight onto one or
+// more per-method RabbitMQ queues (bypassing ingestion-api/DispatchOutbox
 // entirely). k6 itself only does the AMQP publish side and reports its own
 // publish throughput/latency (k6-native metrics) — consumer-worker's own
 // behavior (ack / duplicate / retry_scheduled / poison_dlq /
@@ -10,6 +10,13 @@
 // commands.
 //
 // Needs the custom k6 binary from build/k6/Dockerfile (xk6-amqp).
+//
+// METHODS (__ENV.METHODS) is a comma-separated list, e.g. "PIX,TRANSFER" —
+// iterations round-robin across it, splitting N evenly. Useful for
+// comparing two methods' consumer/DB throughput side by side, e.g. running
+// 2 consumer-worker instances on PIX against 1 on TRANSFER to see whether
+// Postgres/PgBouncer becomes the bottleneck before consumer count does
+// (see loadtest/README.md's 6.3 results for a worked example).
 //
 // Every run is a MIX of three message shapes by default, so a single
 // invocation naturally exercises all of the consumer's outcomes in one
@@ -25,17 +32,25 @@
 import amqp from "k6/x/amqp";
 import { Counter } from "k6/metrics";
 
-const METHOD = __ENV.METHOD || "PIX";
+const METHODS = (__ENV.METHODS || __ENV.METHOD || "PIX")
+  .split(",")
+  .map((m) => m.trim().toUpperCase())
+  .filter(Boolean);
 const N = Number(__ENV.N || 10000);
 const DUP_FRACTION = Number(__ENV.DUP_FRACTION || 0.1);
 const SCHEMA_FRACTION = Number(__ENV.SCHEMA_FRACTION || 0.02);
 const RABBITMQ_URL = __ENV.RABBITMQ_URL || "amqp://guest:guest@localhost:5672/";
 
-amqp.start({ connection_url: RABBITMQ_URL });
-
 const messagesPublished = new Counter("messages_published");
 const duplicatesPublished = new Counter("duplicates_published");
 const badSchemaPublished = new Counter("bad_schema_published");
+// Per-method publish counters (e.g. messages_published_pix,
+// messages_published_transfer) so the k6 summary itself shows the split
+// without having to cross-reference RabbitMQ/Prometheus for it.
+const perMethodPublished = {};
+for (const m of METHODS) {
+  perMethodPublished[m] = new Counter(`messages_published_${m.toLowerCase()}`);
+}
 
 export const options = {
   scenarios: {
@@ -53,7 +68,7 @@ export const options = {
 // not nested under "payment" like the HTTP ingest DTO. See
 // tests/integration/consumer_test.go's consumerPayload for the reference.
 function buildOutboxPayload(method, paymentId, eventId, schemaVersion) {
-  return {
+  const body = {
     schemaVersion,
     paymentId,
     eventId,
@@ -66,6 +81,11 @@ function buildOutboxPayload(method, paymentId, eventId, schemaVersion) {
     methodDetails: methodDetailsFor(method),
     occurredAt: new Date().toISOString(),
   };
+  if (method === "TRANSFER") {
+    body.payerId = "018f7f9e-6e8b-7c3a-8f2a-000000000001";
+    body.recipientId = "018f7f9e-6e8b-7c3a-8f2a-000000000002";
+  }
+  return body;
 }
 
 function methodDetailsFor(method) {
@@ -90,7 +110,22 @@ function uuidv4Like(seed) {
   return `00000000-0000-7000-8000-${h}`;
 }
 
-export default function () {
+// setup() runs once, single-threaded, before any VU starts — calling
+// amqp.start() here (instead of once per VU) avoids a real bug in
+// xk6-amqp: its connection registry is an unsynchronized map, and 100 VUs
+// all calling start() concurrently at VU-init hits a "fatal error:
+// concurrent map writes" that crashes the whole process. Every VU below
+// reuses this one connection via connection_id.
+export function setup() {
+  const connectionId = amqp.start({ connection_url: RABBITMQ_URL });
+  return { connectionId };
+}
+
+export default function (data) {
+  // Round-robin across METHODS — e.g. with "PIX,TRANSFER", even iterations
+  // go to PIX and odd ones to TRANSFER, splitting N evenly between them.
+  const method = METHODS[__ITER % METHODS.length];
+
   const seed = `${__VU}-${__ITER}-${Date.now()}`;
   const paymentId = uuidv4Like(__ITER);
   let eventId = `evt-loadtest-${seed}`;
@@ -98,9 +133,15 @@ export default function () {
   let schemaVersion = "1";
 
   if (DUP_FRACTION > 0 && Math.random() < DUP_FRACTION) {
-    // Reuse a previous iteration's identity so the consumer's
-    // (source_message_id, occurred_at) dedup is exercised -> outcome=duplicate.
-    const dupOf = Math.max(0, __ITER - 1);
+    // Reuse a prior iteration's identity to exercise the consumer's
+    // (source_message_id, occurred_at) dedup -> outcome=duplicate. Must be
+    // an iteration that published the SAME method — each method writes to
+    // its own hypertable (payments_pix vs payments_transfer), so reusing an
+    // identity from a different method's iteration would land in a
+    // different table and never collide, silently skipping the dedup path
+    // instead of exercising it. Stepping back by METHODS.length lands on
+    // the previous iteration that shared this same round-robin slot.
+    const dupOf = Math.max(0, __ITER - METHODS.length);
     eventId = `evt-loadtest-dup-${dupOf}`;
     messageId = `msgid-loadtest-dup-${dupOf}`;
     duplicatesPublished.add(1);
@@ -112,8 +153,9 @@ export default function () {
     badSchemaPublished.add(1);
   }
 
-  const body = buildOutboxPayload(METHOD, paymentId, eventId, schemaVersion);
+  const body = buildOutboxPayload(method, paymentId, eventId, schemaVersion);
   amqp.publish({
+    connection_id: data.connectionId,
     exchange: "payments.exchange",
     // xk6-amqp's PublishOptions has no routing_key field — QueueName is
     // passed straight through as the 2nd ("key") argument to the
@@ -123,11 +165,12 @@ export default function () {
     // Using routing_key here (as a first attempt did) is silently ignored
     // -> empty routing key -> a topic exchange matches no binding -> the
     // message vanishes with no error and no queue growth.
-    queue_name: `payment.${METHOD.toLowerCase()}`,
+    queue_name: `payment.${method.toLowerCase()}`,
     message_id: messageId,
     content_type: "application/json",
     body: JSON.stringify(body),
     persistent: true,
   });
   messagesPublished.add(1);
+  perMethodPublished[method].add(1);
 }

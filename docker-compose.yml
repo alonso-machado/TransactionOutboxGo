@@ -258,6 +258,32 @@ services:
     ports:
       - "9091:9091"
 
+  # A second instance bound to the SAME queue as consumer-pix — RabbitMQ
+  # round-robins payments.pix.queue's deliveries between the two (the
+  # competing-consumers pattern), letting a load test compare 2 consumers'
+  # combined drain rate against consumer-transfer's single instance to see
+  # whether Postgres/PgBouncer becomes the bottleneck before consumer count
+  # does. Not part of the normal topology — only bring this up for that
+  # specific load test (loadtest/README.md's 6.3).
+  #
+  # Named "-extra", not "-2": this is a second, separately-named service,
+  # not a true `--scale consumer-pix=2` replica — consumer-pix's host port
+  # (9091) is fixed (every other consumer-* service follows the same
+  # documented fixed-port convention, see README.md's METRICS_PORT row),
+  # and two replicas of one service can't both bind the same host port.
+  # A name ending in a digit would also collide visually with Compose's own
+  # container suffix (every service gets "-1" appended, scaled or not), so
+  # "consumer-pix-2" would render as the confusing "consumer-pix-2-1".
+  consumer-pix-extra:
+    <<: *consumer-worker-base
+    environment:
+      <<: *consumer-worker-env
+      PAYMENT_QUEUE: "payments.pix.queue"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-consumer-worker}-pix-extra"
+      METRICS_PORT: "9097"
+    ports:
+      - "9097:9097"
+
   consumer-boleto:
     <<: *consumer-worker-base
     environment:

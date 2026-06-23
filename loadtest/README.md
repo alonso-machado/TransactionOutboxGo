@@ -14,7 +14,7 @@ mix them up:
 ```bash
 make loadtest-up
 make loadtest TARGET_URL=http://localhost:8080
-make loadtest-report TARGET_URL=http://localhost:8080   # + summary.json
+make loadtest-report TARGET_URL=http://localhost:8080   # + summary-baseline.json
 ```
 
 Two 5-minute phases at a fixed 100 virtual users: Phase A round-robins all 5
@@ -105,50 +105,103 @@ single invocation exercises all of the consumer's outcomes in one pass:
 
 Set either fraction to `0` (`-e DUP_FRACTION=0`) for a clean-only run.
 
+### Multiple methods at once, multiple consumers per method
+
+`METHODS` (comma-separated, e.g. `PIX,TRANSFER`) replaces `METHOD` to split
+`N` evenly across methods via round-robin — each method still writes to its
+own hypertable (`payments_pix`/`payments_transfer`), so this is also how you
+compare two methods' consumer+DB throughput side by side. Bring up a second
+instance bound to the same queue to test whether adding consumers actually
+scales DB write throughput, or whether Postgres/PgBouncer becomes the
+bottleneck first:
+
+```bash
+make loadtest-up
+podman compose up -d consumer-pix-extra consumer-transfer   # 2nd PIX consumer + the TRANSFER one
+make k6-ext-build
+make loadtest-consumer METHODS=PIX,TRANSFER N=150000 \
+  RABBITMQ_URL=amqp://guest:guest@localhost:5672/
+```
+
+`consumer-pix-extra` (`docker-compose.yml`) is bound to the same
+`payments.pix.queue` as `consumer-pix` — RabbitMQ round-robins deliveries
+between the two (the competing-consumers pattern), so PIX effectively runs
+with 2 consumer instances against TRANSFER's 1. See Results below for what
+that comparison actually showed.
+
 ### Checking consumer behavior
 
 ```bash
-# Snapshot before, then again after the run finishes draining, and diff:
+# Snapshot before (e.g. right after `podman restart` to zero counters),
+# then again after the run finishes draining, and diff. One curl per
+# consumer instance — :9091/:9097 are consumer-pix/consumer-pix-extra,
+# :9093 is consumer-transfer (see docker-compose.yml's METRICS_PORTs).
 curl -s http://localhost:9091/metrics | grep consumer_messages_processed_total
+curl -s http://localhost:9097/metrics | grep consumer_messages_processed_total
+curl -s http://localhost:9093/metrics | grep consumer_messages_processed_total
 curl -s -u guest:guest http://localhost:15672/api/queues/%2F/payments.pix.queue | grep -o '"messages":[0-9]*'
 curl -s -u guest:guest http://localhost:15672/api/queues/%2F/payments.pix.dlq | grep -o '"messages":[0-9]*'
 ```
 
 `consumer_messages_processed_total{outcome=...}` is the per-outcome counter
 (`ack`/`duplicate`/`retry_scheduled`/`poison_dlq`/`unknown_schema_version`);
-the delta across the run should always sum to exactly `N` — no message is
-ever silently lost (see Results below for a worked example).
+summed across every instance bound to a method's queue, the delta should
+always equal that method's published count exactly — no message is ever
+silently lost (see Results below for a worked example). `make
+purge-loadtest-dlq METHOD=PIX` removes only the `providerName="LOADTEST"`
+messages a run leaves in the DLQ afterward, without touching any real
+message — see the main [README.md](../README.md)'s `outbox-admin` section.
 
 ### Results (local compose, 2026-06-23)
 
-`make loadtest-up` subset (`postgres` + `rabbitmq` + `ingestion-api` +
-`consumer-pix` only), `N=50000`, default fractions, 6-vCPU/2GB Podman VM.
+`make loadtest-up` subset plus `consumer-pix-extra` + `consumer-transfer`
+(`postgres` + `rabbitmq` + `ingestion-api` + 2× PIX consumer + 1× TRANSFER
+consumer), `METHODS=PIX,TRANSFER`, `N=150000`, default fractions, 6-vCPU/2GB
+Podman VM. All three consumer instances were restarted immediately before
+this run to zero their `/metrics` counters.
 
-| Metric | Value |
-|---|---|
-| Published | 50,000 in 17.2s (2,899 msg/s) |
-| Flagged duplicate / bad-schema at publish time | 4,967 / 946 |
-| Peak queue backlog observed | 42,432 (consumer couldn't keep up with publish burst) |
-| Backlog fully drained | within ~1 minute of publish finishing |
-| `outcome=ack` (fresh saves) | 48,317 |
-| `outcome=duplicate` | 737 (lower than 4,967 flagged — see below) |
-| `outcome=unknown_schema_version` | 946 |
-| **Reconciliation** | 48,317 + 737 + 946 = **50,000** — exact match, zero message loss |
-| DLQ depth after drain | 946 (exactly the bad-schema count) |
+| Metric | PIX (2 consumers) | TRANSFER (1 consumer) |
+|---|---|---|
+| Published | 75,022 | 74,978 |
+| `outcome=ack` | 73,029 (36,515 + 36,514 — near-perfectly split between the two instances) | 72,966 |
+| `outcome=duplicate` | 661 | 648 |
+| `outcome=unknown_schema_version` | 1,332 | 1,364 |
+| **Reconciliation** | 73,029+661+1,332=**75,022** exact | 72,966+648+1,364=**74,978** exact |
+| DLQ depth after drain | 1,332 (exact match) | 1,364 (exact match) |
+| Backlog fully drained | **~40s** after publish finished | **~100s** after publish finished |
 
-**Why only 737 of the 4,967 flagged "duplicate" publishes actually landed as
-`outcome=duplicate`:** the script flags a message as a duplicate by reusing
-iteration `__ITER-1`'s identity, but with `shared-iterations` spread across
-100 concurrent VUs, iteration order isn't sequential — `__ITER-1` may not
-have been published yet (or may itself have been schema-flagged) by the time
-its "duplicate" pairs with it. This is a property of the publish-side
-simulation under concurrency, not a consumer bug — the reconciliation above
-(every one of the 50,000 published messages is accounted for in exactly one
-outcome bucket) is the thing that actually matters.
+Publish itself: 150,000 messages in 61.2s (2,452 msg/s), split almost
+exactly 50/50 by the round-robin (75,022 / 74,978).
 
-Pin the target method's consumer to 1 pod for a clean per-consumer number;
-an unpinned rerun lets the same backlog drive KEDA 0→N→0, mirroring 6.2
-from the queue side.
+**The actual finding:** 2 consumers drained PIX's backlog roughly **2.5x**
+faster than TRANSFER's 1 consumer drained an equal-sized backlog — at or
+above linear scaling with consumer count. That means Postgres/PgBouncer is
+**not yet the bottleneck** at 2 concurrent consumer connections per method
+on this box; the per-message write path itself scales with consumer count
+here. If you need to find where the DB *does* start to cap throughput, the
+next step is adding more instances (`consumer-pix-3`, ...) until the
+combined drain rate stops scaling linearly with instance count.
+
+(Fewer duplicates land as `outcome=duplicate` than were flagged at publish
+time — the script flags one by reusing a prior iteration's identity, but
+with `shared-iterations` spread across 100 concurrent VUs, that prior
+iteration may not have published yet, or may itself be schema-flagged, by
+the time its pair runs. A property of the publish-side simulation under
+concurrency, not a consumer bug — the reconciliation above is what actually
+matters. The dup-reuse step is `METHODS.length` iterations back, not 1, so a
+duplicate always lands on the same method/table as its pair — otherwise a
+PIX/TRANSFER pair would land in different hypertables and never collide.)
+
+A real, reproducible bug surfaced getting to this result: `xk6-amqp`'s
+connection registry is an unsynchronized map, and every VU calling
+`amqp.start()` concurrently at VU-init could hit a `fatal error: concurrent
+map writes` that crashed the whole process. Fixed in `k6-consumer.js` by
+starting the connection once in `setup()` (runs single-threaded before any
+VU starts) and sharing it via `connection_id`.
+
+Pin the target method's consumer count for a clean, repeatable number; an
+unpinned rerun on Kubernetes lets the same backlog drive KEDA 0→N→0,
+mirroring 6.2 from the queue side.
 
 ## Shared
 

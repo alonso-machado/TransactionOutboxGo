@@ -231,13 +231,19 @@ import it, the same way any layer may import `domain/pii`.
   (`payments.queue`) + dead-letter queue (`payments.dlq`).
 - **`outbox-admin`** — a one-shot maintenance CLI, **not** a third
   long-running service (`DispatchOutbox` stays a goroutine inside
-  `ingestion-api`). Two subcommands, both driven by `make`:
+  `ingestion-api`). Three subcommands, all driven by `make`:
   `replay-dead --method PIX --limit 100` resets `DEAD_LETTER` outbox rows
   back to `NEW` so the existing dispatch loop republishes them;
   `drain-dlq --method PIX` moves messages sitting in `payments.pix.dlq` back
-  onto `payments.pix.queue`. Shares `DATABASE_URL`/`RABBITMQ_URL` with the two
-  services but never binds an HTTP port. See `make replay-dead` /
-  `make drain-dlq` and [`cmd/outbox-admin/main.go`](cmd/outbox-admin/main.go).
+  onto `payments.pix.queue`; `purge-loadtest-dlq --method PIX` scans a DLQ
+  and permanently removes only messages with `providerName="LOADTEST"`
+  (set by every `loadtest/*.js` script), leaving any other message
+  untouched — safe to run against a DLQ with a mix of real and loadtest
+  messages, e.g. after load-testing in a UAT environment. Shares
+  `DATABASE_URL`/`RABBITMQ_URL` with the two services but never binds an
+  HTTP port. See `make replay-dead` / `make drain-dlq` /
+  `make purge-loadtest-dlq` and
+  [`cmd/outbox-admin/main.go`](cmd/outbox-admin/main.go).
 
 ---
 
@@ -436,7 +442,7 @@ TransactionOutboxGo/
 ├── cmd/
 │   ├── ingestion-api/         # HTTP server + DispatchOutbox goroutine (composition root)
 │   ├── consumer-worker/       # RabbitMQ consumer (composition root)
-│   └── outbox-admin/          # one-shot maintenance CLI: replay-dead / drain-dlq (not a 3rd service)
+│   └── outbox-admin/          # one-shot maintenance CLI: replay-dead / drain-dlq / purge-loadtest-dlq (not a 3rd service)
 ├── internal/
 │   ├── domain/                # entities (OutboxMessage, Payment) + ports + SchemaVersion/ParseOptionalUUID/Backoff (no framework imports)
 │   ├── observability/         # tiny OTel metric-instrument helpers shared by usecase + adapter (no framework imports beyond the otel API)

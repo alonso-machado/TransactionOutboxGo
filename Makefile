@@ -3,7 +3,7 @@ COMPOSE_FILE := docker-compose.yml
 COMPOSE      := podman compose -f $(COMPOSE_FILE)
 GO           := podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine
 
-.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer seed-card lint swag test-unit test-integration coverage coverage-all observability-up migrate migrate-down replay-dead drain-dlq
+.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer seed-card lint swag test-unit test-integration coverage coverage-all observability-up migrate migrate-down replay-dead drain-dlq purge-loadtest-dlq
 
 ## ── Docker Compose ────────────────────────────────────────────────────────────
 
@@ -50,6 +50,15 @@ drain-dlq:
 	podman run --rm --network host -v "$(CURDIR):/app" -w /app \
 		-e DATABASE_URL="$(ADMIN_DATABASE_URL)" -e RABBITMQ_URL="$(ADMIN_RABBITMQ_URL)" \
 		golang:1.26-alpine go run ./cmd/outbox-admin drain-dlq --method "$(METHOD)"
+
+# Removes only providerName="LOADTEST" messages from a DLQ (set by every
+# loadtest/*.js script) — any other message is left in place untouched.
+# Safe to run against a DLQ that has a mix of real and loadtest messages,
+# e.g. after load-testing in a UAT environment.
+purge-loadtest-dlq:
+	podman run --rm --network host -v "$(CURDIR):/app" -w /app \
+		-e DATABASE_URL="$(ADMIN_DATABASE_URL)" -e RABBITMQ_URL="$(ADMIN_RABBITMQ_URL)" \
+		golang:1.26-alpine go run ./cmd/outbox-admin purge-loadtest-dlq --method "$(METHOD)"
 
 # Minimal subset for working on dashboards without the full stack: the app
 # services (so there's something to scrape) plus Prometheus/Grafana/the
@@ -207,10 +216,12 @@ loadtest:
 	podman run --rm -i -e TARGET_URL=$(TARGET_URL) -e VUS=$(VUS) -v "$(CURDIR)/loadtest:/lt" -w /lt \
 		grafana/k6 run k6-baseline.js
 
-# Same as `loadtest`, but archives the full default summary to JSON.
+# Same as `loadtest`, but archives the full default summary to JSON —
+# named -baseline so it sits side by side with loadtest-consumer's
+# -consumer one for comparison (6.1 vs 6.3 numbers, run to run).
 loadtest-report:
 	podman run --rm -i -e TARGET_URL=$(TARGET_URL) -e VUS=$(VUS) -v "$(CURDIR)/loadtest:/lt" -w /lt \
-		grafana/k6 run --summary-export=summary.json k6-baseline.js
+		grafana/k6 run --summary-export=summary-baseline.json k6-baseline.js
 
 # 6.2 — floods one method's queue (METHOD=PIX default) to trigger KEDA
 # scale-up, then stops so it scales back to 0. Do NOT pin consumers for this
@@ -226,15 +237,20 @@ loadtest-autoscale:
 k6-ext-build:
 	podman build -t k6-ext -f build/k6/Dockerfile .
 
-# 6.3 — publishes N messages at a fixed 100 VUs straight onto a per-method
-# queue (bypassing ingestion-api), mixed with DUP_FRACTION/SCHEMA_FRACTION
-# duplicate/bad-schema-version messages by default so one run exercises the
-# consumer's whole outcome taxonomy. Reports k6's own publish throughput;
+# 6.3 — publishes N messages at a fixed 100 VUs straight onto one or more
+# per-method queues (bypassing ingestion-api), mixed with
+# DUP_FRACTION/SCHEMA_FRACTION duplicate/bad-schema-version messages by
+# default so one run exercises the consumer's whole outcome taxonomy.
+# METHODS (comma-separated, e.g. PIX,TRANSFER) splits N evenly via
+# round-robin — useful with `podman compose up -d consumer-pix-extra` to
+# compare 2 consumers on one method against 1 on another (see loadtest/README.md's
+# "Multiple methods at once" section). METHOD (singular) still works as a
+# one-method shorthand. Reports k6's own publish throughput;
 # consumer-worker's behavior (ack/duplicate/unknown_schema_version/...) is
 # read from its own /metrics, not from this command — see
 # loadtest/README.md's "Checking consumer behavior". --network host so the
 # default RABBITMQ_URL (localhost:5672) reaches the compose-published port.
 loadtest-consumer:
 	podman run --rm -i --network host -e RABBITMQ_URL=$(RABBITMQ_URL) \
-		-e METHOD=$(METHOD) -e N=$(N) -e DUP_FRACTION=$(DUP_FRACTION) -e SCHEMA_FRACTION=$(SCHEMA_FRACTION) \
-		-v "$(CURDIR)/loadtest:/lt" -w /lt k6-ext run k6-consumer.js
+		-e METHODS=$(METHODS) -e METHOD=$(METHOD) -e N=$(N) -e DUP_FRACTION=$(DUP_FRACTION) -e SCHEMA_FRACTION=$(SCHEMA_FRACTION) \
+		-v "$(CURDIR)/loadtest:/lt" -w /lt k6-ext run --summary-export=summary-consumer.json k6-consumer.js

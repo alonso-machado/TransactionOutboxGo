@@ -45,3 +45,7 @@ coverage.out
 
 # Claude Code agent worktrees (transient, per-session)
 .claude/worktrees/
+
+# k6 load test output (make loadtest-report / loadtest-consumer)
+loadtest/summary-baseline.json
+loadtest/summary-consumer.json
