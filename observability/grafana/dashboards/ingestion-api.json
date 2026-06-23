@@ -116,11 +116,41 @@
       ]
     },
     {
+      "id": 8,
+      "title": "Outbox dead-letter count",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "description": "outbox.dead_letter_count — pairs with the page-severity OutboxDeadLetterPresent alert (observability/prometheus/rules/alerts.yml). Any value > 0 means a message exhausted OUTBOX_MAX_RETRIES and never reached RabbitMQ at all — needs manual replay (make replay-dead) or investigation.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "outbox_dead_letter_count{job=\"ingestion-api\"}",
+          "legendFormat": "dead_letter"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Ingest duplicate (idempotency dedup) rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "description": "ingestion.duplicate_total — POST/PUT/PATCH requests whose derived idempotency key already existed in outbox_messages (a webhook redelivery or client retry), returned as status=\"duplicate\" rather than \"accepted\". Informational, not an incident — a sustained climb can mean an upstream provider/client is retrying more than expected.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (method) (rate(ingestion_duplicate_total{job=\"ingestion-api\"}[1m]))",
+          "legendFormat": "{{method}}"
+        }
+      ]
+    },
+    {
       "id": 7,
       "title": "Go runtime — goroutines / heap / GC pause",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },

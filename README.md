@@ -345,6 +345,12 @@ hypertable (was a single-column `UNIQUE(source_message_id)` on the old plain
 below for why the dedup key gained a column and why redelivery safety still
 holds.
 
+A dedup hit on the ingest side is exported as `ingestion.duplicate_total`
+(by `payment.method`) — visible on the ingestion-api dashboard's "Ingest
+duplicate (idempotency dedup) rate" panel — in addition to the `dedup_hit`
+span attribute on `ingest.payment`. The consumer-side equivalent is the
+`outcome="duplicate"` taxonomy covered next.
+
 ### Consumer outcome taxonomy
 
 A duplicate delivery hitting that `UNIQUE` constraint is **not an error** —

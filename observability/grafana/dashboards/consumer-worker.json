@@ -123,6 +123,21 @@
           "legendFormat": "{{method}}"
         }
       ]
+    },
+    {
+      "id": 8,
+      "title": "Unknown schema version rate (by version)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 },
+      "description": "consumer.unknown_schema_version_total{schema_version=...} — pairs with the ticket-severity UnknownSchemaVersion alert (observability/prometheus/rules/alerts.yml). Unlike the generic outcome=\"unknown_schema_version\" bucket in the top panel, this breaks down by the actual bad schemaVersion value seen — useful for spotting a producer/consumer version skew during a rollout.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (schema_version) (rate(consumer_unknown_schema_version_total[5m]))",
+          "legendFormat": "schemaVersion={{schema_version}}"
+        }
+      ]
     }
   ]
 }

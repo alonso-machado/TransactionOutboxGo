@@ -9,22 +9,30 @@ import (
 	"time"
 
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
+	"github.com/alonsomachado/transaction-outbox-go/internal/observability"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 )
 
 var tracer = otel.Tracer("usecase/ingest")
 
 type IngestPayment struct {
-	outboxRepo domain.OutboxRepository
-	uow        domain.UnitOfWork
+	outboxRepo     domain.OutboxRepository
+	uow            domain.UnitOfWork
+	duplicateTotal metric.Int64Counter
 }
 
 func New(outboxRepo domain.OutboxRepository, uow domain.UnitOfWork) *IngestPayment {
-	return &IngestPayment{outboxRepo: outboxRepo, uow: uow}
+	meter := otel.GetMeterProvider().Meter("usecase/ingest")
+	return &IngestPayment{
+		outboxRepo:     outboxRepo,
+		uow:            uow,
+		duplicateTotal: observability.Int64Counter(meter, "ingestion.duplicate_total"),
+	}
 }
 
 type Request struct {
@@ -148,6 +156,9 @@ func (uc *IngestPayment) Execute(ctx context.Context, req Request) (*Response, e
 		return nil, err
 	}
 	span.SetAttributes(attribute.Bool("dedup_hit", !created))
+	if !created {
+		uc.duplicateTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("method", req.Method)))
+	}
 
 	return &Response{PaymentID: paymentID, IdempotencyKey: key, Created: created}, nil
 }
