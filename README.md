@@ -389,6 +389,63 @@ incapable of reaching the DLQ.
 
 ---
 
+## Message ordering
+
+**This system does not preserve message order, and deliberately doesn't need
+to.** Payments here are **absolute-state records** keyed by
+`(source_message_id, occurred_at)` — each message carries the full payment,
+not a delta like `balance += amount`, so persisting them in any order lands
+the same rows. That's *why* it's safe to scale consumers horizontally (KEDA
+runs 0–N `consumer-<method>` pods on one queue — the competing-consumers
+pattern, which has no ordering guarantee) and why the consumer processes one
+delivery at a time per pod rather than reordering its own input.
+
+The transactional-outbox pattern itself only guarantees **at-least-once
+delivery to the broker** with producer-side atomicity; it never promised
+ordered or exactly-once *consumption*. Consumer correctness rests on the
+idempotent-consumer dedup above (the `(source_message_id, occurred_at)`
+`UNIQUE` constraint), which is order-independent. Reordering across pods/
+retries is therefore a non-issue for this domain.
+
+### If a future requirement *does* need ordering
+
+Say a payment lifecycle is introduced (`AUTHORIZED → CAPTURED → REFUNDED`)
+where applying events out of order corrupts state. The goal is then
+**per-entity ordering** (all events for one payment/payer in sequence) while
+still processing *different* entities in parallel — never global ordering,
+which would mean single-threading everything and forfeiting throughput.
+
+The RabbitMQ-native way to get that, without migrating to Kafka:
+
+1. **Consistent-hash exchange** (the `rabbitmq-consistent-hash-exchange`
+   plugin) keyed on the ordering identity (e.g. `payerId` or `paymentId`)
+   instead of the current topic exchange. The hash routes **all of one
+   entity's messages to the same queue**, while different entities spread
+   across queues — so order is preserved per entity but parallelism is kept
+   across entities.
+2. **Exactly one consumer per queue** — either run a single replica per
+   method queue, or declare the queue with `x-single-active-consumer: true`
+   so only one consumer is ever active (the rest stand by for failover).
+   This keeps each queue's single-threaded, in-order processing (which
+   `AMQPConsumer.Run` already does per pod) as the *only* consumer of that
+   queue, so the broker can't hand message 2 to a second consumer before
+   message 1 is done.
+
+Ordering must hold across **all three hops** — so this also requires the
+dispatcher to poll in order (`FetchPending` ordered by `created_at, id`) and,
+if more than one dispatcher replica runs, to shard its `FOR UPDATE SKIP
+LOCKED` claim by the same ordering key so one entity's rows are always
+claimed by one dispatcher.
+
+A lighter-weight alternative that keeps full parallelism is to make ordering
+**idempotent at the data layer** instead of the transport: guard writes with
+`... WHERE occurred_at < :incoming` (or a monotonic `version`), so a stale
+event physically can't overwrite a newer one and out-of-order delivery
+self-corrects. For absolute-state payments this is already effectively the
+case, which is the deeper reason ordering isn't wired up today.
+
+---
+
 ## TimescaleDB: per-method hypertables
 
 `payments` is now **five TimescaleDB hypertables** — `payments_pix`,

@@ -1,7 +1,7 @@
 -- DispatchOutbox's FetchPending (internal/adapter/persistence/outbox_repo.go)
--- filters status IN ('NEW','RETRYING') and orders by created_at ASC. Neither
--- existing index (idx_outbox_messages_status, the plain status btree; or
--- idx_outbox_messages_next_retry_at, partial on next_retry_at) covers
+-- filters status IN ('NEW','RETRYING') and orders by (created_at ASC, id ASC).
+-- Neither existing index (idx_outbox_messages_status, the plain status btree;
+-- or idx_outbox_messages_next_retry_at, partial on next_retry_at) covers
 -- created_at, so once a large fraction of the table matches that status
 -- filter, the planner reverts to a sequential scan followed by a sort of
 -- every matching row before applying LIMIT — and once that sort no longer
@@ -11,13 +11,23 @@
 -- meaning the poll cycle itself, not the batch/interval config, became the
 -- throughput ceiling.
 --
--- A partial index on created_at, scoped to the same status filter the
--- partial next_retry_at index already uses, lets FetchPending's query become
--- a forward index scan that's already in created_at order — next_retry_at is
--- still checked, just as a cheap filter during the scan instead of a
--- sort key. now() can't appear in a partial index predicate (not
--- IMMUTABLE), so next_retry_at <= now() stays a runtime filter, same as
--- before; only the ORDER BY/sort cost goes away.
+-- A partial index scoped to the same status filter the partial next_retry_at
+-- index already uses lets FetchPending's query become a forward index scan
+-- that's already in (created_at, id) order — next_retry_at is still checked,
+-- just as a cheap filter during the scan instead of a sort key. now() can't
+-- appear in a partial index predicate (not IMMUTABLE), so next_retry_at <=
+-- now() stays a runtime filter, same as before; only the ORDER BY/sort cost
+-- goes away.
+--
+-- id (UUIDv7, time-sortable) is the second column so it covers FetchPending's
+-- created_at tiebreaker: under a burst many rows share a created_at value at
+-- timestamp resolution, and (created_at) alone would leave the planner to add
+-- a sort node to break those ties by id — exactly the sort this index exists
+-- to remove. (created_at, id) is physically in the query's ORDER BY order, so
+-- the scan needs no sort at all. NB: this gives deterministic order only
+-- within a single dispatcher; FOR UPDATE SKIP LOCKED still shards rows across
+-- dispatcher replicas, so there's no global ordering guarantee — see
+-- README.md's "Message ordering".
 CREATE INDEX IF NOT EXISTS idx_outbox_messages_pending_created_at
-    ON outbox_messages (created_at)
+    ON outbox_messages (created_at, id)
     WHERE status IN ('NEW', 'RETRYING');

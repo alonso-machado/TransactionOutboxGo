@@ -60,7 +60,7 @@ func (r *GORMOutboxRepository) FetchPending(ctx context.Context, limit int) ([]*
 		return tx.
 			Where("status IN ?", []string{string(domain.OutboxStatusNew), string(domain.OutboxStatusRetrying)}).
 			Where("next_retry_at IS NULL OR next_retry_at <= ?", time.Now().UTC()).
-			Order("created_at ASC").
+			Order("created_at ASC, id ASC").
 			Limit(limit).
 			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Find(&models).Error
