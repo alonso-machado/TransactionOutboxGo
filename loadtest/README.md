@@ -1,5 +1,85 @@
 # Load tests (Phase 3 Track 6)
 
+## KIND environment setup (for 6.2, and 6.1/6.3 against a real cluster)
+
+6.2 needs a real KEDA `ScaledObject`, which only Kubernetes provides — a
+local [KIND](https://kind.sigs.k8s.io/) cluster is the cheapest way to get
+one without touching AWS/Pulumi. Infra (Postgres/RabbitMQ) lives in the
+`default` namespace; the app (ingestion-api/consumer-worker) is the Helm
+release in its own `transaction-outbox` namespace — same split the chart
+and `infra/kind/*.yaml` assume everywhere else in this repo.
+
+```bash
+# 1. Create the cluster (skip if `kind get clusters` already shows one).
+#    infra/kind/kind-cluster-config.yaml maps host 15673 -> the RabbitMQ
+#    management NodePort set up in step 6 below — recreate the cluster with
+#    this config if you already have one without that port mapping.
+kind create cluster --name kind-cluster --config infra/kind/kind-cluster-config.yaml
+
+# 2. KEDA — the chart's ScaledObject CRDs need the KEDA operator installed
+helm repo add kedacore https://kedacore.github.io/charts
+helm repo update
+helm install keda kedacore/keda --namespace keda --create-namespace
+
+# 3. Infra (Postgres + RabbitMQ) — plain Deployments in "default", not the
+#    chart's normal RDS/Amazon MQ targets (see infra/kind/postgres-rabbitmq.yaml)
+kubectl apply -f infra/kind/postgres-rabbitmq.yaml
+kubectl wait --for=condition=ready pod -l app=postgres --timeout=60s
+kubectl wait --for=condition=ready pod -l app=rabbitmq --timeout=60s
+
+# 4. Migrations — one-shot Job sourced from a ConfigMap (KIND has no
+#    host-path mount for this cluster, unlike compose's volume mount)
+kubectl create configmap migrations --from-file=migrations/
+kubectl apply -f infra/kind/migrate-job.yaml
+kubectl wait --for=condition=complete job/migrate --timeout=60s
+
+# 5. Build the app images and load them straight into KIND's node (no
+#    registry push needed — `:kindtest` matches infra/kind/values-kind.yaml)
+podman build --build-arg SERVICE=ingestion-api  -t localhost/transaction-outbox-go/ingestion-api:kindtest  .
+podman build --build-arg SERVICE=consumer-worker -t localhost/transaction-outbox-go/consumer-worker:kindtest .
+podman save localhost/transaction-outbox-go/ingestion-api:kindtest  -o /tmp/ingestion-api.tar
+podman save localhost/transaction-outbox-go/consumer-worker:kindtest -o /tmp/consumer-worker.tar
+kind load image-archive /tmp/ingestion-api.tar  --name kind-cluster
+kind load image-archive /tmp/consumer-worker.tar --name kind-cluster
+
+# 6. Install the chart with the KIND overrides (KEDA-driven autoscaling,
+#    in-cluster DB/MQ endpoints, rate limiter off, kindLocal.enabled=true
+#    which renders templates/kind-local/rabbitmq-nodeport.yaml — see
+#    infra/kind/values-kind.yaml's comments)
+helm upgrade --install transaction-outbox helmcharts/transaction-outbox \
+  --namespace transaction-outbox --create-namespace \
+  -f infra/kind/values-kind.yaml
+```
+
+Re-run step 5 + `helm upgrade --install ...` (step 6) whenever app code
+changes — `kind load image-archive` replaces the node's cached image, but
+existing pods keep running the old one until rolled, so also run:
+
+```bash
+kubectl rollout restart deployment -n transaction-outbox
+```
+
+### Reaching things from the host
+
+RabbitMQ's management UI/API is reachable straight at `localhost:15673` —
+no `port-forward` needed — once steps 1 and 6 above are both in place:
+`kind-cluster-config.yaml`'s `extraPortMappings` map host 15673 to the
+control-plane node's 30673, and `kindLocal.enabled: true` in
+`values-kind.yaml` makes the chart render a NodePort Service
+(`templates/kind-local/rabbitmq-nodeport.yaml`) publishing RabbitMQ's
+15672 on that same 30673. `loadtest-consumer`'s
+`curl -u guest:guest http://localhost:15672/...` examples below become
+`http://localhost:15673/...` against the KIND cluster's RabbitMQ instead of
+compose's (which keeps the plain 15672).
+
+Nothing else (Postgres, ingestion-api) has a NodePort —
+`kubectl port-forward` covers those if needed, e.g. for 6.1/6.2's
+`TARGET_URL`:
+
+```bash
+kubectl port-forward -n transaction-outbox svc/ingestion-api 8080:8080
+```
+
 Three k6 scripts, run separately with **opposite consumer setups** — don't
 mix them up:
 

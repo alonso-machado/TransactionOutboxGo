@@ -39,7 +39,7 @@ func (f *fakeOutboxRepo) Enqueue(ctx context.Context, uow domain.UnitOfWork, msg
 func (f *fakeOutboxRepo) FetchPending(ctx context.Context, limit int) ([]*domain.OutboxMessage, error) {
 	return nil, nil
 }
-func (f *fakeOutboxRepo) MarkPublished(ctx context.Context, id uuid.UUID, publishedAt time.Time) error {
+func (f *fakeOutboxRepo) MarkPublished(ctx context.Context, ids []uuid.UUID, publishedAt time.Time) error {
 	return nil
 }
 func (f *fakeOutboxRepo) MarkRetrying(ctx context.Context, id uuid.UUID, lastError string) error {

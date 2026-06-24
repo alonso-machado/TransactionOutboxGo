@@ -75,9 +75,12 @@ func (r *GORMOutboxRepository) FetchPending(ctx context.Context, limit int) ([]*
 	return msgs, nil
 }
 
-func (r *GORMOutboxRepository) MarkPublished(ctx context.Context, id uuid.UUID, publishedAt time.Time) error {
+func (r *GORMOutboxRepository) MarkPublished(ctx context.Context, ids []uuid.UUID, publishedAt time.Time) error {
+	if len(ids) == 0 {
+		return nil
+	}
 	return r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
-		Where("id = ?", id).
+		Where("id IN ?", ids).
 		Updates(map[string]any{"status": string(domain.OutboxStatusPublished), "published_at": publishedAt}).Error
 }
 

@@ -477,18 +477,18 @@ each service's env block is actually wired.
 
 ### `ingestion-api` only
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `HTTP_PORT` | `8080` | HTTP listen port |
-| `SWAGGER_ENABLED` | `false` | Serve swagger UI at `/swagger/index.html` (local dev defaults this to `true`; production leaves it `false`) |
-| `OUTBOX_DISPATCH_INTERVAL_MS` | `500` | Poll interval for the `DispatchOutbox` goroutine |
-| `OUTBOX_DISPATCH_BATCH_SIZE` | `50` | Rows fetched per dispatch poll |
-| `OUTBOX_MAX_RETRIES` | `5` | Publish attempts before an outbox row is marked `DEAD_LETTER` |
-| `OUTBOX_PRUNE_AFTER_HOURS` | `48` | Hours after which a `PUBLISHED` row is eligible for pruning |
+| Variable | Default                                      | Meaning |
+|---|----------------------------------------------|---|
+| `HTTP_PORT` | `8080`                                       | HTTP listen port |
+| `SWAGGER_ENABLED` | `false`                                      | Serve swagger UI at `/swagger/index.html` (local dev defaults this to `true`; production leaves it `false`) |
+| `OUTBOX_DISPATCH_INTERVAL_MS` | `250`                                        | Poll interval for the `DispatchOutbox` goroutine |
+| `OUTBOX_DISPATCH_BATCH_SIZE` | `100`                                        | Rows fetched per dispatch poll |
+| `OUTBOX_MAX_RETRIES` | `5`                                          | Publish attempts before an outbox row is marked `DEAD_LETTER` |
+| `OUTBOX_PRUNE_AFTER_HOURS` | `48`                                         | Hours after which a `PUBLISHED` row is eligible for pruning |
 | `RATE_LIMIT_ENABLED` | `false` locally, `true` in cloud Helm values | Leaky-bucket IP rate limiter (see [Edge protection](#edge-protection-rate-limiting--waf) below). Off by default in `docker-compose.yml`/`.env.example` so k6 load tests and seed scripts don't throttle themselves |
-| `RATE_LIMIT_RATE` | `50` | Leak rate, requests/second per client IP |
-| `RATE_LIMIT_BURST` | `100` | Bucket capacity (requests admitted immediately before throttling kicks in) |
-| `TRUSTED_PROXIES` | *(empty)* | Comma-separated CIDRs Gin trusts for `X-Forwarded-For` when resolving `c.ClientIP()`. Empty locally (no proxy in front, uses `RemoteAddr` directly); set to the VPC/private-subnet CIDRs in cloud, where the ALB sits in front and injects XFF |
+| `RATE_LIMIT_RATE` | `50`                                         | Leak rate, requests/second per client IP |
+| `RATE_LIMIT_BURST` | `100`                                        | Bucket capacity (requests admitted immediately before throttling kicks in) |
+| `TRUSTED_PROXIES` | *(empty)*                                    | Comma-separated CIDRs Gin trusts for `X-Forwarded-For` when resolving `c.ClientIP()`. Empty locally (no proxy in front, uses `RemoteAddr` directly); set to the VPC/private-subnet CIDRs in cloud, where the ALB sits in front and injects XFF |
 
 ### `consumer-worker` only
 

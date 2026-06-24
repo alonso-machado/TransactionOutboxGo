@@ -8,6 +8,7 @@ import (
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain/pii"
 	"github.com/alonsomachado/transaction-outbox-go/internal/observability"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -117,7 +118,12 @@ func (d *DispatchOutbox) dispatch(ctx context.Context) {
 		return
 	}
 
-	var publishedCount, retryingCount, deadLetterCount int
+	var retryingCount, deadLetterCount int
+	// Collected, not marked inline — MarkPublished is one UPDATE for the
+	// whole batch (WHERE id IN (...)) instead of one round trip per message,
+	// since a successful publish never needs a per-row reason/backoff like
+	// the retry/dead-letter paths do.
+	published := make([]*domain.OutboxMessage, 0, len(msgs))
 
 	for _, msg := range msgs {
 		if err := d.publisher.Publish(ctx, msg); err != nil {
@@ -136,19 +142,28 @@ func (d *DispatchOutbox) dispatch(ctx context.Context) {
 			}
 			continue
 		}
-		publishedCount++
-		if markErr := d.outboxRepo.MarkPublished(ctx, msg.ID, time.Now().UTC()); markErr != nil {
+		published = append(published, msg)
+	}
+
+	if len(published) > 0 {
+		ids := make([]uuid.UUID, len(published))
+		for i, msg := range published {
+			ids[i] = msg.ID
+		}
+		if markErr := d.outboxRepo.MarkPublished(ctx, ids, time.Now().UTC()); markErr != nil {
 			slog.ErrorContext(ctx, "outbox mark published error", "err", markErr.Error())
 		}
 		// Per-message, not batched, so the counter carries a `method`
 		// dimension — a Grafana panel can show publish rate per method,
 		// feeding capacity planning for the per-method KEDA limits.
-		d.publishedTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("method", msg.PaymentMethod)))
+		for _, msg := range published {
+			d.publishedTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("method", msg.PaymentMethod)))
+		}
 	}
 
 	span.SetAttributes(
 		attribute.Int("batch_size", len(msgs)),
-		attribute.Int("published_count", publishedCount),
+		attribute.Int("published_count", len(published)),
 		attribute.Int("retrying_count", retryingCount),
 		attribute.Int("dead_letter_count", deadLetterCount),
 	)

@@ -22,7 +22,7 @@ func (s *stubRepo) FetchPending(ctx context.Context, limit int) ([]*domain.Outbo
 	s.fetches.Add(1)
 	return nil, nil
 }
-func (s *stubRepo) MarkPublished(ctx context.Context, id uuid.UUID, publishedAt time.Time) error {
+func (s *stubRepo) MarkPublished(ctx context.Context, ids []uuid.UUID, publishedAt time.Time) error {
 	return nil
 }
 func (s *stubRepo) MarkRetrying(ctx context.Context, id uuid.UUID, lastError string) error {

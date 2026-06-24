@@ -26,11 +26,23 @@ configMap:
     # run. Off here for the same reason it's off in docker-compose.
     RATE_LIMIT_ENABLED: "false"
     # Phase 5's outbox-dispatcher-is-the-real-bottleneck finding
-    # (loadtest/README.md's 6.1 results): batch=50/interval=500ms caps
-    # outbox->RabbitMQ publish at ~100 rows/sec regardless of insert rate.
-    # Bumped 4x to raise that ceiling for this run.
+    # (loadtest/README.md's 6.1 results): the default batch/interval caps
+    # outbox->RabbitMQ publish well below what a 100-VU unrestricted hammer
+    # sustains (measured this session). 100ms here (chart/code default is
+    # now 250ms) pushes the dispatch ceiling higher still for this test,
+    # on top of the idx_outbox_messages_pending_created_at index fix
+    # (migrations/000005) that removed FetchPending's disk-sort cost.
     OUTBOX_DISPATCH_BATCH_SIZE: "200"
+    OUTBOX_DISPATCH_INTERVAL_MS: "100"
 
 secret:
   databaseUrl: "postgres://outbox:outbox@postgres.default.svc.cluster.local:5432/outbox?sslmode=disable"
   rabbitmqUrl: "amqp://guest:guest@rabbitmq.default.svc.cluster.local:5672/"
+
+# Exposes RabbitMQ's management UI/API on the host via
+# kind-cluster-config.yaml's hostPort 15673 -> this NodePort mapping — see
+# templates/kind-local/rabbitmq-nodeport.yaml. Off in every other values
+# file (compose already publishes its own on host 15672; the cloud target
+# has no equivalent).
+kindLocal:
+  enabled: true

@@ -46,7 +46,11 @@ type OutboxRepository interface {
 	// FetchPending selects status IN (NEW, RETRYING) AND (next_retry_at IS
 	// NULL OR next_retry_at <= now()), FOR UPDATE SKIP LOCKED.
 	FetchPending(ctx context.Context, limit int) ([]*OutboxMessage, error)
-	MarkPublished(ctx context.Context, id uuid.UUID, publishedAt time.Time) error
+	// MarkPublished marks every row in ids PUBLISHED in a single statement —
+	// the dispatcher calls this once per batch with every successfully
+	// published message's ID, not once per message, so a 100-row batch is
+	// one UPDATE round trip instead of 100.
+	MarkPublished(ctx context.Context, ids []uuid.UUID, publishedAt time.Time) error
 	MarkRetrying(ctx context.Context, id uuid.UUID, lastError string) error
 	MarkDeadLetter(ctx context.Context, id uuid.UUID, lastError string) error
 	DeleteOldPublished(ctx context.Context, olderThan time.Duration) error

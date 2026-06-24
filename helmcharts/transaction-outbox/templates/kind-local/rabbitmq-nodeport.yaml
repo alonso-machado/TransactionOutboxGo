@@ -1,0 +1,25 @@
+{{- if .Values.kindLocal.enabled }}
+# KIND-local only — exposes the management UI/API of the plain RabbitMQ
+# Deployment in infra/kind/postgres-rabbitmq.yaml (namespace "default", not
+# part of this chart) via a fixed NodePort, so it's reachable from the host
+# without kubectl port-forward. See infra/kind/kind-cluster-config.yaml for
+# the hostPort->nodePort mapping and values.yaml's kindLocal comment for why
+# this lives outside .Values.namespace.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-management-nodeport
+  namespace: default
+  labels:
+    app: rabbitmq
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+spec:
+  type: NodePort
+  selector:
+    app: rabbitmq
+  ports:
+    - name: management
+      port: 15672
+      targetPort: 15672
+      nodePort: {{ .Values.kindLocal.rabbitmqManagementNodePort }}
+{{- end }}

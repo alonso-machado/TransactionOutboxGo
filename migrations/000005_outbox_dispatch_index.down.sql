@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_outbox_messages_pending_created_at;
