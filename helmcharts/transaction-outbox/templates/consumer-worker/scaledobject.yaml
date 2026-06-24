@@ -26,6 +26,18 @@ spec:
       behavior:
         scaleUp:
           stabilizationWindowSeconds: {{ $.Values.consumerWorker.keda.scaleUpStabilizationSeconds }}
+          # Without this, the HPA default policy (max of "+4 pods" or
+          # "double") needs two 15s pollingInterval cycles to go from 1
+          # replica to maxReplicaCount=10 (1->5->10) — a 40k-message queue
+          # spike piles up well before that. A single Pods policy sized to
+          # maxReplicaCount lets one reconcile jump straight to max instead
+          # of ramping. periodSeconds matches pollingInterval since that's
+          # how often KEDA actually has a new value to react to anyway —
+          # making the policy's own window shorter wouldn't help.
+          policies:
+            - type: Pods
+              value: {{ $.Values.consumerWorker.keda.maxReplicaCount }}
+              periodSeconds: {{ $.Values.consumerWorker.keda.pollingInterval }}
         scaleDown:
           stabilizationWindowSeconds: {{ $.Values.consumerWorker.keda.scaleDownStabilizationSeconds }}
   triggers:

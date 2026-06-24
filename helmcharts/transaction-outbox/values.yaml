@@ -167,7 +167,13 @@ ingestionApi:
       memory: "256Mi"
   hpa:
     minReplicas: 1
-    maxReplicas: 10
+    # Measured under 200 VUs / ~667 req/s sustained (loadtest/README.md
+    # 6.2): ingestion-api never needed more than 4 replicas before CPU
+    # utilization dropped back under cpuUtilization below. Lowered from 10
+    # to match observed need rather than leaving idle headroom every
+    # environment pays for; raise it again if a higher load level proves
+    # 4 isn't enough.
+    maxReplicas: 4
     cpuUtilization: 70
     memoryUtilization: 80
     # 0 — scale up on the very next HPA sync, no waiting. 30 — hold a scale-up

@@ -32,6 +32,15 @@ spec:
   behavior:
     scaleUp:
       stabilizationWindowSeconds: {{ .Values.ingestionApi.hpa.scaleUpStabilizationSeconds }}
+      # Same reasoning as consumer-worker's ScaledObject — without an
+      # explicit policy, the HPA default (max of "+4 pods" or "double" per
+      # 15s sync) needs multiple cycles to reach maxReplicas from 1. A
+      # single Pods policy sized to maxReplicas lets one sync jump straight
+      # there under a sudden spike instead of ramping.
+      policies:
+        - type: Pods
+          value: {{ .Values.ingestionApi.hpa.maxReplicas }}
+          periodSeconds: 15
     scaleDown:
       stabilizationWindowSeconds: {{ .Values.ingestionApi.hpa.scaleDownStabilizationSeconds }}
 {{- end }}

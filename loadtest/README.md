@@ -35,6 +35,12 @@ curl -sL -o /tmp/metrics-server.yaml \
   https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 sed -i 's/namespace: kube-system/namespace: default/g' /tmp/metrics-server.yaml
 sed -i '/--kubelet-use-node-status-port/a\        - --kubelet-insecure-tls' /tmp/metrics-server.yaml
+# The auth-reader RoleBinding must stay in kube-system — it binds to the
+# "extension-apiserver-authentication-reader" Role, which only exists
+# there (RoleBindings can't reference a Role outside their own namespace).
+# Its ServiceAccount *subject* staying "default" is fine — that's a
+# cross-namespace reference, which RoleBindings do support.
+sed -i '/name: metrics-server-auth-reader/{n;s/namespace: default/namespace: kube-system/}' /tmp/metrics-server.yaml
 kubectl apply -f /tmp/metrics-server.yaml
 kubectl wait --for=condition=available deployment/metrics-server -n default --timeout=60s
 

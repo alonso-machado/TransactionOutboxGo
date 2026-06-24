@@ -58,9 +58,18 @@ spec:
             - { name: RABBITMQ_DEFAULT_USER, value: "guest" }
             - { name: RABBITMQ_DEFAULT_PASS, value: "guest" }
           readinessProbe:
+            # timeoutSeconds defaults to 1s, which is `rabbitmq-diagnostics
+            # ping`'s own Erlang-distribution round trip, not just a TCP
+            # check — under load-test throughput (this pod pegged at 700m+
+            # CPU, unconstrained/no limit) that round trip routinely takes
+            # >1s even though the broker is actively serving every AMQP
+            # connection fine. The default 1s timeout turned that slowness
+            # into ~200 spurious Readiness flaps over one test run, with no
+            # real outage behind any of them.
             exec: { command: ["rabbitmq-diagnostics", "ping"] }
             initialDelaySeconds: 10
             periodSeconds: 5
+            timeoutSeconds: 10
 ---
 apiVersion: v1
 kind: Service

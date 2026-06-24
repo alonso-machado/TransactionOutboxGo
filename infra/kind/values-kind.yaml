@@ -40,7 +40,10 @@ secret:
   rabbitmqUrl: "amqp://guest:guest@rabbitmq.default.svc.cluster.local:5672/"
 
 ingestionApi:
-  replicas: 3
+  # No `replicas:` override anymore — the HPA below owns that field
+  # exclusively (templates/ingestion-api/deployment.yaml no longer
+  # templates it, see that file's comment) and a value here would just be
+  # silently ignored.
   resources:
     requests:
       cpu: "250m"

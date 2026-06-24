@@ -11,7 +11,13 @@ metadata:
     app: ingestion-api
     {{- include "transaction-outbox.labels" . | nindent 4 }}
 spec:
-  replicas: {{ .Values.ingestionApi.replicas }}
+  # No replicas field — the HPA (hpa.yaml, same canary.enabled condition as
+  # this Deployment) owns it exclusively from here on. Templating a value
+  # here makes every `helm upgrade` fight the HPA/KEDA controller for
+  # ownership of .spec.replicas via server-side apply ("conflict ... using
+  # apps/v1: .spec.replicas"), since whichever one wrote it last is the
+  # field manager. Omitting it lets Kubernetes default to 1 replica only on
+  # first creation; the HPA reconciles it immediately after.
   selector:
     matchLabels:
       app: ingestion-api

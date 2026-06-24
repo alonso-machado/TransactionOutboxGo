@@ -14,9 +14,13 @@ metadata:
     app: consumer-{{ .name }}
     {{- include "transaction-outbox.labels" $ | nindent 4 }}
 spec:
-  # Managed by this method's KEDA ScaledObject (scaledobject.yaml) — starts
-  # at 0 and scales on that method's RabbitMQ queue depth.
-  replicas: 0
+  # No replicas field — this method's KEDA ScaledObject (scaledobject.yaml)
+  # owns it exclusively via the keda-hpa-* HPA it generates. Templating 0
+  # here makes every `helm upgrade` fight that HPA for ownership of
+  # .spec.replicas via server-side apply ("conflict ... using apps/v1:
+  # .spec.replicas") once KEDA has scaled it away from 0. Omitting it lets
+  # Kubernetes default to 1 replica only on first creation, before the
+  # ScaledObject exists to reconcile it down to minReplicaCount (0).
   selector:
     matchLabels:
       app: consumer-{{ .name }}
