@@ -170,6 +170,11 @@ ingestionApi:
     maxReplicas: 10
     cpuUtilization: 70
     memoryUtilization: 80
+    # 0 — scale up on the very next HPA sync, no waiting. 30 — hold a scale-up
+    # for at least this long before scaling back down, so a load spike that
+    # drains in a few seconds doesn't immediately give the replica back.
+    scaleUpStabilizationSeconds: 0
+    scaleDownStabilizationSeconds: 30
 
 consumerWorker:
   # Empty by default — the cloud target (infra/pulumi/workloads.go)
@@ -187,8 +192,13 @@ consumerWorker:
     minReplicaCount: 0 # scale to zero when idle
     maxReplicaCount: 10
     pollingInterval: 15 # seconds between queue checks
-    cooldownPeriod: 60 # seconds to wait before scaling down
+    cooldownPeriod: 60 # seconds to wait before scaling to zero (idle path only)
     queueLengthValue: "1000" # 1 replica per 1000 messages
+    # Same intent as ingestionApi.hpa's pair above, applied to the HPA KEDA
+    # generates — see scaledobject.yaml's comment on why cooldownPeriod
+    # alone doesn't cover every scale-down step.
+    scaleUpStabilizationSeconds: 0
+    scaleDownStabilizationSeconds: 30
 
 # One Deployment + one KEDA ScaledObject is rendered per entry (see
 # templates/consumer-worker/). Adding a 6th payment method is a one-line
@@ -223,3 +233,4 @@ paymentMethods:
 kindLocal:
   enabled: false
   rabbitmqManagementNodePort: 30673
+  ingestionApiNodePort: 30080

@@ -22,7 +22,7 @@ import { buildBody } from "./payloads.js";
 
 const METHOD = __ENV.METHOD || "PIX";
 const BASE = __ENV.TARGET_URL || "http://localhost:8080";
-const VUS = Number(__ENV.VUS || 100);
+const VUS = Number(__ENV.VUS || 200);
 const DURATION = __ENV.DURATION || "8m";
 
 export const options = {

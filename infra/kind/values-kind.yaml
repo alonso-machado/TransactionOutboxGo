@@ -39,6 +39,16 @@ secret:
   databaseUrl: "postgres://outbox:outbox@postgres.default.svc.cluster.local:5432/outbox?sslmode=disable"
   rabbitmqUrl: "amqp://guest:guest@rabbitmq.default.svc.cluster.local:5672/"
 
+ingestionApi:
+  replicas: 3
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "128Mi"
+    limits:
+      cpu: "1000m"
+      memory: "256Mi"
+
 # Exposes RabbitMQ's management UI/API on the host via
 # kind-cluster-config.yaml's hostPort 15673 -> this NodePort mapping — see
 # templates/kind-local/rabbitmq-nodeport.yaml. Off in every other values

@@ -40,6 +40,9 @@ func (s *stubRepo) CountDeadLetter(ctx context.Context) (int64, error) { return 
 type stubPublisher struct{}
 
 func (stubPublisher) Publish(ctx context.Context, msg *domain.OutboxMessage) error { return nil }
+func (stubPublisher) PublishBatch(ctx context.Context, msgs []*domain.OutboxMessage) []error {
+	return make([]error, len(msgs))
+}
 
 // A NOTIFY trigger must cause a dispatch shortly after (via the debounce
 // timer), independently of the much longer poll interval.

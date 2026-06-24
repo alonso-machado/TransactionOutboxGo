@@ -1,15 +1,20 @@
-# KIND cluster config for local load testing (loadtest/README.md). Maps the
-# host's 15673 to the control-plane node's 30673, which
-# templates/kind-local/rabbitmq-nodeport.yaml (gated by values.yaml's
-# kindLocal.enabled, set true in infra/kind/values-kind.yaml) publishes
-# RabbitMQ's management UI/API on as a NodePort. 15673, not 15672, so this
-# doesn't clash with docker-compose.yml's own host-published RabbitMQ
-# management port — both stacks can run side by side.
+# KIND cluster config for local load testing (loadtest/README.md). Maps
+# host ports to NodePorts that kindLocal.enabled (infra/kind/values-kind.yaml)
+# makes the chart render as fixed NodePort Services — both avoid the
+# equivalent docker-compose.yml host ports (15672/8080) so the two stacks
+# can run side by side.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
     extraPortMappings:
+      # RabbitMQ management UI/API — templates/kind-local/rabbitmq-nodeport.yaml
       - containerPort: 30673
         hostPort: 15673
+        protocol: TCP
+      # ingestion-api — templates/ingestion-api/service.yaml (NodePort when
+      # kindLocal.enabled). k6 on the Windows host (loadtest/*.js) targets
+      # this directly: TARGET_URL=http://localhost:8081
+      - containerPort: 30080
+        hostPort: 8081
         protocol: TCP

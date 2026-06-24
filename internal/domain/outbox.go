@@ -79,4 +79,10 @@ type DLQReplayer interface {
 
 type Publisher interface {
 	Publish(ctx context.Context, msg *OutboxMessage) error
+	// PublishBatch publishes every msg, returning one error per msg (nil on
+	// success) in the same order — pipelined: implementations should fire
+	// all publishes before waiting on any broker confirm, instead of
+	// round-tripping per message, so a batch's total latency is closer to
+	// one round trip than len(msgs) of them.
+	PublishBatch(ctx context.Context, msgs []*OutboxMessage) []error
 }

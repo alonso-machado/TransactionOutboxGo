@@ -21,19 +21,36 @@ helm repo add kedacore https://kedacore.github.io/charts
 helm repo update
 helm install keda kedacore/keda --namespace keda --create-namespace
 
-# 3. Infra (Postgres + RabbitMQ) — plain Deployments in "default", not the
+# 3. metrics-server — ingestionApi.hpa (templates/ingestion-api/hpa.yaml)
+#    targets CPU/memory utilization, which is a no-op without this: `kubectl
+#    top` and the HPA's metrics both come from here, and KIND doesn't ship
+#    it by default. --kubelet-insecure-tls is required because KIND's
+#    kubelet serving certs aren't signed for metrics-server's normal
+#    verification path — fine for a local throwaway cluster, never do this
+#    on a real one. Same pattern as KEDA above: cluster-level infra,
+#    installed once, NOT part of the transaction-outbox chart, namespaced
+#    to "default" here (its upstream manifest defaults to kube-system) to
+#    match this repo's KIND-infra convention.
+curl -sL -o /tmp/metrics-server.yaml \
+  https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+sed -i 's/namespace: kube-system/namespace: default/g' /tmp/metrics-server.yaml
+sed -i '/--kubelet-use-node-status-port/a\        - --kubelet-insecure-tls' /tmp/metrics-server.yaml
+kubectl apply -f /tmp/metrics-server.yaml
+kubectl wait --for=condition=available deployment/metrics-server -n default --timeout=60s
+
+# 4. Infra (Postgres + RabbitMQ) — plain Deployments in "default", not the
 #    chart's normal RDS/Amazon MQ targets (see infra/kind/postgres-rabbitmq.yaml)
 kubectl apply -f infra/kind/postgres-rabbitmq.yaml
 kubectl wait --for=condition=ready pod -l app=postgres --timeout=60s
 kubectl wait --for=condition=ready pod -l app=rabbitmq --timeout=60s
 
-# 4. Migrations — one-shot Job sourced from a ConfigMap (KIND has no
+# 5. Migrations — one-shot Job sourced from a ConfigMap (KIND has no
 #    host-path mount for this cluster, unlike compose's volume mount)
 kubectl create configmap migrations --from-file=migrations/
 kubectl apply -f infra/kind/migrate-job.yaml
 kubectl wait --for=condition=complete job/migrate --timeout=60s
 
-# 5. Build the app images and load them straight into KIND's node (no
+# 6. Build the app images and load them straight into KIND's node (no
 #    registry push needed — `:kindtest` matches infra/kind/values-kind.yaml)
 podman build --build-arg SERVICE=ingestion-api  -t localhost/transaction-outbox-go/ingestion-api:kindtest  .
 podman build --build-arg SERVICE=consumer-worker -t localhost/transaction-outbox-go/consumer-worker:kindtest .
@@ -42,7 +59,7 @@ podman save localhost/transaction-outbox-go/consumer-worker:kindtest -o /tmp/con
 kind load image-archive /tmp/ingestion-api.tar  --name kind-cluster
 kind load image-archive /tmp/consumer-worker.tar --name kind-cluster
 
-# 6. Install the chart with the KIND overrides (KEDA-driven autoscaling,
+# 7. Install the chart with the KIND overrides (KEDA-driven autoscaling,
 #    in-cluster DB/MQ endpoints, rate limiter off, kindLocal.enabled=true
 #    which renders templates/kind-local/rabbitmq-nodeport.yaml — see
 #    infra/kind/values-kind.yaml's comments)
@@ -51,7 +68,7 @@ helm upgrade --install transaction-outbox helmcharts/transaction-outbox \
   -f infra/kind/values-kind.yaml
 ```
 
-Re-run step 5 + `helm upgrade --install ...` (step 6) whenever app code
+Re-run step 6 + `helm upgrade --install ...` (step 7) whenever app code
 changes — `kind load image-archive` replaces the node's cached image, but
 existing pods keep running the old one until rolled, so also run:
 
@@ -72,13 +89,23 @@ control-plane node's 30673, and `kindLocal.enabled: true` in
 `http://localhost:15673/...` against the KIND cluster's RabbitMQ instead of
 compose's (which keeps the plain 15672).
 
-Nothing else (Postgres, ingestion-api) has a NodePort —
-`kubectl port-forward` covers those if needed, e.g. for 6.1/6.2's
-`TARGET_URL`:
+`ingestion-api` gets the same treatment for 6.1/6.2's `TARGET_URL` — `k6`
+runs on the Windows host, so a fixed NodePort beats keeping a
+`kubectl port-forward` alive in another terminal for the whole test run.
+`kindLocal.enabled: true` forces `templates/ingestion-api/service.yaml` to
+`type: NodePort` on a fixed `nodePort` (`kindLocal.ingestionApiNodePort`,
+default `30080`), and `kind-cluster-config.yaml` maps that to host `8081`
+(not `8080`, so it doesn't clash with compose's own host-published
+ingestion-api):
 
 ```bash
-kubectl port-forward -n transaction-outbox svc/ingestion-api 8080:8080
+make loadtest-autoscale METHOD=PIX TARGET_URL=http://localhost:8081
 ```
+
+Only Postgres has no host-reachable port — nothing in this load-test suite
+needs to reach it directly; `kubectl port-forward -n default svc/postgres
+5432:5432` works the same way as RabbitMQ's did before it got a NodePort, if
+you ever need to.
 
 Three k6 scripts, run separately with **opposite consumer setups** — don't
 mix them up:

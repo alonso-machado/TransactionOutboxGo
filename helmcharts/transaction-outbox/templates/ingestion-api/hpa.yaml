@@ -29,4 +29,9 @@ spec:
         target:
           type: Utilization
           averageUtilization: {{ .Values.ingestionApi.hpa.memoryUtilization }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: {{ .Values.ingestionApi.hpa.scaleUpStabilizationSeconds }}
+    scaleDown:
+      stabilizationWindowSeconds: {{ .Values.ingestionApi.hpa.scaleDownStabilizationSeconds }}
 {{- end }}

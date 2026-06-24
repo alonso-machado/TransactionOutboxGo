@@ -3,6 +3,7 @@ package outbox
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
@@ -17,6 +18,12 @@ import (
 
 var tracer = otel.Tracer("usecase/outbox")
 
+// metricsInterval is how often the TRUE-backlog gauges (recordBacklogMetrics)
+// refresh — deliberately much coarser than the dispatch poll interval, since
+// they're two full-table COUNT(*) scans and Grafana doesn't need them
+// faster than this to be useful.
+const metricsInterval = 5 * time.Second
+
 type DispatchOutbox struct {
 	outboxRepo      domain.OutboxRepository
 	publisher       domain.Publisher
@@ -27,6 +34,7 @@ type DispatchOutbox struct {
 	publishedTotal  metric.Int64Counter
 	pendingCount    metric.Int64Gauge
 	deadLetterCount metric.Int64Gauge
+	metricsInFlight atomic.Bool
 }
 
 func New(
@@ -71,8 +79,10 @@ const notifyDebounce = 50 * time.Millisecond
 func (d *DispatchOutbox) Run(ctx context.Context, trigger <-chan struct{}) {
 	ticker := time.NewTicker(d.interval)
 	pruneTicker := time.NewTicker(1 * time.Hour)
+	metricsTicker := time.NewTicker(metricsInterval)
 	defer ticker.Stop()
 	defer pruneTicker.Stop()
+	defer metricsTicker.Stop()
 
 	// debounce is non-nil only while a trigger signal is pending, so the
 	// select below only fires it once per debounce window even under a
@@ -93,6 +103,10 @@ func (d *DispatchOutbox) Run(ctx context.Context, trigger <-chan struct{}) {
 			if err := d.outboxRepo.DeleteOldPublished(ctx, d.pruneAfter); err != nil {
 				slog.ErrorContext(ctx, "outbox prune error", "err", err.Error())
 			}
+		case <-metricsTicker.C:
+			// Own goroutine: a slow COUNT(*) under a big backlog must not
+			// block this select loop's next tick/trigger/prune case.
+			go d.recordBacklogMetrics(ctx)
 		case <-trigger:
 			if debounce == nil {
 				debounce = time.NewTimer(notifyDebounce)
@@ -125,8 +139,13 @@ func (d *DispatchOutbox) dispatch(ctx context.Context) {
 	// the retry/dead-letter paths do.
 	published := make([]*domain.OutboxMessage, 0, len(msgs))
 
-	for _, msg := range msgs {
-		if err := d.publisher.Publish(ctx, msg); err != nil {
+	// One pipelined call for the whole batch instead of one Publish() per
+	// message — PublishBatch fires every message before awaiting any
+	// confirm, so this batch's wall time is ~1 round trip instead of
+	// len(msgs) of them. See AMQPPublisher.PublishBatch's comment.
+	errs := d.publisher.PublishBatch(ctx, msgs)
+	for i, msg := range msgs {
+		if err := errs[i]; err != nil {
 			reason := pii.Redact(err.Error())
 			slog.ErrorContext(ctx, "outbox publish error", "idempotency_key", msg.IdempotencyKey, "err", reason)
 			if msg.RetryCount+1 >= d.maxRetries {
@@ -167,8 +186,23 @@ func (d *DispatchOutbox) dispatch(ctx context.Context) {
 		attribute.Int("retrying_count", retryingCount),
 		attribute.Int("dead_letter_count", deadLetterCount),
 	)
-	// Record the TRUE backlog (Phase 5 Track 2.B) — len(msgs) is capped at
-	// batchSize, so a 10,000-row backlog would otherwise read as a flat 50.
+}
+
+// recordBacklogMetrics updates the TRUE-backlog gauges (Phase 5 Track 2.B —
+// FetchPending's len(msgs) is capped at batchSize, so a 10,000-row backlog
+// would otherwise read as a flat 50). Deliberately NOT called from dispatch():
+// these are two full-table COUNT(*) scans, and as the backlog grows they get
+// slower — calling them inline on every tick made dispatch() itself the thing
+// that was slow, throttling publishing in exact proportion to how far behind
+// it already was. metricsInterval decouples them onto their own cadence, and
+// inFlight skips a tick rather than piling up concurrent scans if a previous
+// one is still running past the interval.
+func (d *DispatchOutbox) recordBacklogMetrics(ctx context.Context) {
+	if !d.metricsInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	defer d.metricsInFlight.Store(false)
+
 	if count, err := d.outboxRepo.CountPending(ctx); err != nil {
 		slog.ErrorContext(ctx, "outbox count pending error", "err", err.Error())
 	} else {

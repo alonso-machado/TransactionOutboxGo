@@ -20,7 +20,14 @@ spec:
   minReplicaCount: {{ $.Values.consumerWorker.keda.minReplicaCount }} # scale to zero when idle
   maxReplicaCount: {{ $.Values.consumerWorker.keda.maxReplicaCount }}
   pollingInterval: {{ $.Values.consumerWorker.keda.pollingInterval }} # seconds between queue checks
-  cooldownPeriod: {{ $.Values.consumerWorker.keda.cooldownPeriod }} # seconds to wait before scaling down
+  cooldownPeriod: {{ $.Values.consumerWorker.keda.cooldownPeriod }} # seconds to wait before scaling to zero
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: {{ $.Values.consumerWorker.keda.scaleUpStabilizationSeconds }}
+        scaleDown:
+          stabilizationWindowSeconds: {{ $.Values.consumerWorker.keda.scaleDownStabilizationSeconds }}
   triggers:
     - type: rabbitmq
       metadata:
