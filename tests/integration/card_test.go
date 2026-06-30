@@ -130,7 +130,7 @@ func TestCardE2E_FullPath_RoutesIsolatedAndMasksPAN(t *testing.T) {
 	require.True(t, ok, "expected payment to be persisted")
 
 	var payment persistence.PaymentModel
-	require.NoError(t, suite.db.First(&payment).Error)
+	require.NoError(t, suite.paymentsDB.First(&payment).Error)
 	require.Equal(t, "CARTAO_CREDITO", payment.Method)
 	require.Contains(t, string(payment.MethodDetails), "************1111")
 	require.NotContains(t, string(payment.MethodDetails), "4111111111111111")

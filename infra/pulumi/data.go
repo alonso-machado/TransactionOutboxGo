@@ -14,9 +14,18 @@ import (
 )
 
 const (
-	dbName      = "outbox"
-	dbUsername  = "outbox"
-	rmqUsername = "outbox"
+	dbName = "outbox"
+	// Two-DB split: the same RDS instance hosts a second logical database for
+	// the consumer side's payments_* hypertables. RDS only auto-creates the
+	// single DbName (`outbox`) on the instance; `payments` must be created
+	// out-of-band against the instance (a one-time `CREATE DATABASE payments`,
+	// the cloud analogue of observability/postgres/init-payments.sql), the
+	// same way the schema migrations themselves are applied out-of-band — RDS
+	// is private (PubliclyAccessible=false) so neither is driven from this
+	// stack. See README.md's cloud deploy notes.
+	paymentsDBName = "payments"
+	dbUsername     = "outbox"
+	rmqUsername    = "outbox"
 )
 
 // dataStack is RDS Postgres + Amazon MQ for RabbitMQ + the Secrets Manager
@@ -28,12 +37,14 @@ const (
 // exact Secrets Manager entry names ESO's ExternalSecret.spec.dataFrom
 // references.
 type dataStack struct {
-	dbEndpoint         pulumi.StringOutput
-	rabbitmqEndpoint   pulumi.StringOutput
-	databaseURL        pulumi.StringOutput
-	rabbitmqURL        pulumi.StringOutput
-	dbSecretName       string
-	rabbitmqSecretName string
+	dbEndpoint           pulumi.StringOutput
+	rabbitmqEndpoint     pulumi.StringOutput
+	databaseURL          pulumi.StringOutput
+	paymentsDatabaseURL  pulumi.StringOutput
+	rabbitmqURL          pulumi.StringOutput
+	dbSecretName         string
+	paymentsDBSecretName string
+	rabbitmqSecretName   string
 }
 
 // newData provisions RDS PostgreSQL 18 and Amazon MQ for RabbitMQ, both
@@ -177,6 +188,9 @@ func newData(ctx *pulumi.Context, cfg *stackConfig, net *network, cluster *clust
 
 	dbEndpoint := db.Address
 	databaseURL := pulumi.Sprintf("postgres://%s:%s@%s/%s?sslmode=require", dbUsername, cfg.dbPassword, dbEndpoint, dbName)
+	// Same instance/credentials, different logical database — consumer-worker's
+	// payments_* hypertables (the two-DB split).
+	paymentsDatabaseURL := pulumi.Sprintf("postgres://%s:%s@%s/%s?sslmode=require", dbUsername, cfg.dbPassword, dbEndpoint, paymentsDBName)
 
 	// SINGLE_INSTANCE mode exposes exactly one AMQP endpoint. The management
 	// HTTPS endpoint KEDA's rabbitmq trigger needs is broker.Instances[0]'s
@@ -204,6 +218,24 @@ func newData(ctx *pulumi.Context, cfg *stackConfig, net *network, cluster *clust
 		return nil, fmt.Errorf("create db secret version: %w", err)
 	}
 
+	// Second Secrets Manager entry for the payments DB URL — ESO's
+	// ExternalSecret (externalsecret.yaml) syncs it into the cluster's
+	// PAYMENTS_DATABASE_URL key, which consumer-worker maps its DATABASE_URL
+	// env from. Mirrors the outbox db-url secret above.
+	paymentsDBSecretName := fmt.Sprintf("transaction-outbox/%s/payments-database-url", cfg.environment)
+	paymentsDBSecret, err := secretsmanager.NewSecret(ctx, "transaction-outbox-payments-db-url", &secretsmanager.SecretArgs{
+		Name: pulumi.String(paymentsDBSecretName),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create payments db secret: %w", err)
+	}
+	if _, err := secretsmanager.NewSecretVersion(ctx, "transaction-outbox-payments-db-url", &secretsmanager.SecretVersionArgs{
+		SecretId:     paymentsDBSecret.ID(),
+		SecretString: paymentsDatabaseURL,
+	}); err != nil {
+		return nil, fmt.Errorf("create payments db secret version: %w", err)
+	}
+
 	rabbitmqSecretName := fmt.Sprintf("transaction-outbox/%s/rabbitmq-url", cfg.environment)
 	rmqSecret, err := secretsmanager.NewSecret(ctx, "transaction-outbox-rabbitmq-url", &secretsmanager.SecretArgs{
 		Name: pulumi.String(rabbitmqSecretName),
@@ -219,12 +251,14 @@ func newData(ctx *pulumi.Context, cfg *stackConfig, net *network, cluster *clust
 	}
 
 	return &dataStack{
-		dbEndpoint:         dbEndpoint,
-		rabbitmqEndpoint:   rabbitmqURL,
-		databaseURL:        databaseURL,
-		rabbitmqURL:        rabbitmqURL,
-		dbSecretName:       dbSecretName,
-		rabbitmqSecretName: rabbitmqSecretName,
+		dbEndpoint:           dbEndpoint,
+		rabbitmqEndpoint:     rabbitmqURL,
+		databaseURL:          databaseURL,
+		paymentsDatabaseURL:  paymentsDatabaseURL,
+		rabbitmqURL:          rabbitmqURL,
+		dbSecretName:         dbSecretName,
+		paymentsDBSecretName: paymentsDBSecretName,
+		rabbitmqSecretName:   rabbitmqSecretName,
 	}, nil
 }
 

@@ -100,7 +100,7 @@ func TestPCI_CardPayment_NeverLeaksFullPANOrCVV(t *testing.T) {
 	require.True(t, ok, "expected payment to be persisted")
 
 	var payment persistence.PaymentModel
-	require.NoError(t, suite.db.First(&payment).Error)
+	require.NoError(t, suite.paymentsDB.First(&payment).Error)
 	persistedDetails := string(payment.MethodDetails)
 	require.NotContains(t, persistedDetails, fullPAN, "full PAN must never reach the payments table")
 	require.NotContains(t, persistedDetails, "cvv", "CVV must never be persisted")

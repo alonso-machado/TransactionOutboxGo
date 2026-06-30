@@ -16,7 +16,7 @@ import (
 func countTable(t *testing.T, name string) int64 {
 	t.Helper()
 	var n int64
-	require.NoError(t, suite.db.Table(name).Count(&n).Error)
+	require.NoError(t, suite.paymentsDB.Table(name).Count(&n).Error)
 	return n
 }
 

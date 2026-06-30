@@ -1,0 +1,52 @@
+# KEDA ScaledObject for the outbox relay. Unlike consumer-worker's (which
+# scales on RabbitMQ queue depth), this scales on the OUTBOX BACKLOG — the
+# count of NEW/RETRYING rows in outbox_messages — using KEDA's postgresql
+# scaler. minReplicaCount is 1 (not 0): the relay must always have a live pod
+# to keep the LISTEN/NOTIFY fast path warm and run the hourly prune / backlog
+# metrics, so it only ever scales UP from 1 under a backlog, never to zero.
+#
+# No canary retarget (consumer-worker's scaledobject re-points to a Rollout
+# when canary.enabled) — outbox-worker has no Rollout variant, so this always
+# targets the Deployment.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: outbox-worker
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: outbox-worker
+  minReplicaCount: {{ .Values.outboxWorker.keda.minReplicaCount }}
+  maxReplicaCount: {{ .Values.outboxWorker.keda.maxReplicaCount }}
+  pollingInterval: {{ .Values.outboxWorker.keda.pollingInterval }} # seconds between backlog checks
+  cooldownPeriod: {{ .Values.outboxWorker.keda.cooldownPeriod }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: {{ .Values.outboxWorker.keda.scaleUpStabilizationSeconds }}
+          # Same reasoning as consumer-worker's ScaledObject — a single Pods
+          # policy sized to maxReplicaCount lets one reconcile jump straight to
+          # max under a sudden backlog spike instead of ramping over several
+          # pollingInterval cycles.
+          policies:
+            - type: Pods
+              value: {{ .Values.outboxWorker.keda.maxReplicaCount }}
+              periodSeconds: {{ .Values.outboxWorker.keda.pollingInterval }}
+        scaleDown:
+          stabilizationWindowSeconds: {{ .Values.outboxWorker.keda.scaleDownStabilizationSeconds }}
+  triggers:
+    - type: postgresql
+      metadata:
+        # NEW + RETRYING = everything still owed to RabbitMQ. PUBLISHED and
+        # DEAD_LETTER rows are terminal and don't count toward backlog.
+        query: "SELECT count(*) FROM outbox_messages WHERE status IN ('NEW','RETRYING')"
+        targetQueryValue: {{ .Values.outboxWorker.keda.targetQueryValue | quote }}
+        # Resolved from the outbox-worker pod's DATABASE_URL env (sourced from
+        # the OUTBOX_DATABASE_URL Secret key). Points at the same `outbox` DB
+        # the relay uses; via PgBouncer in the cloud topology. If the periodic
+        # count query's pool usage ever matters, give KEDA its own env pointed
+        # straight at Postgres and reference it here instead.
+        connectionFromEnv: DATABASE_URL

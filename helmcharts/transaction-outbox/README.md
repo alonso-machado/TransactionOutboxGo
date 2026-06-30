@@ -1,9 +1,20 @@
 # transaction-outbox Helm chart
 
-Deploys the Transactional Outbox payments system: one `ingestion-api`
-Deployment/Service/HPA, and one `consumer-worker` Deployment + KEDA
-`ScaledObject` pair per payment method (driven by `values.yaml`'s
-`paymentMethods` list — see `templates/consumer-worker/`).
+Deploys the Transactional Outbox payments system:
+
+- one `ingestion-api` Deployment + Service (fixed replica count by default;
+  `ingestionApi.hpa.enabled: true` opts back into a CPU/memory HPA);
+- one `outbox-worker` Deployment + KEDA `ScaledObject` (the Transactional
+  Outbox relay — scales on outbox backlog via the postgresql scaler,
+  `outboxWorker.keda.minReplicaCount` defaults to 1 — see
+  `templates/outbox-worker/`);
+- one `consumer-worker` Deployment + KEDA `ScaledObject` pair per payment
+  method (driven by `values.yaml`'s `paymentMethods` list — see
+  `templates/consumer-worker/`).
+
+Two logical databases (one Postgres/RDS instance): ingestion-api and
+outbox-worker use `secret.databaseUrl` (the `outbox` DB); consumer-worker uses
+`secret.paymentsDatabaseUrl` (the `payments` DB).
 
 ## Install
 
@@ -12,9 +23,10 @@ helm upgrade --install transaction-outbox helmcharts/transaction-outbox \
   --namespace transaction-outbox --create-namespace
 ```
 
-Override `secret.databaseUrl` / `secret.rabbitmqUrl` (and any other value)
-via `--set` or a `-f custom-values.yaml` file — never commit real connection
-strings into `values.yaml`.
+Override `secret.databaseUrl` / `secret.paymentsDatabaseUrl` /
+`secret.rabbitmqUrl` (and any other value) via `--set` or a
+`-f custom-values.yaml` file — never commit real connection strings into
+`values.yaml`.
 
 ## Adding a payment method
 

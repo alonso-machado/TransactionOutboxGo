@@ -17,7 +17,7 @@ x-consumer-worker-base: &consumer-worker-base
       condition: service_healthy
     rabbitmq:
       condition: service_healthy
-    migrate:
+    migrate-payments:
       condition: service_completed_successfully
     pgbouncer:
       condition: service_healthy
@@ -30,7 +30,11 @@ x-consumer-worker-env: &consumer-worker-env
   # postgres directly, so the 0..N-per-method KEDA fan-out's many short-lived
   # connections collapse onto a small server-side pool instead of each pod
   # opening its own GORM pool straight against Postgres.
-  DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@pgbouncer:6432/${POSTGRES_DB:-outbox}?sslmode=disable"
+  #
+  # Two-DB split: consumer-worker is the only writer of payments_*, so it
+  # points at the `payments` database (PgBouncer's wildcard [databases] entry
+  # transparently pools whichever dbname the client requests).
+  DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@pgbouncer:6432/payments?sslmode=disable"
   RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
   PREFETCH_COUNT: "${CONSUMER_PREFETCH:-10}"
   MAX_DELIVERIES: "${RABBITMQ_MAX_REDELIVERIES:-5}"
@@ -68,6 +72,11 @@ services:
       # single-version path /var/lib/postgresql/data — the single mount point
       # must be the parent /var/lib/postgresql instead.
       - postgres_data:/var/lib/postgresql
+      # Creates the second logical database (`payments`) on a fresh data dir,
+      # alongside the image-created `outbox` (POSTGRES_DB). Runs once, only
+      # when the volume is empty — `make down` (-v) wipes the volume so the
+      # next `up` re-runs it. See the file's own comment for the two-DB split.
+      - ./observability/postgres/init-payments.sql:/docker-entrypoint-initdb.d/init-payments.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-outbox} -d ${POSTGRES_DB:-outbox}"]
       interval: 5s
@@ -119,22 +128,44 @@ services:
       - outbox
     restart: unless-stopped
 
-  # Phase 5 Track 1: one-shot golang-migrate container that applies
-  # migrations/*.up.sql before any app service starts — replaces the
+  # Phase 5 Track 1: one-shot golang-migrate containers that apply
+  # migrations/<set>/*.up.sql before any app service starts — replaces the
   # AutoMigrate/MigrateTimescale boot-time calls that used to live in
-  # cmd/ingestion-api/main.go and cmd/consumer-worker/main.go. Exits 0 (or
-  # a no-op if already at the latest version) and the container is left in
-  # "Exited" state, which `depends_on: condition: service_completed_successfully`
-  # below waits on.
-  migrate:
+  # cmd/ingestion-api/main.go and cmd/consumer-worker/main.go. Each exits 0
+  # (or a no-op if already at the latest version) and is left in "Exited"
+  # state, which `depends_on: condition: service_completed_successfully` below
+  # waits on.
+  #
+  # Two sets now, one per logical database (the outbox/payments split): the
+  # outbox table + its notify trigger/indexes go to the `outbox` DB, the
+  # TimescaleDB payments_* hypertables go to the `payments` DB created by
+  # observability/postgres/init-payments.sql. golang-migrate tracks its own
+  # schema_migrations table per database, so these run independently.
+  migrate-outbox:
     image: migrate/migrate:latest
     volumes:
       - ./migrations:/migrations:ro
     entrypoint:
       - migrate
-      - -path=/migrations
+      - -path=/migrations/outbox
       - -database
       - "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@postgres:5432/${POSTGRES_DB:-outbox}?sslmode=disable"
+      - up
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - outbox
+
+  migrate-payments:
+    image: migrate/migrate:latest
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint:
+      - migrate
+      - -path=/migrations/payments
+      - -database
+      - "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@postgres:5432/payments?sslmode=disable"
       - up
     depends_on:
       postgres:
@@ -201,15 +232,17 @@ services:
         SERVICE: ingestion-api
     environment:
       # Phase 5 Track 3.B — points at PgBouncer, not postgres directly (see
-      # the pgbouncer service above and consumer-worker-env's note).
+      # the pgbouncer service above). Two-DB split: ingestion-api only writes
+      # the outbox table, so it points at the `outbox` database (POSTGRES_DB).
       DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@pgbouncer:6432/${POSTGRES_DB:-outbox}?sslmode=disable"
+      # Still provided because the shared Config struct marks RABBITMQ_URL
+      # required — but ingestion-api no longer connects to RabbitMQ at all
+      # (the relay is now outbox-worker). It's also why this service no longer
+      # depends_on rabbitmq below: it can boot and accept writes with the
+      # broker down, which is the whole point of the outbox.
       RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
       HTTP_PORT: "${APP_PORT:-8080}"
       SWAGGER_ENABLED: "${SWAGGER_ENABLED:-true}"
-      OUTBOX_DISPATCH_INTERVAL_MS: "${OUTBOX_DISPATCH_INTERVAL_MS:-250}"
-      OUTBOX_DISPATCH_BATCH_SIZE: "${OUTBOX_DISPATCH_BATCH_SIZE:-100}"
-      OUTBOX_MAX_RETRIES: "${OUTBOX_MAX_RETRIES:-5}"
-      OUTBOX_PRUNE_AFTER_HOURS: "${OUTBOX_PRUNE_AFTER_HOURS:-48}"
       RETRY_BACKOFF_BASE: "${RETRY_BACKOFF_BASE:-1s}"
       RETRY_BACKOFF_CAP: "${RETRY_BACKOFF_CAP:-5m}"
       OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-ingestion-api}"
@@ -230,13 +263,52 @@ services:
       - "${METRICS_PORT:-9090}:9090"
     # tempo is NOT a dependency here — see consumer-worker's note above;
     # this lets `make loadtest-up` bring up a minimal subset of this same
-    # compose file without dragging Tempo along.
+    # compose file without dragging Tempo along. rabbitmq is intentionally NOT
+    # a dependency either — ingestion-api never connects to it now.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate-outbox:
+        condition: service_completed_successfully
+      pgbouncer:
+        condition: service_healthy
+    networks:
+      - outbox
+    restart: unless-stopped
+
+  # The Transactional Outbox relay (DispatchOutbox), split out of ingestion-api
+  # into its own process so it scales on outbox backlog independently of the
+  # fixed-size HTTP front door. It is the only reader of the outbox table and
+  # the only publisher to RabbitMQ; it also declares the shared topology that
+  # the per-method consumer-worker services consume from. Points at the
+  # `outbox` database, same as ingestion-api.
+  outbox-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: outbox-worker
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@pgbouncer:6432/${POSTGRES_DB:-outbox}?sslmode=disable"
+      RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
+      OUTBOX_DISPATCH_INTERVAL_MS: "${OUTBOX_DISPATCH_INTERVAL_MS:-250}"
+      OUTBOX_DISPATCH_BATCH_SIZE: "${OUTBOX_DISPATCH_BATCH_SIZE:-100}"
+      OUTBOX_MAX_RETRIES: "${OUTBOX_MAX_RETRIES:-5}"
+      OUTBOX_PRUNE_AFTER_HOURS: "${OUTBOX_PRUNE_AFTER_HOURS:-48}"
+      RETRY_BACKOFF_BASE: "${RETRY_BACKOFF_BASE:-1s}"
+      RETRY_BACKOFF_CAP: "${RETRY_BACKOFF_CAP:-5m}"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-outbox-worker}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-tempo:4318}"
+      METRICS_PORT: "9098"
+      LOG_FORMAT: "${LOG_FORMAT:-json}"
+    ports:
+      - "9098:9098"
     depends_on:
       postgres:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-      migrate:
+      migrate-outbox:
         condition: service_completed_successfully
       pgbouncer:
         condition: service_healthy

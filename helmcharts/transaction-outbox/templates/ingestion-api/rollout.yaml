@@ -42,6 +42,8 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: transaction-outbox-secrets
+                  # outbox DB (the DATABASE_URL key) — ingestion-api only writes
+                  # outbox_messages. consumer-worker uses PAYMENTS_DATABASE_URL.
                   key: DATABASE_URL
             - name: RABBITMQ_URL
               valueFrom:

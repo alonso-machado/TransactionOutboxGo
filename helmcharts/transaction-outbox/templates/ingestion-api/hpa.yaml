@@ -1,7 +1,9 @@
-{{- if not .Values.canary.enabled }}
-# Rollout owns ingestion-api's replica count when canary.enabled — Argo
-# Rollouts manages canary/stable ReplicaSet sizes itself during a rollout,
-# which an external HPA targeting the same Deployment would fight with.
+{{- if and (not .Values.canary.enabled) .Values.ingestionApi.hpa.enabled }}
+# Rendered only when canary is off AND hpa.enabled is true. ingestion-api now
+# defaults to a fixed replica count (hpa.enabled=false → the Deployment owns
+# .spec.replicas), so this HPA is opt-in. The Rollout (canary.enabled=true)
+# owns the replica count itself during a rollout, which an external HPA
+# targeting the same workload would fight with — hence the canary exclusion too.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

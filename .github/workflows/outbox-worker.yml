@@ -1,28 +1,28 @@
-name: CI - consumer-worker
+name: CI - outbox-worker
 
-# Independent of the other microservices' workflows on purpose — see
-# .github/workflows/README.md for why each service gets its own workflow file
-# rather than one matrixed workflow. Gate order: build -> lint -> unit-tests -> upload -> deploy.
-# integration-tests is an optional, flag-gated safety measure off the gate
-# path — it never blocks upload/deploy.
+# Independent of ingestion-api.yml and consumer-worker.yml on purpose — see
+# .github/workflows/README.md for why each microservice gets its own workflow
+# file rather than one matrixed workflow. Gate order: build -> lint ->
+# unit-tests -> upload -> deploy. integration-tests is an optional, flag-gated
+# safety measure off the gate path — it never blocks upload/deploy.
 on:
   push:
     branches: [main]
     paths:
       - "internal/**"
-      - "cmd/consumer-worker/**"
+      - "cmd/outbox-worker/**"
       - "go.mod"
       - "go.sum"
       - "Dockerfile"
-      - ".github/workflows/consumer-worker.yml"
+      - ".github/workflows/outbox-worker.yml"
   pull_request:
     paths:
       - "internal/**"
-      - "cmd/consumer-worker/**"
+      - "cmd/outbox-worker/**"
       - "go.mod"
       - "go.sum"
       - "Dockerfile"
-      - ".github/workflows/consumer-worker.yml"
+      - ".github/workflows/outbox-worker.yml"
   workflow_dispatch:
     inputs:
       run_integration:
@@ -32,7 +32,7 @@ on:
 
 env:
   GO_VERSION: "1.26"
-  SERVICE: consumer-worker
+  SERVICE: outbox-worker
 
 jobs:
   build:
@@ -165,9 +165,8 @@ jobs:
           command: up
           stack-name: dev
           work-dir: infra/pulumi
-          # Only this service's image-tag config key — never touches
-          # ingestion-api's, so this deploy can't redeploy the other
-          # service's pods (see Track 4's workloads.go).
-          config-map: '{"transaction-outbox:imageTagConsumerWorker":{"value":"${{ github.sha }}","secret":false}}'
+          # Only this service's image-tag config key — never touches the other
+          # services', so this deploy can't redeploy their pods (see config.go).
+          config-map: '{"transaction-outbox:imageTagOutboxWorker":{"value":"${{ github.sha }}","secret":false}}'
         env:
           PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}

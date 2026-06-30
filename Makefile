@@ -14,24 +14,40 @@ down:
 	$(COMPOSE) down -v
 
 # Phase 5 Track 1: golang-migrate as a container, not the app, applies
-# migrations/*.up.sql against the compose Postgres before `up` brings up the
-# app services. Connects on localhost using compose's published Postgres
-# port, so Postgres must already be up — `make up`'s dependency on this
-# target starts it first via the one-shot `migrate` compose service.
+# migrations/<set>/*.up.sql against the compose Postgres before `up` brings up
+# the app services. Connects on localhost using compose's published Postgres
+# port, so Postgres must already be up — `make up`'s dependency on this target
+# starts it first.
+#
+# Two sets, one per logical database (the outbox/payments split): outbox/ ->
+# the `outbox` DB, payments/ -> the `payments` DB. The compose postgres init
+# script (observability/postgres/init-payments.sql) creates `payments` only on
+# a fresh volume, so migrate also CREATE-DATABASEs it if missing — keeps this
+# target idempotent against a pre-existing single-DB volume.
 POSTGRES_USER     ?= outbox
 POSTGRES_PASSWORD ?= outbox
 POSTGRES_PORT     ?= 5432
 POSTGRES_DB       ?= outbox
-MIGRATE_DSN := postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable
+PAYMENTS_DB       ?= payments
+MIGRATE_DSN_OUTBOX   := postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable
+MIGRATE_DSN_PAYMENTS := postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/$(PAYMENTS_DB)?sslmode=disable
+
+# Roll back one step in this set (default outbox); override with DB=payments.
+MIGRATE_DOWN_PATH ?= migrations/outbox
+MIGRATE_DOWN_DSN  ?= $(MIGRATE_DSN_OUTBOX)
 
 migrate:
 	$(COMPOSE) up --build -d postgres
+	$(COMPOSE) exec -T postgres sh -c \
+		"psql -U $(POSTGRES_USER) -tc \"SELECT 1 FROM pg_database WHERE datname='$(PAYMENTS_DB)'\" | grep -q 1 || createdb -U $(POSTGRES_USER) $(PAYMENTS_DB)"
 	podman run --rm -v "$(CURDIR)/migrations:/migrations" --network host \
-		migrate/migrate -path=/migrations -database "$(MIGRATE_DSN)" up
+		migrate/migrate -path=/migrations/outbox -database "$(MIGRATE_DSN_OUTBOX)" up
+	podman run --rm -v "$(CURDIR)/migrations:/migrations" --network host \
+		migrate/migrate -path=/migrations/payments -database "$(MIGRATE_DSN_PAYMENTS)" up
 
 migrate-down:
 	podman run --rm -v "$(CURDIR)/migrations:/migrations" --network host \
-		migrate/migrate -path=/migrations -database "$(MIGRATE_DSN)" down 1
+		migrate/migrate -path=/$(MIGRATE_DOWN_PATH) -database "$(MIGRATE_DOWN_DSN)" down 1
 
 # Phase 5 Track 2.C — DLQ replay convenience targets. METHOD="" (default)
 # replays across every method for replay-dead; drain-dlq requires METHOD.

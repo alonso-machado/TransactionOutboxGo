@@ -1,0 +1,15 @@
+-- Runs once, on a fresh Postgres data dir, via the official image's
+-- /docker-entrypoint-initdb.d hook (see docker-compose.yml's postgres volume
+-- mount). The image already creates POSTGRES_DB (the `outbox` database, which
+-- holds outbox_messages); this adds the second logical database in the SAME
+-- instance for the consumer side's payments_* hypertables.
+--
+-- Why two databases: ingestion-api/outbox-worker only ever touch the outbox
+-- table, consumer-worker only ever touches payments, and no transaction spans
+-- the two — so splitting them keeps the ingestion side and the consumer side
+-- on independent schemas (and independent golang-migrate version histories)
+-- without giving up the transactional-outbox guarantee.
+--
+-- The TimescaleDB extension itself is created per-database by the payments
+-- migration set (migrations/payments/000001_timescale.up.sql), not here.
+CREATE DATABASE payments;

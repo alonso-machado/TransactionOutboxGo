@@ -1,6 +1,15 @@
-# One-shot migrate Job — same migrate/migrate image and migrations/ as
-# docker-compose.yml's `migrate` service, just sourced from a ConfigMap
-# since KIND has no host-path mount for this cluster.
+# One-shot migrate Job — the KIND analogue of docker-compose.yml's
+# migrate-outbox/migrate-payments services, sourced from ConfigMaps since KIND
+# has no host-path mount for this cluster.
+#
+# Two-DB split: this now (1) creates the `payments` database (the cluster
+# analogue of observability/postgres/init-payments.sql — the in-cluster
+# Postgres only auto-creates `outbox`), (2) applies migrations/outbox to the
+# `outbox` DB, then (3) applies migrations/payments to the `payments` DB.
+# Because the two sets have overlapping version numbers and golang-migrate
+# tracks schema_migrations per database, they MUST live in separate
+# ConfigMaps/paths — see loadtest/README.md for the updated `kubectl create
+# configmap` commands (migrations-outbox / migrations-payments).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -11,16 +20,40 @@ spec:
   template:
     spec:
       restartPolicy: Never
-      containers:
-        - name: migrate
+      initContainers:
+        # Idempotent CREATE DATABASE payments — the psql client ships in the
+        # stock postgres image; createdb is a no-op-guarded by the SELECT so
+        # re-running the Job never errors on an already-created database.
+        - name: createdb-payments
+          image: docker.io/library/postgres:18-alpine
+          env:
+            - { name: PGPASSWORD, value: outbox }
+          command: ["sh", "-c"]
+          args:
+            - >
+              psql -h postgres -U outbox -d outbox -tc "SELECT 1 FROM pg_database WHERE datname='payments'" | grep -q 1 ||
+              createdb -h postgres -U outbox payments
+        - name: migrate-outbox
           image: docker.io/migrate/migrate:latest
           args:
-            - -path=/migrations
+            - -path=/migrations/outbox
             - -database
             - postgres://outbox:outbox@postgres:5432/outbox?sslmode=disable
             - up
           volumeMounts:
-            - { name: migrations, mountPath: /migrations }
+            - { name: migrations-outbox, mountPath: /migrations/outbox }
+      containers:
+        - name: migrate-payments
+          image: docker.io/migrate/migrate:latest
+          args:
+            - -path=/migrations/payments
+            - -database
+            - postgres://outbox:outbox@postgres:5432/payments?sslmode=disable
+            - up
+          volumeMounts:
+            - { name: migrations-payments, mountPath: /migrations/payments }
       volumes:
-        - name: migrations
-          configMap: { name: migrations }
+        - name: migrations-outbox
+          configMap: { name: migrations-outbox }
+        - name: migrations-payments
+          configMap: { name: migrations-payments }

@@ -44,28 +44,40 @@ acknowledges the client, and a separate relay reliably forwards it to the broker
 
 ## Architecture
 
-Two binaries, but **N consumer-worker instances** — one per payment method
-(Phase 3), each bound to exactly one RabbitMQ queue via `PAYMENT_QUEUE`, so
-KEDA can scale a method's consumers independently of the others. The
-**`DispatchOutbox`** use case runs as a background goroutine inside
-`ingestion-api` (not a third process), so the API both serves HTTP and
-dispatches the outbox — handling the full Transactional Outbox responsibility.
-The API **never writes to the `payments` table** — only `consumer-worker` does.
+Three service binaries: **`ingestion-api`** (fixed 1 replica, HTTP write path),
+**`outbox-worker`** (the Transactional Outbox relay — its own process, KEDA-
+scaled on outbox backlog, min 1), and **`consumer-worker`** with **N instances**
+— one per payment method (Phase 3), each bound to exactly one RabbitMQ queue via
+`PAYMENT_QUEUE` so KEDA can scale a method's consumers independently. The
+**`DispatchOutbox`** use case runs in `outbox-worker` (it used to be a goroutine
+inside `ingestion-api`); splitting it out lets the relay scale on backlog
+independently of the HTTP front door, and lets `ingestion-api` accept writes
+even when RabbitMQ is down — it never connects to the broker at all now.
+
+Two logical databases share one Postgres instance: ingestion-api and
+outbox-worker use the **`outbox`** database (`outbox_messages`); consumer-worker
+uses the **`payments`** database (`payments_*` hypertables). The API **never
+writes to the `payments` tables** — only `consumer-worker` does.
 
 ```mermaid
 flowchart LR
     Client([Client])
 
-    subgraph API["ingestion-api (process 1)"]
-        direction TB
+    subgraph API["ingestion-api (fixed 1 replica)"]
         H[Gin HTTP handler]
-        R[DispatchOutbox goroutine<br/>poll · publish · mark]
-        H -. "in-process" .- R
     end
 
-    subgraph DB[(PostgreSQL 18 / TimescaleDB)]
-        OBX[[outbox_messages]]
-        PAY[[payments]]
+    subgraph OW["outbox-worker (KEDA, min 1)"]
+        R[DispatchOutbox<br/>poll · LISTEN/NOTIFY · publish · mark]
+    end
+
+    subgraph DB[(PostgreSQL 18 / TimescaleDB — one instance)]
+        subgraph DBO["outbox database"]
+            OBX[[outbox_messages]]
+        end
+        subgraph DBP["payments database"]
+            PAY[[payments]]
+        end
     end
 
     subgraph MQ["RabbitMQ 4.3 (quorum, one queue + DLQ per method)"]
@@ -95,6 +107,7 @@ flowchart LR
     Client -- "POST/PUT/PATCH /api/v1/payments" --> H
     H -- "tx: INSERT (idempotency_key UNIQUE, status=NEW, payment_method)" --> OBX
     H -- "201 Created" --> Client
+    OBX -. "NOTIFY outbox_new (cross-process wake)" .-> R
     R -- "SELECT status IN (NEW, RETRYING) FOR UPDATE SKIP LOCKED" --> OBX
     R -- "publish (confirm, persistent, routing key = payment.&lt;method&gt;)" --> EX
     R -- "mark PUBLISHED" --> OBX
@@ -216,22 +229,27 @@ import it, the same way any layer may import `domain/pii`.
 
 - **`ingestion-api`** — Gin HTTP server exposing `POST/PUT/PATCH /api/v1/payments`
   and `/healthz`. Pre-generates the Payment UUID, computes the idempotency key from
-  the business fields, writes **only** to the outbox table inside a transaction
-  (status `NEW`), returns `201 Created`. Also hosts the **`DispatchOutbox`
-  goroutine** — the Transactional Outbox core: polls `NEW`/`RETRYING` rows
-  (deduped via `FOR UPDATE SKIP LOCKED`), publishes to RabbitMQ with publisher
-  confirms, marks rows `PUBLISHED` (or `RETRYING`/`DEAD_LETTER` on failure), and
-  prunes old published rows.
+  the business fields, writes **only** to the outbox table (in the `outbox`
+  database) inside a transaction (status `NEW`), returns `201 Created`. Runs at a
+  fixed 1 replica and does **not** connect to RabbitMQ.
+- **`outbox-worker`** — the Transactional Outbox core, its own process: polls
+  `NEW`/`RETRYING` rows (deduped via `FOR UPDATE SKIP LOCKED`, plus a
+  LISTEN/NOTIFY fast path), publishes to RabbitMQ with publisher confirms, marks
+  rows `PUBLISHED` (or `RETRYING`/`DEAD_LETTER` on failure with exponential
+  backoff), prunes old published rows, and declares the shared RabbitMQ topology.
+  KEDA scales it on outbox backlog (postgresql scaler), min 1.
 - **`consumer-worker`** — RabbitMQ consumer with prefetch + manual ack. The
-  **only writer** of the `payments` table — dedupes via the
-  `payments.source_message_id` `UNIQUE` constraint (`ON CONFLICT DO NOTHING`), so
-  a redelivered message is a safe no-op. No separate inbox table.
-- **PostgreSQL** — stores `outbox_messages` and `payments`.
+  **only writer** of the `payments` tables (in the `payments` database) —
+  dedupes via the `payments.source_message_id` `UNIQUE` constraint
+  (`ON CONFLICT DO NOTHING`), so a redelivered message is a safe no-op. No
+  separate inbox table.
+- **PostgreSQL** — one instance, two logical databases: `outbox`
+  (`outbox_messages`) and `payments` (`payments_*` hypertables + the `payments`
+  view).
 - **RabbitMQ** — durable topic exchange (`payments.exchange`) + quorum queue
   (`payments.queue`) + dead-letter queue (`payments.dlq`).
-- **`outbox-admin`** — a one-shot maintenance CLI, **not** a third
-  long-running service (`DispatchOutbox` stays a goroutine inside
-  `ingestion-api`). Three subcommands, all driven by `make`:
+- **`outbox-admin`** — a one-shot maintenance CLI, **not** a long-running
+  service. Three subcommands, all driven by `make`:
   `replay-dead --method PIX --limit 100` resets `DEAD_LETTER` outbox rows
   back to `NEW` so the existing dispatch loop republishes them;
   `drain-dlq --method PIX` moves messages sitting in `payments.pix.dlq` back
@@ -239,9 +257,9 @@ import it, the same way any layer may import `domain/pii`.
   and permanently removes only messages with `providerName="LOADTEST"`
   (set by every `loadtest/*.js` script), leaving any other message
   untouched — safe to run against a DLQ with a mix of real and loadtest
-  messages, e.g. after load-testing in a UAT environment. Shares
-  `DATABASE_URL`/`RABBITMQ_URL` with the two services but never binds an
-  HTTP port. See `make replay-dead` / `make drain-dlq` /
+  messages, e.g. after load-testing in a UAT environment. Operates on the
+  `outbox` database (`DATABASE_URL` points at it, same as ingestion-api/
+  outbox-worker) plus `RABBITMQ_URL`, but never binds an HTTP port. See `make replay-dead` / `make drain-dlq` /
   `make purge-loadtest-dlq` and
   [`cmd/outbox-admin/main.go`](cmd/outbox-admin/main.go).
 
@@ -497,15 +515,19 @@ TransactionOutboxGo/
 ├── .claude/plan.md            # full implementation plan
 ├── CLAUDE.md                  # guidance for Claude Code in this repo
 ├── cmd/
-│   ├── ingestion-api/         # HTTP server + DispatchOutbox goroutine (composition root)
-│   ├── consumer-worker/       # RabbitMQ consumer (composition root)
-│   └── outbox-admin/          # one-shot maintenance CLI: replay-dead / drain-dlq / purge-loadtest-dlq (not a 3rd service)
+│   ├── ingestion-api/         # HTTP write path → outbox DB (composition root)
+│   ├── outbox-worker/         # DispatchOutbox relay → RabbitMQ, KEDA-scaled (composition root)
+│   ├── consumer-worker/       # RabbitMQ consumer → payments DB (composition root)
+│   └── outbox-admin/          # one-shot maintenance CLI: replay-dead / drain-dlq / purge-loadtest-dlq
 ├── internal/
 │   ├── domain/                # entities (OutboxMessage, Payment) + ports + SchemaVersion/ParseOptionalUUID/Backoff (no framework imports)
 │   ├── observability/         # tiny OTel metric-instrument helpers shared by usecase + adapter (no framework imports beyond the otel API)
 │   ├── usecase/                # ingest (IngestPayment) / outbox (DispatchOutbox) / consume (ProcessMessage)
 │   ├── adapter/                # http · persistence · messaging
 │   └── infrastructure/         # config · database · rabbitmq · telemetry · logging
+├── migrations/
+│   ├── outbox/                 # golang-migrate set for the `outbox` database
+│   └── payments/               # golang-migrate set for the `payments` database
 ├── tests/integration/          # TestContainers suite (Postgres + RabbitMQ) — see Testing below
 ├── docker-compose.yml
 ├── Dockerfile
@@ -516,21 +538,25 @@ TransactionOutboxGo/
 
 ## Environment variables
 
-Both binaries read config via [`internal/infrastructure/config`](internal/infrastructure/config/config.go)
+All three service binaries read config via [`internal/infrastructure/config`](internal/infrastructure/config/config.go)
 (`envconfig`). `DATABASE_URL` and `RABBITMQ_URL` are the only two marked
-`required` — everything else has a default. See [`.env.example`](.env.example)
-for local-dev values and [`docker-compose.yml`](docker-compose.yml) for how
-each service's env block is actually wired.
+`required` — everything else has a default. (ingestion-api still requires
+`RABBITMQ_URL` to be set because the `Config` struct is shared, but it never
+opens a connection.) Each service points `DATABASE_URL` at its own logical
+database: `outbox` for ingestion-api/outbox-worker, `payments` for
+consumer-worker. See [`.env.example`](.env.example) for local-dev values and
+[`docker-compose.yml`](docker-compose.yml) for how each service's env block is
+wired.
 
-### Shared (both `ingestion-api` and `consumer-worker`)
+### Shared (all three services)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DATABASE_URL` | *(required)* | Postgres DSN |
-| `RABBITMQ_URL` | *(required)* | AMQP connection string |
+| `DATABASE_URL` | *(required)* | Postgres DSN — `outbox` DB for ingestion-api/outbox-worker, `payments` DB for consumer-worker |
+| `RABBITMQ_URL` | *(required)* | AMQP connection string (unused by ingestion-api) |
 | `OTEL_SERVICE_NAME` | `transaction-outbox-go` | OTel resource service name — each service/per-method consumer overrides this to its own name (e.g. `consumer-worker-pix`) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `localhost:4318` | OTLP/HTTP collector endpoint (Jaeger in local dev) |
-| `METRICS_PORT` | `9090` | Prometheus `/metrics` port — each per-method consumer-worker overrides this to its own fixed port (9091–9095, see `docker-compose.yml`) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `localhost:4318` | OTLP/HTTP collector endpoint (Tempo in local dev) |
+| `METRICS_PORT` | `9090` | Prometheus `/metrics` port — outbox-worker uses `9098`; each per-method consumer-worker overrides this to its own fixed port (9091–9095, see `docker-compose.yml`) |
 
 ### `ingestion-api` only
 
@@ -538,14 +564,20 @@ each service's env block is actually wired.
 |---|----------------------------------------------|---|
 | `HTTP_PORT` | `8080`                                       | HTTP listen port |
 | `SWAGGER_ENABLED` | `false`                                      | Serve swagger UI at `/swagger/index.html` (local dev defaults this to `true`; production leaves it `false`) |
-| `OUTBOX_DISPATCH_INTERVAL_MS` | `250`                                        | Poll interval for the `DispatchOutbox` goroutine |
-| `OUTBOX_DISPATCH_BATCH_SIZE` | `100`                                        | Rows fetched per dispatch poll |
-| `OUTBOX_MAX_RETRIES` | `5`                                          | Publish attempts before an outbox row is marked `DEAD_LETTER` |
-| `OUTBOX_PRUNE_AFTER_HOURS` | `48`                                         | Hours after which a `PUBLISHED` row is eligible for pruning |
 | `RATE_LIMIT_ENABLED` | `false` locally, `true` in cloud Helm values | Leaky-bucket IP rate limiter (see [Edge protection](#edge-protection-rate-limiting--waf) below). Off by default in `docker-compose.yml`/`.env.example` so k6 load tests and seed scripts don't throttle themselves |
 | `RATE_LIMIT_RATE` | `50`                                         | Leak rate, requests/second per client IP |
 | `RATE_LIMIT_BURST` | `100`                                        | Bucket capacity (requests admitted immediately before throttling kicks in) |
 | `TRUSTED_PROXIES` | *(empty)*                                    | Comma-separated CIDRs Gin trusts for `X-Forwarded-For` when resolving `c.ClientIP()`. Empty locally (no proxy in front, uses `RemoteAddr` directly); set to the VPC/private-subnet CIDRs in cloud, where the ALB sits in front and injects XFF |
+
+### `outbox-worker` only
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OUTBOX_DISPATCH_INTERVAL_MS` | `250` | Poll interval for the dispatch loop (the LISTEN/NOTIFY fast path wakes it sooner on enqueue) |
+| `OUTBOX_DISPATCH_BATCH_SIZE` | `50` | Rows fetched per dispatch poll |
+| `OUTBOX_MAX_RETRIES` | `5` | Publish attempts before an outbox row is marked `DEAD_LETTER` |
+| `OUTBOX_PRUNE_AFTER_HOURS` | `48` | Hours after which a `PUBLISHED` row is eligible for pruning |
+| `RETRY_BACKOFF_BASE` / `RETRY_BACKOFF_CAP` | `1s` / `5m` | Exponential-backoff bounds for `next_retry_at` scheduling (shared with consumer-worker's retry-queue TTL) |
 
 ### `consumer-worker` only
 

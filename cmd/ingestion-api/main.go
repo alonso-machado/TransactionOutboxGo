@@ -18,15 +18,12 @@ import (
 
 	handler "github.com/alonsomachado/transaction-outbox-go/internal/adapter/http"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/http/ratelimit"
-	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/messaging"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/persistence"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/config"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/database"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/logging"
-	rmq "github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/rabbitmq"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/telemetry"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ingest"
-	outboxuc "github.com/alonsomachado/transaction-outbox-go/internal/usecase/outbox"
 )
 
 func main() {
@@ -61,43 +58,21 @@ func main() {
 		os.Exit(1)
 	}
 	// Schema migrations are no longer applied here — Phase 5 Track 1 moved
-	// them to versioned golang-migrate files under migrations/, applied by
-	// `make migrate` / the migrate/migrate compose service before the app
-	// starts (see docker-compose.yml's `migrate` service).
-
-	conn, err := rmq.Connect(cfg.RabbitMQURL, cfg.RabbitMQTLS)
-	if err != nil {
-		slog.ErrorContext(ctx, "rabbitmq connect failed", "err", err.Error())
-		os.Exit(1)
-	}
-	defer func() { _ = conn.Close() }()
-
-	ch, err := conn.Channel()
-	if err != nil {
-		slog.ErrorContext(ctx, "rabbitmq channel failed", "err", err.Error())
-		os.Exit(1)
-	}
-	if err := rmq.DeclareTopology(ch); err != nil {
-		slog.ErrorContext(ctx, "rabbitmq topology failed", "err", err.Error())
-		os.Exit(1)
-	}
-	if err := ch.Close(); err != nil {
-		slog.ErrorContext(ctx, "close topology channel error", "err", err.Error())
-	}
+	// them to versioned golang-migrate files under migrations/outbox/, applied
+	// by `make migrate` / the migrate-outbox compose one-shot before the app
+	// starts (see docker-compose.yml).
+	//
+	// ingestion-api no longer talks to RabbitMQ at all: the Transactional
+	// Outbox relay (DispatchOutbox) is now its own process, outbox-worker
+	// (cmd/outbox-worker). ingestion-api only writes the outbox row; the INSERT
+	// fires the LISTEN/NOTIFY trigger that wakes outbox-worker. This is also a
+	// resilience win — ingestion-api can keep accepting writes even when the
+	// broker is down, which is the whole point of the outbox.
 
 	uow := persistence.NewUnitOfWork(db)
 	outboxRepo := persistence.NewOutboxRepository(db, cfg.RetryBackoffBase, cfg.RetryBackoffCap)
-	publisher := messaging.NewPublisher(conn)
 
 	ingestUC := ingest.New(outboxRepo, uow)
-	dispatchUC := outboxuc.New(
-		outboxRepo,
-		publisher,
-		cfg.DispatchBatchSize,
-		cfg.MaxRetries,
-		time.Duration(cfg.DispatchInterval)*time.Millisecond,
-		time.Duration(cfg.PruneAfterHours)*time.Hour,
-	)
 
 	paymentHandler := handler.NewPaymentHandler(ingestUC)
 
@@ -122,14 +97,6 @@ func main() {
 			close(janitorStop)
 		}()
 	}
-
-	// Phase 5 Track 3.A — a dedicated LISTEN connection wakes DispatchOutbox
-	// immediately on enqueue; the poll ticker inside Run remains the
-	// correctness fallback if this connection ever drops.
-	notifyListener := database.NewListener(cfg.DatabaseURL)
-	go notifyListener.Run(ctx)
-
-	go dispatchUC.Run(ctx, notifyListener.Notify)
 
 	srv := &http.Server{
 		Addr:    ":" + cfg.HTTPPort,

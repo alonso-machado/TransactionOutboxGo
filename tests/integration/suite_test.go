@@ -35,33 +35,41 @@ import (
 // Postgres 17 + RabbitMQ 4.3 container pair, started once in TestMain, plus
 // the wired GORM DB and AMQP connection used by every test file in this
 // package. Tables are truncated between tests, not containers restarted.
+// Two-DB split: the outbox use-cases (ingest/dispatch) talk to the `outbox`
+// database (db / pgURI); the consumer writes the `payments` database
+// (paymentsDB / paymentsURI). Both live in the SAME testcontainer Postgres —
+// the split is logical, exactly as in production (one instance, two
+// databases), so no second container is needed.
 var suite struct {
-	db       *gorm.DB
-	amqpConn *amqp.Connection
-	pgURI    string
-	amqpURI  string
-	pgC      *tcpostgres.PostgresContainer
-	rmqC     *tcrabbitmq.RabbitMQContainer
+	db          *gorm.DB
+	paymentsDB  *gorm.DB
+	amqpConn    *amqp.Connection
+	pgURI       string
+	paymentsURI string
+	amqpURI     string
+	pgC         *tcpostgres.PostgresContainer
+	rmqC        *tcrabbitmq.RabbitMQContainer
 }
 
-// migrationsDir resolves the repo's migrations/ directory relative to this
-// source file (not the test binary's working directory), so the suite
-// finds it regardless of where `go test` is invoked from.
-func migrationsDir() (string, error) {
+// migrationsDir resolves the repo's migrations/<set> directory relative to
+// this source file (not the test binary's working directory), so the suite
+// finds it regardless of where `go test` is invoked from. set is "outbox" or
+// "payments" — the two per-database migration sets.
+func migrationsDir(set string) (string, error) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		return "", os.ErrNotExist
 	}
-	return filepath.Abs(filepath.Join(filepath.Dir(thisFile), "..", "..", "migrations"))
+	return filepath.Abs(filepath.Join(filepath.Dir(thisFile), "..", "..", "migrations", set))
 }
 
-// applyMigrations runs every up migration in migrations/ against dsn via
+// applyMigrations runs every up migration in migrations/<set> against dsn via
 // golang-migrate's Go library — the in-process equivalent of `make migrate`
-// /the compose `migrate` service, used here so the ephemeral testcontainer
-// Postgres ends up with exactly the schema production gets, with no
-// AutoMigrate anywhere in the suite.
-func applyMigrations(dsn string) error {
-	dir, err := migrationsDir()
+// /the compose migrate-outbox/migrate-payments services, used here so the
+// ephemeral testcontainer databases end up with exactly the schema production
+// gets, with no AutoMigrate anywhere in the suite.
+func applyMigrations(dsn, set string) error {
+	dir, err := migrationsDir(set)
 	if err != nil {
 		return err
 	}
@@ -123,13 +131,36 @@ func TestMain(m *testing.M) {
 	}
 	suite.db = db
 
-	// Phase 5 Track 1: apply the same versioned migrations/ directory the
-	// real services rely on (via golang-migrate) against the ephemeral
-	// testcontainer Postgres, instead of AutoMigrate/MigrateTimescale — so
-	// the integration suite is also a regression test that the migrations
-	// directory alone produces a working schema.
-	if err := applyMigrations(dsn); err != nil {
-		log.Printf("apply migrations: %v", err)
+	// Two-DB split: the container auto-creates only the outbox_test database
+	// (WithDatabase above). Create the payments_test database in the same
+	// instance — the cloud analogue of observability/postgres/init-payments.sql
+	// — and derive its DSN from the outbox one (same host/creds, different
+	// dbname).
+	if err := db.Exec("CREATE DATABASE payments_test").Error; err != nil {
+		log.Printf("create payments database: %v", err)
+		os.Exit(1)
+	}
+	paymentsDSN := strings.Replace(dsn, "/outbox_test?", "/payments_test?", 1)
+	suite.paymentsURI = paymentsDSN
+
+	paymentsDB, err := database.Connect(paymentsDSN, "")
+	if err != nil {
+		log.Printf("connect payments db: %v", err)
+		os.Exit(1)
+	}
+	suite.paymentsDB = paymentsDB
+
+	// Phase 5 Track 1: apply the same versioned migrations the real services
+	// rely on (via golang-migrate) against the ephemeral testcontainer
+	// databases, instead of AutoMigrate/MigrateTimescale — so the integration
+	// suite is also a regression test that the migration sets alone produce a
+	// working schema. Two sets now (the outbox/payments split), one per DB.
+	if err := applyMigrations(dsn, "outbox"); err != nil {
+		log.Printf("apply outbox migrations: %v", err)
+		os.Exit(1)
+	}
+	if err := applyMigrations(paymentsDSN, "payments"); err != nil {
+		log.Printf("apply payments migrations: %v", err)
 		os.Exit(1)
 	}
 
@@ -167,12 +198,18 @@ func TestMain(m *testing.M) {
 // for speed.
 func truncateAll(t *testing.T) {
 	t.Helper()
-	tables := []string{"outbox_messages"}
-	for _, method := range rmq.Methods {
-		tables = append(tables, "payments_"+strings.ToLower(method))
+	// outbox_messages lives in the outbox DB; the payments_<method>
+	// hypertables in the payments DB (the two-DB split) — truncate each in its
+	// own database.
+	if err := suite.db.Exec("TRUNCATE TABLE outbox_messages").Error; err != nil {
+		t.Fatalf("truncate outbox_messages: %v", err)
 	}
-	if err := suite.db.Exec("TRUNCATE TABLE " + strings.Join(tables, ", ")).Error; err != nil {
-		t.Fatalf("truncate tables: %v", err)
+	paymentsTables := make([]string, 0, len(rmq.Methods))
+	for _, method := range rmq.Methods {
+		paymentsTables = append(paymentsTables, "payments_"+strings.ToLower(method))
+	}
+	if err := suite.paymentsDB.Exec("TRUNCATE TABLE " + strings.Join(paymentsTables, ", ")).Error; err != nil {
+		t.Fatalf("truncate payments tables: %v", err)
 	}
 	for _, method := range rmq.Methods {
 		purgeQueue(t, rmq.QueueFor(method))
@@ -233,8 +270,9 @@ func amqpDial(t *testing.T) (*amqp.Connection, error) {
 // newConsumer wires a real AMQPConsumer + ProcessMessage against the shared
 // DB and AMQP connection, bound to method's queue.
 func newConsumer(method string, prefetch, maxDeliveries int) *messaging.AMQPConsumer {
-	paymentRepo := persistence.NewPaymentRepository(suite.db)
-	uow := persistence.NewUnitOfWork(suite.db)
+	// consumer-worker writes the payments DB (the two-DB split).
+	paymentRepo := persistence.NewPaymentRepository(suite.paymentsDB)
+	uow := persistence.NewUnitOfWork(suite.paymentsDB)
 	processMsg := consume.New(paymentRepo, uow)
 	return messaging.NewConsumer(suite.amqpConn, processMsg, method, prefetch, maxDeliveries, 0, 0)
 }
@@ -262,6 +300,6 @@ func countOutboxByStatus(status domain.OutboxStatus) int64 {
 
 func countPayments() int64 {
 	var n int64
-	suite.db.Model(&persistence.PaymentModel{}).Count(&n)
+	suite.paymentsDB.Model(&persistence.PaymentModel{}).Count(&n)
 	return n
 }

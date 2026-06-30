@@ -11,13 +11,19 @@ metadata:
     app: ingestion-api
     {{- include "transaction-outbox.labels" . | nindent 4 }}
 spec:
-  # No replicas field — the HPA (hpa.yaml, same canary.enabled condition as
-  # this Deployment) owns it exclusively from here on. Templating a value
-  # here makes every `helm upgrade` fight the HPA/KEDA controller for
-  # ownership of .spec.replicas via server-side apply ("conflict ... using
-  # apps/v1: .spec.replicas"), since whichever one wrote it last is the
-  # field manager. Omitting it lets Kubernetes default to 1 replica only on
-  # first creation; the HPA reconciles it immediately after.
+  {{- if .Values.ingestionApi.hpa.enabled }}
+  # No replicas field — the HPA (hpa.yaml, rendered under this same
+  # hpa.enabled condition) owns it exclusively. Templating a value here makes
+  # every `helm upgrade` fight the HPA for ownership of .spec.replicas via
+  # server-side apply ("conflict ... using apps/v1: .spec.replicas"), since
+  # whichever one wrote it last is the field manager. Omitting it lets
+  # Kubernetes default to 1 only on first creation; the HPA reconciles after.
+  {{- else }}
+  # HPA disabled (the default now) — ingestion-api runs at a fixed replica
+  # count, so this Deployment owns .spec.replicas directly. No HPA is rendered,
+  # so there's nothing to fight over the field.
+  replicas: {{ .Values.ingestionApi.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       app: ingestion-api
@@ -48,6 +54,8 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: transaction-outbox-secrets
+                  # outbox DB (the DATABASE_URL key) — ingestion-api only writes
+                  # outbox_messages. consumer-worker uses PAYMENTS_DATABASE_URL.
                   key: DATABASE_URL
             - name: RABBITMQ_URL
               valueFrom:

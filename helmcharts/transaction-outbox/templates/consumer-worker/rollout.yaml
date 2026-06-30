@@ -45,7 +45,8 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: transaction-outbox-secrets
-                  key: DATABASE_URL
+                  # payments DB — consumer-worker is the only writer of payments_*.
+                  key: PAYMENTS_DATABASE_URL
             - name: RABBITMQ_URL
               valueFrom:
                 secretKeyRef:

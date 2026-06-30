@@ -50,19 +50,27 @@ kubectl apply -f infra/kind/postgres-rabbitmq.yaml
 kubectl wait --for=condition=ready pod -l app=postgres --timeout=60s
 kubectl wait --for=condition=ready pod -l app=rabbitmq --timeout=60s
 
-# 5. Migrations — one-shot Job sourced from a ConfigMap (KIND has no
-#    host-path mount for this cluster, unlike compose's volume mount)
-kubectl create configmap migrations --from-file=migrations/
+# 5. Migrations — one-shot Job sourced from ConfigMaps (KIND has no host-path
+#    mount for this cluster, unlike compose's volume mount). Two-DB split: one
+#    ConfigMap per migration set (the sets have overlapping version numbers and
+#    golang-migrate tracks schema_migrations per database, so they can't share
+#    a path). The Job also CREATE-DATABASEs `payments` first — see
+#    infra/kind/migrate-job.yaml.
+kubectl create configmap migrations-outbox   --from-file=migrations/outbox/
+kubectl create configmap migrations-payments --from-file=migrations/payments/
 kubectl apply -f infra/kind/migrate-job.yaml
 kubectl wait --for=condition=complete job/migrate --timeout=60s
 
 # 6. Build the app images and load them straight into KIND's node (no
 #    registry push needed — `:kindtest` matches infra/kind/values-kind.yaml)
-podman build --build-arg SERVICE=ingestion-api  -t localhost/transaction-outbox-go/ingestion-api:kindtest  .
+podman build --build-arg SERVICE=ingestion-api   -t localhost/transaction-outbox-go/ingestion-api:kindtest   .
+podman build --build-arg SERVICE=outbox-worker   -t localhost/transaction-outbox-go/outbox-worker:kindtest   .
 podman build --build-arg SERVICE=consumer-worker -t localhost/transaction-outbox-go/consumer-worker:kindtest .
-podman save localhost/transaction-outbox-go/ingestion-api:kindtest  -o /tmp/ingestion-api.tar
+podman save localhost/transaction-outbox-go/ingestion-api:kindtest   -o /tmp/ingestion-api.tar
+podman save localhost/transaction-outbox-go/outbox-worker:kindtest   -o /tmp/outbox-worker.tar
 podman save localhost/transaction-outbox-go/consumer-worker:kindtest -o /tmp/consumer-worker.tar
-kind load image-archive /tmp/ingestion-api.tar  --name kind-cluster
+kind load image-archive /tmp/ingestion-api.tar   --name kind-cluster
+kind load image-archive /tmp/outbox-worker.tar   --name kind-cluster
 kind load image-archive /tmp/consumer-worker.tar --name kind-cluster
 
 # 7. Install the chart with the KIND overrides (KEDA-driven autoscaling,

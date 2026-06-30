@@ -1,0 +1,85 @@
+# The Transactional Outbox relay (DispatchOutbox), split out of ingestion-api
+# into its own Deployment so it scales on outbox backlog (its KEDA
+# ScaledObject, scaledobject.yaml) independently of the fixed-size HTTP front
+# door. Single Deployment (not per-method like consumer-worker) — it drains
+# every method's NEW/RETRYING rows from the one outbox table and fans them out
+# to the per-method queues it publishes to.
+#
+# Unlike ingestion-api/consumer-worker, this has no canary (Rollout) variant —
+# it's an internal relay with no request traffic to weight, so it renders the
+# same plain Deployment regardless of .Values.canary.enabled.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: outbox-worker
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: outbox-worker
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+spec:
+  # No replicas field — this Deployment's KEDA ScaledObject (scaledobject.yaml)
+  # owns .spec.replicas via the HPA it generates. Templating a value here makes
+  # every `helm upgrade` fight that HPA for ownership (server-side apply
+  # conflict). minReplicaCount is 1, so it never sits at 0.
+  selector:
+    matchLabels:
+      app: outbox-worker
+  template:
+    metadata:
+      labels:
+        app: outbox-worker
+    spec:
+      {{- with .Values.outboxWorker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: outbox-worker
+          # CI tags images by git SHA (Dockerfile ARG SERVICE=outbox-worker);
+          # the values.yaml default is a placeholder for local/manual use.
+          image: {{ .Values.image.outboxWorker }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.outboxWorker.metricsPort }}
+          envFrom:
+            - configMapRef:
+                name: transaction-outbox-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  # outbox DB (the DATABASE_URL key) — the relay only
+                  # reads/marks outbox_messages, same DB as ingestion-api.
+                  key: DATABASE_URL
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: RABBITMQ_URL
+            - name: METRICS_PORT
+              value: {{ .Values.outboxWorker.metricsPort | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: outbox-worker
+          resources:
+            {{- toYaml .Values.outboxWorker.resources | nindent 12 }}
+          # Like consumer-worker, the relay has no main HTTP server — only the
+          # Prometheus /metrics endpoint (internal/infrastructure/telemetry).
+          # startupProbe covers the initial DB + RabbitMQ connect; while it's
+          # failing, liveness/readiness aren't evaluated.
+          startupProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            failureThreshold: 30
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 10

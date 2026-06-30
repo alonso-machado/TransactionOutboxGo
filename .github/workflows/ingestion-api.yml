@@ -1,8 +1,8 @@
 name: CI - ingestion-api
 
-# Independent of consumer-worker.yml on purpose — see .github/workflows/README.md
-# for why this is two separate workflow files rather than one matrixed
-# workflow. Gate order: build -> lint -> unit-tests -> upload -> deploy.
+# Independent of the other microservices' workflows on purpose — see
+# .github/workflows/README.md for why each service gets its own workflow file
+# rather than one matrixed workflow. Gate order: build -> lint -> unit-tests -> upload -> deploy.
 # integration-tests is an optional, flag-gated safety measure off the gate
 # path — it never blocks upload/deploy.
 on:

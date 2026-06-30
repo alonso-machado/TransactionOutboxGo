@@ -2,6 +2,7 @@ namespace: transaction-outbox
 
 image:
   ingestionApi: transaction-outbox-go/ingestion-api:latest
+  outboxWorker: transaction-outbox-go/outbox-worker:latest
   consumerWorker: transaction-outbox-go/consumer-worker:latest
 
 # Non-sensitive configuration shared by ingestion-api and consumer-worker,
@@ -43,21 +44,28 @@ configMap:
     RABBITMQ_TLS: "false"
 
 # PLACEHOLDER — do NOT use these values in any real environment. Real
-# DATABASE_URL / RABBITMQ_URL are injected by CI/CD (GitHub Actions secrets,
-# HashiCorp Vault, Sealed Secrets, etc.) at deploy time via
-# `--set secret.databaseUrl=... --set secret.rabbitmqUrl=...` or a values
-# override file — never commit real connection strings here. Plaintext here;
-# templates/secret.yaml base64-encodes them.
+# connection strings are injected by CI/CD (GitHub Actions secrets, HashiCorp
+# Vault, Sealed Secrets, etc.) at deploy time via
+# `--set secret.databaseUrl=... --set secret.paymentsDatabaseUrl=... --set secret.rabbitmqUrl=...`
+# or a values override file — never commit real connection strings here.
+# Plaintext here; templates/secret.yaml base64-encodes them.
 #
-# Phase 5 Track 3.B convention: when pgbouncer.enabled is true,
-# secret.databaseUrl should point at the in-cluster PgBouncer Service
-# (postgres://<user>:<pass>@pgbouncer.{{ .Values.namespace }}.svc.cluster.local:6432/<db>)
-# instead of RDS directly — pgbouncer.upstreamHost/.upstreamPort below is
-# where the *real* Postgres/RDS endpoint goes, kept separate from the app's
-# own DATABASE_URL so PgBouncer is genuinely in front of, not bypassed by,
-# every consumer/ingestion-api connection.
+# Two-DB split: databaseUrl is the `outbox` database (outbox_messages), used by
+# ingestion-api and outbox-worker; paymentsDatabaseUrl is the `payments`
+# database (payments_* hypertables), used by consumer-worker. Same Postgres/RDS
+# instance, two logical databases. (databaseUrl keeps its original name — the
+# outbox side is the pre-split default — so only the payments URL is additive.)
+#
+# Phase 5 Track 3.B convention: when pgbouncer.enabled is true, both URLs
+# should point at the in-cluster PgBouncer Service
+# (postgres://<user>:<pass>@pgbouncer.{{ .Values.namespace }}.svc.cluster.local:6432/<db>,
+# with <db> being `outbox` or `payments`) instead of RDS directly —
+# pgbouncer.upstreamHost/.upstreamPort below is where the *real* Postgres/RDS
+# endpoint goes, kept separate from the apps' own DATABASE_URL so PgBouncer is
+# genuinely in front of, not bypassed by, every connection.
 secret:
   databaseUrl: "CHANGE_ME"
+  paymentsDatabaseUrl: "CHANGE_ME"
   rabbitmqUrl: "CHANGE_ME"
 
 # External Secrets Operator (Phase 5 Track 5.A). False by default — local/
@@ -72,6 +80,7 @@ externalSecrets:
   enabled: false
   region: "us-east-1"
   databaseSecretName: "transaction-outbox/dev/database-url"
+  paymentsDatabaseSecretName: "transaction-outbox/dev/payments-database-url"
   rabbitmqSecretName: "transaction-outbox/dev/rabbitmq-url"
 
 # Phase 5 Track 3.B/3.C — PgBouncer (transaction-pooling mode) + its
@@ -166,6 +175,14 @@ ingestionApi:
       cpu: "500m"
       memory: "256Mi"
   hpa:
+    # Off by default — ingestion-api now runs at a fixed replica count
+    # (ingestionApi.replicas, default 1). It's a thin, broker-independent
+    # write path in front of the outbox; the autoscaling workload is
+    # outbox-worker (KEDA, on outbox backlog) and consumer-worker (KEDA, on
+    # queue depth), not this. Flip to true to restore CPU/memory HPA using the
+    # thresholds below — when false, the Deployment owns .spec.replicas and the
+    # HorizontalPodAutoscaler isn't rendered (templates/ingestion-api/hpa.yaml).
+    enabled: false
     minReplicas: 1
     # Measured under 200 VUs / ~667 req/s sustained (loadtest/README.md
     # 6.2): ingestion-api never needed more than 4 replicas before CPU
@@ -179,6 +196,38 @@ ingestionApi:
     # 0 — scale up on the very next HPA sync, no waiting. 30 — hold a scale-up
     # for at least this long before scaling back down, so a load spike that
     # drains in a few seconds doesn't immediately give the replica back.
+    scaleUpStabilizationSeconds: 0
+    scaleDownStabilizationSeconds: 30
+
+# The Transactional Outbox relay, split out of ingestion-api into its own
+# Deployment + KEDA ScaledObject (templates/outbox-worker/). Scales on outbox
+# backlog (NEW/RETRYING row count) via KEDA's postgresql scaler, with a floor
+# of 1 so the LISTEN/NOTIFY fast path stays warm and the hourly prune / backlog
+# metrics always have a live pod.
+outboxWorker:
+  # Empty by default — the cloud target can pin these pods to the same
+  # ingestion-side node group as ingestion-api (both touch the outbox DB only).
+  nodeSelector: {}
+  metricsPort: 9090
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  keda:
+    # 1, not 0 (unlike consumer-worker): keeps the LISTEN/NOTIFY connection
+    # live so an enqueue publishes in single-digit ms instead of waiting for
+    # KEDA to spin a pod, and keeps the prune/metrics tickers running.
+    minReplicaCount: 1
+    maxReplicaCount: 10
+    pollingInterval: 15 # seconds between outbox-backlog checks
+    cooldownPeriod: 60
+    # 1 replica per this many NEW/RETRYING rows. Multiple replicas are safe:
+    # OutboxRepository.FetchPending uses FOR UPDATE SKIP LOCKED, so they never
+    # double-publish a row.
+    targetQueryValue: "100"
     scaleUpStabilizationSeconds: 0
     scaleDownStabilizationSeconds: 30
 

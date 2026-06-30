@@ -6,6 +6,7 @@
 # Service names only resolve within the same namespace).
 image:
   ingestionApi: localhost/transaction-outbox-go/ingestion-api:kindtest
+  outboxWorker: localhost/transaction-outbox-go/outbox-worker:kindtest
   consumerWorker: localhost/transaction-outbox-go/consumer-worker:kindtest
 
 configMap:
@@ -30,20 +31,26 @@ configMap:
     # outbox->RabbitMQ publish well below what a 100-VU unrestricted hammer
     # sustains (measured this session). 100ms here (chart/code default is
     # now 250ms) pushes the dispatch ceiling higher still for this test,
-    # on top of the idx_outbox_messages_pending_created_at index fix
-    # (migrations/000005) that removed FetchPending's disk-sort cost.
+    # on top of the idx_outbox_messages_pending_created_at index
+    # (migrations/outbox/000001_init) that removed FetchPending's disk-sort cost.
     OUTBOX_DISPATCH_BATCH_SIZE: "200"
     OUTBOX_DISPATCH_INTERVAL_MS: "100"
 
 secret:
+  # Two-DB split: outbox DB for ingestion-api/outbox-worker, payments DB for
+  # consumer-worker — both on the same in-cluster Postgres, different dbname.
   databaseUrl: "postgres://outbox:outbox@postgres.default.svc.cluster.local:5432/outbox?sslmode=disable"
+  paymentsDatabaseUrl: "postgres://outbox:outbox@postgres.default.svc.cluster.local:5432/payments?sslmode=disable"
   rabbitmqUrl: "amqp://guest:guest@rabbitmq.default.svc.cluster.local:5672/"
 
 ingestionApi:
-  # No `replicas:` override anymore — the HPA below owns that field
-  # exclusively (templates/ingestion-api/deployment.yaml no longer
-  # templates it, see that file's comment) and a value here would just be
-  # silently ignored.
+  # The load test exists to drive ingestion-api's autoscaling, so re-enable
+  # the HPA here — the chart default is now hpa.enabled:false (fixed 1
+  # replica). With it true, the HPA owns .spec.replicas exclusively
+  # (templates/ingestion-api/deployment.yaml omits the field), so no
+  # `replicas:` override belongs here.
+  hpa:
+    enabled: true
   resources:
     requests:
       cpu: "250m"

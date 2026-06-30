@@ -31,11 +31,12 @@ type stackConfig struct {
 	dbInstanceClass      string
 	dbMultiAz            bool
 	rabbitmqInstanceType string
-	// Two separate keys, NOT one shared `imageTag` — Track 3 runs two
-	// independent CI pipelines (ingestion-api.yml, consumer-worker.yml),
-	// each deploying only its own service. A single shared key would mean
-	// either pipeline's `pulumi up` redeploys BOTH services' pods.
+	// One key per service, NOT a single shared `imageTag` — each service has
+	// its own independent CI pipeline (ingestion-api.yml, outbox-worker.yml,
+	// consumer-worker.yml) deploying only its own image. A single shared key
+	// would mean any pipeline's `pulumi up` redeploys ALL services' pods.
 	imageTagIngestionApi   string
+	imageTagOutboxWorker   string
 	imageTagConsumerWorker string
 	dbPassword             pulumi.StringOutput
 	rabbitmqPassword       pulumi.StringOutput
@@ -67,6 +68,7 @@ func loadConfig(ctx *pulumi.Context) *stackConfig {
 		dbMultiAz:              c.GetBool("dbMultiAz"),
 		rabbitmqInstanceType:   c.Get("rabbitmqInstanceType"),
 		imageTagIngestionApi:   c.Get("imageTagIngestionApi"),
+		imageTagOutboxWorker:   c.Get("imageTagOutboxWorker"),
 		imageTagConsumerWorker: c.Get("imageTagConsumerWorker"),
 		dbPassword:             c.RequireSecret("dbPassword"),
 		rabbitmqPassword:       c.RequireSecret("rabbitmqPassword"),

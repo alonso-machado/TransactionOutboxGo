@@ -12,10 +12,26 @@ Payments domain:
   `/api/v1/payments`, stores them durably in Postgres (outbox table only —
   it never writes to the `payments` table directly), pre-generates the
   Payment UUID and embeds the full payment data in the outbox payload,
-  relays to RabbitMQ via a background goroutine, returns `201 Created`.
+  returns `201 Created`. It does **not** talk to RabbitMQ at all (so it keeps
+  accepting writes even when the broker is down) and runs at a **fixed 1
+  replica** — it's a thin write path in front of the outbox.
+- **`outbox-worker`** — the Transactional Outbox relay (`DispatchOutbox`),
+  **its own process** (not a goroutine in ingestion-api). The only reader of
+  the outbox table and the only RabbitMQ publisher: poll (+ LISTEN/NOTIFY
+  fast path) → dedup → publish with confirms → mark `PUBLISHED`/`RETRYING`/
+  `DEAD_LETTER`, with exponential backoff + DLQ. Scales on outbox backlog via
+  KEDA (postgresql scaler), **min 1 replica** (keeps the NOTIFY path warm and
+  the prune/metrics tickers alive).
 - **`consumer-worker`** — consumes from RabbitMQ and is the **only writer**
   of the `payments` table; dedupes via a `UNIQUE` constraint on the
-  `payments.source_message_id` column (no separate inbox table).
+  `payments.source_message_id` column (no separate inbox table). Scales on
+  queue depth via KEDA (min 0).
+
+**Two databases, one Postgres instance:** ingestion-api + outbox-worker use the
+`outbox` database (`outbox_messages`); consumer-worker uses the `payments`
+database (`payments_*` hypertables). No transaction spans the two, so the
+transactional-outbox guarantee (atomic outbox insert) is preserved. Each
+process keeps a single `DATABASE_URL` pointed at its own database.
 
 Full design (Phase 1 — core system): [`.claude/plan.md`](.claude/plan.md)
 Phase 2 plan (OTel · Swagger · TestContainers · K8s+KEDA): [`.claude/plan-phase2.md`](.claude/plan-phase2.md)
@@ -59,8 +75,10 @@ interfaces.
 | `Config` struct (envconfig) | `internal/infrastructure/config/` |
 | DB connection bootstrap + AutoMigrate | `internal/infrastructure/database/` |
 | RabbitMQ connection + topology declaration | `internal/infrastructure/rabbitmq/` |
-| Composition root / DI (ingestion-api) | `cmd/ingestion-api/main.go` |
+| Composition root / DI (ingestion-api — HTTP + rate limit, writes outbox) | `cmd/ingestion-api/main.go` |
+| Composition root / DI (outbox-worker — `DispatchOutbox` relay + LISTEN/NOTIFY) | `cmd/outbox-worker/main.go` |
 | Composition root / DI (consumer-worker) | `cmd/consumer-worker/main.go` |
+| Versioned migrations, split per database | `migrations/outbox/`, `migrations/payments/` |
 | Docker Compose (local dev) | `docker-compose.yml` |
 | Multi-stage Dockerfile (ARG SERVICE) | `Dockerfile` |
 | Helm chart (one Deployment/Rollout + ScaledObject per payment method, templated; `canary.enabled` switches Deployment+HPA ↔ Argo Rollout+AnalysisTemplate) | `helmcharts/transaction-outbox/` |
@@ -130,9 +148,13 @@ interfaces.
 - **Outbox status state machine:** `NEW` → `PUBLISHED`, `NEW` → `RETRYING`,
   `RETRYING` → `PUBLISHED`, `RETRYING` → `DEAD_LETTER` (after max retries).
 - **`DispatchOutbox`** (`usecase/outbox`) is the Transactional Outbox core: it runs
-  as a goroutine started from `cmd/ingestion-api/main.go`, sharing the DB pool and
-  RabbitMQ connection with the HTTP server. Use `context.Context` for graceful
-  shutdown. Use `FOR UPDATE SKIP LOCKED` so multiple replicas never double-publish.
+  as the **`outbox-worker` process** (`cmd/outbox-worker/main.go`), which owns the
+  outbox DB connection, the RabbitMQ publisher, and topology declaration. Use
+  `context.Context` for graceful shutdown. Use `FOR UPDATE SKIP LOCKED` so
+  multiple replicas (KEDA can scale it past 1 under backlog) never
+  double-publish. The use-case itself is unchanged by the split — it still
+  receives a `<-chan struct{}` trigger from the `database.Listener` wired in
+  by `cmd/outbox-worker/main.go`.
 - **Publisher confirms** must be enabled on the `DispatchOutbox` AMQP channel. Never
   mark a row `PUBLISHED` before the confirm ACK arrives.
 - **Manual ack + prefetch** on the consumer. Only call `msg.Ack()` after the DB
@@ -218,8 +240,15 @@ rationale.
 - Do **not** put GORM struct tags on domain entities.
 - Do **not** ACK a RabbitMQ message before the DB transaction commits.
 - Do **not** mark an outbox row `PUBLISHED` before receiving a publisher confirm.
-- Do **not** add a third binary — `DispatchOutbox` is a goroutine inside
-  `ingestion-api`, not a separate process.
+- Do **not** fold `DispatchOutbox` back into `ingestion-api`. It is its own
+  binary, `outbox-worker` (`cmd/outbox-worker/main.go`), so it scales on outbox
+  backlog independently and ingestion-api stays broker-independent. (This
+  reverses the earlier "no third binary" rule.) There are now **three**
+  service binaries plus the `outbox-admin` CLI.
+- Do **not** point a service at the wrong database. ingestion-api and
+  outbox-worker → `outbox` DB; consumer-worker → `payments` DB. New
+  outbox-related migrations go in `migrations/outbox/`, payments ones in
+  `migrations/payments/`.
 - Do **not** use `AutoMigrate` in tests — use a test transaction rollback or a
   dedicated test schema.
 - Do **not** run `git commit` or `git push` in this repo, ever, even if asked

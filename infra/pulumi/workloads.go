@@ -44,11 +44,15 @@ func installWorkloads(ctx *pulumi.Context, cfg *stackConfig, cluster *clusterSta
 			"namespace": pulumi.String("transaction-outbox"),
 			"image": pulumi.Map{
 				"ingestionApi":   imageFor("ingestion-api", cfg.imageTagIngestionApi),
+				"outboxWorker":   imageFor("outbox-worker", cfg.imageTagOutboxWorker),
 				"consumerWorker": imageFor("consumer-worker", cfg.imageTagConsumerWorker),
 			},
 			"secret": pulumi.Map{
-				"databaseUrl": data.databaseURL,
-				"rabbitmqUrl": data.rabbitmqURL,
+				// Two-DB split: databaseUrl = outbox DB (ingestion-api +
+				// outbox-worker), paymentsDatabaseUrl = payments DB (consumer).
+				"databaseUrl":         data.databaseURL,
+				"paymentsDatabaseUrl": data.paymentsDatabaseURL,
+				"rabbitmqUrl":         data.rabbitmqURL,
 			},
 			// Phase 5 Track 5.A: cloud sources DATABASE_URL/RABBITMQ_URL from
 			// AWS Secrets Manager via ESO's ExternalSecret CRs (templates/
@@ -56,10 +60,11 @@ func installWorkloads(ctx *pulumi.Context, cfg *stackConfig, cluster *clusterSta
 			// from "secret" above. Local/compose (values.yaml's default,
 			// externalSecrets.enabled: false) keeps the static Secret.
 			"externalSecrets": pulumi.Map{
-				"enabled":            pulumi.Bool(true),
-				"region":             pulumi.String(cfg.awsRegion),
-				"databaseSecretName": pulumi.String(data.dbSecretName),
-				"rabbitmqSecretName": pulumi.String(data.rabbitmqSecretName),
+				"enabled":                    pulumi.Bool(true),
+				"region":                     pulumi.String(cfg.awsRegion),
+				"databaseSecretName":         pulumi.String(data.dbSecretName),
+				"paymentsDatabaseSecretName": pulumi.String(data.paymentsDBSecretName),
+				"rabbitmqSecretName":         pulumi.String(data.rabbitmqSecretName),
 			},
 			// Phase 4 Track 4: Argo Rollouts controller is installed
 			// (main.go) — render Rollout/AnalysisTemplate instead of plain
