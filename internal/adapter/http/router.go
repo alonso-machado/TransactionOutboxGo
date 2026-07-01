@@ -33,7 +33,7 @@ func healthz(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
-func NewRouter(paymentHandler *PaymentHandler, serviceName string, swaggerEnabled bool, rl RouterConfig) *gin.Engine {
+func NewRouter(paymentHandler *PaymentHandler, ticketHandler *TicketHandler, serviceName string, swaggerEnabled bool, rl RouterConfig) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(gin.Logger())
@@ -53,6 +53,7 @@ func NewRouter(paymentHandler *PaymentHandler, serviceName string, swaggerEnable
 		v1.POST("/payments", paymentHandler.Handle)
 		v1.PUT("/payments/:id", paymentHandler.Handle)
 		v1.PATCH("/payments/:id", paymentHandler.Handle)
+		v1.POST("/ticket", ticketHandler.Handle)
 	}
 
 	if swaggerEnabled {

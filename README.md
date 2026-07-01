@@ -231,7 +231,10 @@ import it, the same way any layer may import `domain/pii`.
   and `/healthz`. Pre-generates the Payment UUID, computes the idempotency key from
   the business fields, writes **only** to the outbox table (in the `outbox`
   database) inside a transaction (status `NEW`), returns `201 Created`. Runs at a
-  fixed 1 replica and does **not** connect to RabbitMQ.
+  fixed 1 replica and does **not** connect to RabbitMQ. Also serves
+  **`POST /api/v1/ticket`**, landing a ticket-order event in a separate
+  `ticket_outbox` table (idempotent on the order's `event_id`) for a future
+  ticket-processing microservice to consume — no relay exists yet.
 - **`outbox-worker`** — the Transactional Outbox core, its own process: polls
   `NEW`/`RETRYING` rows (deduped via `FOR UPDATE SKIP LOCKED`, plus a
   LISTEN/NOTIFY fast path), publishes to RabbitMQ with publisher confirms, marks
@@ -244,8 +247,8 @@ import it, the same way any layer may import `domain/pii`.
   (`ON CONFLICT DO NOTHING`), so a redelivered message is a safe no-op. No
   separate inbox table.
 - **PostgreSQL** — one instance, two logical databases: `outbox`
-  (`outbox_messages`) and `payments` (`payments_*` hypertables + the `payments`
-  view).
+  (`outbox_messages` + `ticket_outbox`) and `payments` (`payments_*`
+  hypertables + the `payments` view).
 - **RabbitMQ** — durable topic exchange (`payments.exchange`) + quorum queue
   (`payments.queue`) + dead-letter queue (`payments.dlq`).
 - **`outbox-admin`** — a one-shot maintenance CLI, **not** a long-running

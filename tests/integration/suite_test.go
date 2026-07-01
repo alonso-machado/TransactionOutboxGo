@@ -21,6 +21,7 @@ import (
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/consume"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ingest"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/outbox"
+	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ticket"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
@@ -201,8 +202,8 @@ func truncateAll(t *testing.T) {
 	// outbox_messages lives in the outbox DB; the payments_<method>
 	// hypertables in the payments DB (the two-DB split) — truncate each in its
 	// own database.
-	if err := suite.db.Exec("TRUNCATE TABLE outbox_messages").Error; err != nil {
-		t.Fatalf("truncate outbox_messages: %v", err)
+	if err := suite.db.Exec("TRUNCATE TABLE outbox_messages, ticket_outbox").Error; err != nil {
+		t.Fatalf("truncate outbox tables: %v", err)
 	}
 	paymentsTables := make([]string, 0, len(rmq.Methods))
 	for _, method := range rmq.Methods {
@@ -240,7 +241,16 @@ func newIngest() *ingest.IngestPayment {
 // against the shared DB, mirroring cmd/ingestion-api/main.go's DI.
 func newRouter() *gin.Engine {
 	h := handler.NewPaymentHandler(newIngest())
-	return handler.NewRouter(h, "ingestion-api-test", false, handler.RouterConfig{})
+	th := handler.NewTicketHandler(newTicketIngest())
+	return handler.NewRouter(h, th, "ingestion-api-test", false, handler.RouterConfig{})
+}
+
+// newTicketIngest wires an IngestTicket use case against the shared outbox DB
+// (ticket_outbox lives in the same database as outbox_messages).
+func newTicketIngest() *ticket.IngestTicket {
+	ticketRepo := persistence.NewTicketOutboxRepository(suite.db)
+	uow := persistence.NewUnitOfWork(suite.db)
+	return ticket.New(ticketRepo, uow)
 }
 
 // newDispatch wires a DispatchOutbox use case against the shared DB and a
@@ -301,5 +311,11 @@ func countOutboxByStatus(status domain.OutboxStatus) int64 {
 func countPayments() int64 {
 	var n int64
 	suite.paymentsDB.Model(&persistence.PaymentModel{}).Count(&n)
+	return n
+}
+
+func countTicketOutbox() int64 {
+	var n int64
+	suite.db.Model(&persistence.TicketOutboxModel{}).Count(&n)
 	return n
 }

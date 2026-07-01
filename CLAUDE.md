@@ -14,7 +14,10 @@ Payments domain:
   Payment UUID and embeds the full payment data in the outbox payload,
   returns `201 Created`. It does **not** talk to RabbitMQ at all (so it keeps
   accepting writes even when the broker is down) and runs at a **fixed 1
-  replica** — it's a thin write path in front of the outbox.
+  replica** — it's a thin write path in front of the outbox. It also serves
+  **`POST /api/v1/ticket`**, which lands a ticket-order event in a separate
+  **`ticket_outbox`** table (idempotent on the order's `event_id`); a future
+  ticket-processing microservice will consume it — there's no relay yet.
 - **`outbox-worker`** — the Transactional Outbox relay (`DispatchOutbox`),
   **its own process** (not a goroutine in ingestion-api). The only reader of
   the outbox table and the only RabbitMQ publisher: poll (+ LISTEN/NOTIFY
@@ -28,8 +31,8 @@ Payments domain:
   queue depth via KEDA (min 0).
 
 **Two databases, one Postgres instance:** ingestion-api + outbox-worker use the
-`outbox` database (`outbox_messages`); consumer-worker uses the `payments`
-database (`payments_*` hypertables). No transaction spans the two, so the
+`outbox` database (`outbox_messages` + `ticket_outbox`); consumer-worker uses the
+`payments` database (`payments_*` hypertables). No transaction spans the two, so the
 transactional-outbox guarantee (atomic outbox insert) is preserved. Each
 process keeps a single `DATABASE_URL` pointed at its own database.
 
@@ -38,6 +41,7 @@ Phase 2 plan (OTel · Swagger · TestContainers · K8s+KEDA): [`.claude/plan-pha
 Phase 3 plan (per-method queues · card payments · CI/CD · Pulumi/AWS · k6): [`.claude/plan-phase3.md`](.claude/plan-phase3.md)
 Phase 4 plan (leaky-bucket rate limiter · canary deploys · Grafana · TimescaleDB): [`.claude/plan-phase4.md`](.claude/plan-phase4.md)
 Phase 5 plan (versioned migrations · retry backoff · DLQ replay · LISTEN/NOTIFY · connection pooling · Loki/Tempo/alerting · External Secrets · PCI/DR): [`.claude/plan-phase5.md`](.claude/plan-phase5.md)
+Phase 6 plan — **planned, not yet implemented** (ticket_outbox relay · `ticket-consumer-worker` microservice · `tickets` DB · QR/validation): [`.claude/plan-phase6.md`](.claude/plan-phase6.md)
 User-facing docs: [`README.md`](README.md)
 
 ---
@@ -49,7 +53,7 @@ User-facing docs: [`README.md`](README.md)
 ```
 infrastructure  (Gin · GORM · amqp091 · Postgres · config · main / DI)
   └── adapter   (http handlers/DTOs · GORM repos · RabbitMQ pub/consumer)
-        └── usecase   (IngestPayment · DispatchOutbox · ProcessMessage)
+        └── usecase   (IngestPayment · IngestTicket · DispatchOutbox · ProcessMessage)
               └── domain   (entities + port interfaces) ← ZERO external imports
 ```
 
@@ -64,9 +68,10 @@ interfaces.
 
 | What | Path |
 |---|---|
-| Entities (`OutboxMessage`, `Payment`) | `internal/domain/` |
-| Port interfaces (`OutboxRepository`, `PaymentRepository`, `Publisher`, `UnitOfWork`) | `internal/domain/` |
+| Entities (`OutboxMessage`, `Payment`, `TicketOutboxMessage`) | `internal/domain/` |
+| Port interfaces (`OutboxRepository`, `PaymentRepository`, `TicketOutboxRepository`, `Publisher`, `UnitOfWork`) | `internal/domain/` |
 | `IngestPayment` use-case | `internal/usecase/ingest/` |
+| `IngestTicket` use-case (POST /api/v1/ticket → `ticket_outbox`) | `internal/usecase/ticket/` |
 | `DispatchOutbox` use-case — Transactional Outbox core (poll → dedup → publish → mark) | `internal/usecase/outbox/` |
 | `ProcessMessage` use-case (parses payload, persists via `PaymentRepository`; dedup is the `payments.source_message_id` UNIQUE constraint) | `internal/usecase/consume/` |
 | Gin router, handlers, DTOs, middleware | `internal/adapter/http/` |
@@ -81,7 +86,7 @@ interfaces.
 | Versioned migrations, split per database | `migrations/outbox/`, `migrations/payments/` |
 | Docker Compose (local dev) | `docker-compose.yml` |
 | Multi-stage Dockerfile (ARG SERVICE) | `Dockerfile` |
-| Helm chart (one Deployment/Rollout + ScaledObject per payment method, templated; `canary.enabled` switches Deployment+HPA ↔ Argo Rollout+AnalysisTemplate) | `helmcharts/transaction-outbox/` |
+| Helm chart (fixed-replica `ingestion-api` — `ingestionApi.hpa.enabled` opts into an HPA; one `outbox-worker` Deployment + KEDA postgresql ScaledObject; one consumer Deployment/Rollout + ScaledObject per payment method; `canary.enabled` switches Deployment+HPA ↔ Argo Rollout+AnalysisTemplate) | `helmcharts/transaction-outbox/` |
 | Pulumi (AWS: EKS, RDS, Amazon MQ, ECR, KEDA, Argo Rollouts, AWS Load Balancer Controller — installs the Helm chart) | `infra/pulumi/` |
 | Rate limiter (leaky-bucket IP throttle, ingestion-api only) | `internal/adapter/http/ratelimit/` |
 | Prometheus/Grafana provisioning (dashboards, datasource, postgres-exporter queries) | `observability/` |
@@ -184,7 +189,8 @@ make test     # go test -race ./...
 make tidy     # go mod tidy
 make lint     # golangci-lint run ./...  (golangci/golangci-lint:latest image)
 
-# Podman Compose — starts Postgres + RabbitMQ + both services
+# Podman Compose — starts Postgres + RabbitMQ + the app services
+# (ingestion-api, outbox-worker, and the per-method consumer-worker set)
 make up       # podman compose up --build -d
 make logs     # tail logs from all services
 make down     # podman compose down -v (removes volumes)
@@ -207,13 +213,15 @@ done. Key rules enforced:
 
 ## CI/CD (GitHub Actions)
 
-**One workflow per microservice, not one shared pipeline** —
-[`.github/workflows/ingestion-api.yml`](.github/workflows/ingestion-api.yml) and
+**One workflow per microservice, not one shared pipeline** — three now:
+[`.github/workflows/ingestion-api.yml`](.github/workflows/ingestion-api.yml),
+[`outbox-worker.yml`](.github/workflows/outbox-worker.yml), and
 [`consumer-worker.yml`](.github/workflows/consumer-worker.yml). Each is
 triggered only by changes to its own `cmd/<service>/**` path (plus shared
 `internal/**`/`go.mod`/`go.sum`/`Dockerfile`), so a change scoped to one
-service never triggers, gates, or redeploys the other. Both follow the same
-gate order:
+service never triggers, gates, or redeploys the others, and each `deploy`
+sets only its own `imageTag<Service>` Pulumi config key. All three follow the
+same gate order:
 
 ```
 build → lint (golangci-lint + actionlint + helm lint, GATE) → unit-tests (GATE) → upload (ECR) → deploy (pulumi up)

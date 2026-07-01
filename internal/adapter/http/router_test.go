@@ -1,4 +1,4 @@
-package handler
+﻿package handler
 
 import (
 	"net/http"
@@ -11,7 +11,7 @@ import (
 
 func TestRouter_Healthz_NeverRateLimited(t *testing.T) {
 	store := ratelimit.NewInMemoryStore(time.Minute)
-	r := NewRouter(NewPaymentHandler(nil), "test", false, RouterConfig{
+	r := NewRouter(NewPaymentHandler(nil), NewTicketHandler(nil), "test", false, RouterConfig{
 		RateLimitEnabled: true,
 		RateLimitStore:   store,
 		RateLimitRate:    1,
@@ -30,7 +30,7 @@ func TestRouter_Healthz_NeverRateLimited(t *testing.T) {
 
 func TestRouter_RateLimit_429AfterBurstWithHeaders(t *testing.T) {
 	store := ratelimit.NewInMemoryStore(time.Minute)
-	r := NewRouter(NewPaymentHandler(nil), "test", false, RouterConfig{
+	r := NewRouter(NewPaymentHandler(nil), NewTicketHandler(nil), "test", false, RouterConfig{
 		RateLimitEnabled: true,
 		RateLimitStore:   store,
 		RateLimitRate:    1,
@@ -64,7 +64,7 @@ func TestRouter_RateLimit_429AfterBurstWithHeaders(t *testing.T) {
 
 func TestRouter_RateLimit_PerIPIsolation(t *testing.T) {
 	store := ratelimit.NewInMemoryStore(time.Minute)
-	r := NewRouter(NewPaymentHandler(nil), "test", false, RouterConfig{
+	r := NewRouter(NewPaymentHandler(nil), NewTicketHandler(nil), "test", false, RouterConfig{
 		RateLimitEnabled: true,
 		RateLimitStore:   store,
 		RateLimitRate:    1,
@@ -92,7 +92,7 @@ func TestRouter_RateLimit_PerIPIsolation(t *testing.T) {
 
 func TestRouter_RateLimit_SpoofedXFFIgnoredWithoutTrustedProxies(t *testing.T) {
 	store := ratelimit.NewInMemoryStore(time.Minute)
-	r := NewRouter(NewPaymentHandler(nil), "test", false, RouterConfig{
+	r := NewRouter(NewPaymentHandler(nil), NewTicketHandler(nil), "test", false, RouterConfig{
 		TrustedProxies:   nil, // no proxies trusted -> c.ClientIP() must use RemoteAddr, not XFF
 		RateLimitEnabled: true,
 		RateLimitStore:   store,
@@ -114,7 +114,7 @@ func TestRouter_RateLimit_SpoofedXFFIgnoredWithoutTrustedProxies(t *testing.T) {
 	if w := post("10.0.0.1", ""); w.Code == http.StatusTooManyRequests {
 		t.Fatalf("expected first request to be admitted")
 	}
-	// Same RemoteAddr, spoofed XFF claiming to be a different IP — with no
+	// Same RemoteAddr, spoofed XFF claiming to be a different IP â€” with no
 	// trusted proxies configured, this must still be bucketed as 10.0.0.1
 	// and therefore rejected, not treated as a fresh IP.
 	if w := post("10.0.0.1", "1.2.3.4"); w.Code != http.StatusTooManyRequests {
@@ -123,7 +123,7 @@ func TestRouter_RateLimit_SpoofedXFFIgnoredWithoutTrustedProxies(t *testing.T) {
 }
 
 func TestRouter_RateLimit_Disabled_NeverRejects(t *testing.T) {
-	r := NewRouter(NewPaymentHandler(nil), "test", false, RouterConfig{
+	r := NewRouter(NewPaymentHandler(nil), NewTicketHandler(nil), "test", false, RouterConfig{
 		RateLimitEnabled: false,
 	})
 

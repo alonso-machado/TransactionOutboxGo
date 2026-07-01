@@ -24,6 +24,7 @@ import (
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/logging"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/telemetry"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ingest"
+	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ticket"
 )
 
 func main() {
@@ -71,14 +72,17 @@ func main() {
 
 	uow := persistence.NewUnitOfWork(db)
 	outboxRepo := persistence.NewOutboxRepository(db, cfg.RetryBackoffBase, cfg.RetryBackoffCap)
+	ticketRepo := persistence.NewTicketOutboxRepository(db)
 
 	ingestUC := ingest.New(outboxRepo, uow)
+	ingestTicketUC := ticket.New(ticketRepo, uow)
 
 	paymentHandler := handler.NewPaymentHandler(ingestUC)
+	ticketHandler := handler.NewTicketHandler(ingestTicketUC)
 
 	rateLimitStore := ratelimit.NewInMemoryStore(10 * time.Minute)
 
-	router := handler.NewRouter(paymentHandler, cfg.OtelServiceName, cfg.SwaggerEnabled, handler.RouterConfig{
+	router := handler.NewRouter(paymentHandler, ticketHandler, cfg.OtelServiceName, cfg.SwaggerEnabled, handler.RouterConfig{
 		TrustedProxies:   cfg.TrustedProxies,
 		RateLimitEnabled: cfg.RateLimitEnabled,
 		RateLimitStore:   rateLimitStore,

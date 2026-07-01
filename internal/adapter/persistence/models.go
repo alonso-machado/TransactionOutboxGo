@@ -25,6 +25,21 @@ type OutboxMessageModel struct {
 
 func (OutboxMessageModel) TableName() string { return "outbox_messages" }
 
+// TicketOutboxModel is the ticket_outbox table — the landing table for POST
+// /api/v1/ticket. Lives in the same `outbox` database as OutboxMessageModel
+// (ingestion-api's DB); a future ticket-processing microservice reads it.
+type TicketOutboxModel struct {
+	ID             uuid.UUID `gorm:"type:uuid;primaryKey"`
+	IdempotencyKey string    `gorm:"uniqueIndex;not null"`
+	EventID        string    `gorm:"index;not null"`
+	Payload        []byte    `gorm:"type:jsonb;not null"`
+	Status         string    `gorm:"index;default:NEW"`
+	CreatedAt      time.Time
+	ProcessedAt    *time.Time `gorm:"column:processed_at"`
+}
+
+func (TicketOutboxModel) TableName() string { return "ticket_outbox" }
+
 type PaymentModel struct {
 	ID                uuid.UUID `gorm:"type:uuid;primaryKey"`
 	SourceMessageID   string    `gorm:"uniqueIndex;not null"`
