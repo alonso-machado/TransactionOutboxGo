@@ -8,22 +8,82 @@ import (
 )
 
 const (
-	Exchange = "payments.exchange"
-	DLX      = "payments.dlx"
+	Exchange = "tickets.exchange"
+	DLX      = "tickets.dlx"
 )
 
-// Methods is the canonical list of payment methods that have a dedicated
-// queue. ValidateMethod (adapter/http) rejects any payment.method not in
-// this list with a 400 — a method without a bound queue would be a topic
-// exchange black hole (published, matched by no binding, silently dropped).
-var Methods = []string{"PIX", "BOLETO", "TRANSFER", "CARTAO_CREDITO", "CARTAO_DEBITO"}
+// Stream distinguishes the two message flows that both route by
+// (EventType, EventSubtype): order intake (ingestion-api ->
+// order-consumer-worker) and payment-gateway webhook confirmations
+// (ingestion-api -> fulfillment-consumer-worker). QueuePrefix names the
+// queue/DLQ/retry-queue; RoutingPrefix names
+// the topic-exchange routing key. Kept distinct (rather than one flat name)
+// so a queue like "events.concert.rock.queue" and a routing key like
+// "order.concert.rock" both read naturally.
+type Stream struct {
+	QueuePrefix   string
+	RoutingPrefix string
+}
+
+var (
+	// OrderStream carries ticket orders from ingestion-api's
+	// POST /api/v1/orders to order-consumer-worker, e.g. queue
+	// "events.concert.rock.queue", routing key "order.concert.rock".
+	OrderStream = Stream{QueuePrefix: "events", RoutingPrefix: "order"}
+	// PaymentEventStream carries verified payment-gateway webhook
+	// confirmations from ingestion-api to fulfillment-consumer-worker, e.g.
+	// queue "payments.concert.rock.queue", routing key "payment.concert.rock".
+	PaymentEventStream = Stream{QueuePrefix: "payments", RoutingPrefix: "payment"}
+)
+
+// StreamForAggregateType maps an OutboxMessage.AggregateType ("order" /
+// "payment_event") to its Stream — how AMQPPublisher decides which queue
+// prefix/routing-key prefix a row publishes under without needing the
+// caller to pass the stream through separately.
+func StreamForAggregateType(aggregateType string) (Stream, bool) {
+	switch aggregateType {
+	case "order":
+		return OrderStream, true
+	case "payment_event":
+		return PaymentEventStream, true
+	default:
+		return Stream{}, false
+	}
+}
+
+// EventTypes is the canonical event_type -> []event_subtype registry that
+// replaces the old per-payment-method Methods list. An order's
+// (event_type, event_subtype) not found here has no bound queue on either
+// stream — ValidateEventType (adapter/http) rejects it with a 400 rather
+// than publishing into a topic-exchange black hole (matched by no binding,
+// silently dropped), the same rationale the old per-method validation used.
+var EventTypes = map[string][]string{
+	"CONCERT":    {"ROCK", "POP", "ELECTRONIC", "SAMBA"},
+	"SPORTS":     {"FOOTBALL", "BASKETBALL", "UFC"},
+	"THEATER":    {"PLAY", "STANDUP", "MUSICAL"},
+	"CONFERENCE": {"TECH", "BUSINESS"},
+}
+
+// IsValidEventType reports whether (eventType, eventSubtype) has a bound
+// queue on every stream.
+func IsValidEventType(eventType, eventSubtype string) bool {
+	subtypes, ok := EventTypes[eventType]
+	if !ok {
+		return false
+	}
+	for _, s := range subtypes {
+		if s == eventSubtype {
+			return true
+		}
+	}
+	return false
+}
 
 // Connect dials the AMQP broker. tlsEnabled is the PCI-DSS encryption-in-
-// transit toggle (Phase 5 Track 5.B, config.Config.RabbitMQTLS) — when true
-// and url uses the plain amqp:// scheme, it's switched to amqps:// before
-// dialing (Amazon MQ in cloud requires amqps://; local/compose stays
-// amqp://). If url already specifies a scheme other than "amqp", it's left
-// untouched.
+// transit toggle (config.Config.RabbitMQTLS) — when true and url uses the
+// plain amqp:// scheme, it's switched to amqps:// before dialing (Amazon MQ
+// in cloud requires amqps://; local/compose stays amqp://). If url already
+// specifies a scheme other than "amqp", it's left untouched.
 func Connect(url string, tlsEnabled bool) (*amqp.Connection, error) {
 	return amqp.Dial(withAMQPS(url, tlsEnabled))
 }
@@ -35,87 +95,92 @@ func withAMQPS(url string, tlsEnabled bool) string {
 	return url
 }
 
-// IsValidMethod reports whether method (expected upper-case) has a bound queue.
-func IsValidMethod(method string) bool {
-	for _, m := range Methods {
-		if m == method {
-			return true
+func shardKey(eventType, eventSubtype string) string {
+	return strings.ToLower(eventType) + "." + strings.ToLower(eventSubtype)
+}
+
+// QueueFor returns the durable quorum queue name for (stream, eventType,
+// eventSubtype), e.g. "events.concert.rock.queue".
+func QueueFor(stream Stream, eventType, eventSubtype string) string {
+	return stream.QueuePrefix + "." + shardKey(eventType, eventSubtype) + ".queue"
+}
+
+// DLQFor returns the dead-letter queue name, e.g. "events.concert.rock.dlq".
+func DLQFor(stream Stream, eventType, eventSubtype string) string {
+	return stream.QueuePrefix + "." + shardKey(eventType, eventSubtype) + ".dlq"
+}
+
+// RetryQueueFor returns the per-shard retry-holding queue name, e.g.
+// "events.concert.rock.retry". It has no consumer; a message sits here for
+// its backoff TTL (set per-message via the `expiration` field on publish),
+// then the broker dead-letters it back onto QueueFor(...) via this queue's
+// DLX/dead-letter-routing-key args.
+func RetryQueueFor(stream Stream, eventType, eventSubtype string) string {
+	return stream.QueuePrefix + "." + shardKey(eventType, eventSubtype) + ".retry"
+}
+
+// RoutingKeyFor returns the topic-exchange routing key, e.g.
+// "order.concert.rock".
+func RoutingKeyFor(stream Stream, eventType, eventSubtype string) string {
+	return stream.RoutingPrefix + "." + shardKey(eventType, eventSubtype)
+}
+
+// DLXRoutingKeyFor returns the dead-letter routing key, e.g.
+// "order.concert.rock.dead".
+func DLXRoutingKeyFor(stream Stream, eventType, eventSubtype string) string {
+	return RoutingKeyFor(stream, eventType, eventSubtype) + ".dead"
+}
+
+// ParseQueueName reverse-looks-up the (stream, eventType, eventSubtype) a
+// queue name belongs to, e.g. "events.concert.rock.queue" ->
+// (OrderStream, "CONCERT", "ROCK", true). It's how
+// order-consumer-worker/fulfillment-consumer-worker turn the single
+// CONSUMER_QUEUE env var they're given into the routing info needed for
+// their retry queue, keeping the
+// queue<->(stream,type,subtype) mapping in one place.
+func ParseQueueName(queue string) (stream Stream, eventType, eventSubtype string, ok bool) {
+	for _, s := range []Stream{OrderStream, PaymentEventStream} {
+		for et, subtypes := range EventTypes {
+			for _, est := range subtypes {
+				if QueueFor(s, et, est) == queue {
+					return s, et, est, true
+				}
+			}
 		}
 	}
-	return false
+	return Stream{}, "", "", false
 }
 
-// QueueFor returns the durable quorum queue name for method, e.g.
-// "payments.pix.queue".
-func QueueFor(method string) string {
-	return "payments." + strings.ToLower(method) + ".queue"
-}
-
-// DLQFor returns the dead-letter queue name for method, e.g.
-// "payments.pix.dlq".
-func DLQFor(method string) string {
-	return "payments." + strings.ToLower(method) + ".dlq"
-}
-
-// RetryQueueFor returns the per-method retry-holding queue name for method,
-// e.g. "payments.pix.retry" (Phase 5 Track 2.A). It has no consumer; a
-// message sits here for its backoff TTL (set per-message via the
-// `expiration` field on publish), then the broker dead-letters it back onto
-// QueueFor(method) via this queue's DLX/dead-letter-routing-key args.
-func RetryQueueFor(method string) string {
-	return "payments." + strings.ToLower(method) + ".retry"
-}
-
-// RoutingKeyFor returns the topic-exchange routing key for method, e.g.
-// "payment.pix".
-func RoutingKeyFor(method string) string {
-	return "payment." + strings.ToLower(method)
-}
-
-// DLXRoutingKeyFor returns the dead-letter routing key for method, e.g.
-// "payment.pix.dead".
-func DLXRoutingKeyFor(method string) string {
-	return "payment." + strings.ToLower(method) + ".dead"
-}
-
-// MethodForQueue reverse-looks-up the method that owns queue (e.g.
-// "payments.pix.queue" -> "PIX", true). It's how consumer-worker turns the
-// single PAYMENT_QUEUE env var it's given into the method used to derive the
-// retry routing key, keeping the method<->queue mapping in one place.
-func MethodForQueue(queue string) (string, bool) {
-	for _, m := range Methods {
-		if QueueFor(m) == queue {
-			return m, true
-		}
-	}
-	return "", false
-}
-
-// DeclareTopology declares the shared exchange/DLX plus every method's queue
-// and DLQ. Called by ingestion-api on startup, since DispatchOutbox
-// publishes to all of them.
+// DeclareTopology declares the shared exchange/DLX plus every (stream,
+// event_type, event_subtype) queue and DLQ, on both streams. Called by
+// outbox-worker on startup, since it publishes to all of them.
 func DeclareTopology(ch *amqp.Channel) error {
 	if err := declareExchanges(ch); err != nil {
 		return err
 	}
-	for _, method := range Methods {
-		if err := declareMethodQueue(ch, method); err != nil {
-			return err
+	for _, stream := range []Stream{OrderStream, PaymentEventStream} {
+		for eventType, subtypes := range EventTypes {
+			for _, eventSubtype := range subtypes {
+				if err := declareShardQueue(ch, stream, eventType, eventSubtype); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil
 }
 
 // DeclareQueue idempotently declares the shared exchange/DLX plus just one
-// method's queue and DLQ. Used by consumer-worker, which only ever binds to
-// its own queue — re-declaring the exchanges too makes a worker
-// self-sufficient even if it starts before ingestion-api (declare is
-// idempotent, so this is safe to repeat).
-func DeclareQueue(ch *amqp.Channel, method string) error {
+// (stream, event_type, event_subtype) queue and DLQ. Used by
+// order-consumer-worker/fulfillment-consumer-worker, which only ever bind to
+// their own queue — re-declaring
+// the exchanges too makes a worker self-sufficient even if it starts before
+// outbox-worker (declare is idempotent, so this is safe to repeat).
+func DeclareQueue(ch *amqp.Channel, stream Stream, eventType, eventSubtype string) error {
 	if err := declareExchanges(ch); err != nil {
 		return err
 	}
-	return declareMethodQueue(ch, method)
+	return declareShardQueue(ch, stream, eventType, eventSubtype)
 }
 
 func declareExchanges(ch *amqp.Channel) error {
@@ -128,8 +193,9 @@ func declareExchanges(ch *amqp.Channel) error {
 	return nil
 }
 
-// declareMethodQueue declares method's DLQ (bound to DLX) and its queue
-// (bound to Exchange), wiring the queue's dead-letter args to its own DLQ.
+// declareShardQueue declares a (stream, event_type, event_subtype) shard's
+// DLQ (bound to DLX) and its queue (bound to Exchange), wiring the queue's
+// dead-letter args to its own DLQ.
 //
 // Poison-message handling does NOT rely on the quorum queue's own
 // x-delivery-limit: testing against RabbitMQ 4.3 showed it set correctly via
@@ -141,9 +207,9 @@ func declareExchanges(ch *amqp.Channel) error {
 // exhausted. Explicit reject-without-requeue against a queue with
 // x-dead-letter-exchange configured is the basic DLX mechanism and always
 // dead-letters, independent of any quorum-queue feature.
-func declareMethodQueue(ch *amqp.Channel, method string) error {
-	dlq := DLQFor(method)
-	dlxRoutingKey := DLXRoutingKeyFor(method)
+func declareShardQueue(ch *amqp.Channel, stream Stream, eventType, eventSubtype string) error {
+	dlq := DLQFor(stream, eventType, eventSubtype)
+	dlxRoutingKey := DLXRoutingKeyFor(stream, eventType, eventSubtype)
 	if _, err := ch.QueueDeclare(dlq, true, false, false, false, nil); err != nil {
 		return fmt.Errorf("declare dlq %s: %w", dlq, err)
 	}
@@ -151,7 +217,7 @@ func declareMethodQueue(ch *amqp.Channel, method string) error {
 		return fmt.Errorf("bind dlq %s: %w", dlq, err)
 	}
 
-	queue := QueueFor(method)
+	queue := QueueFor(stream, eventType, eventSubtype)
 	args := amqp.Table{
 		"x-queue-type":              "quorum",
 		"x-dead-letter-exchange":    DLX,
@@ -160,22 +226,22 @@ func declareMethodQueue(ch *amqp.Channel, method string) error {
 	if _, err := ch.QueueDeclare(queue, true, false, false, false, args); err != nil {
 		return fmt.Errorf("declare queue %s: %w", queue, err)
 	}
-	if err := ch.QueueBind(queue, RoutingKeyFor(method), Exchange, false, nil); err != nil {
+	routingKey := RoutingKeyFor(stream, eventType, eventSubtype)
+	if err := ch.QueueBind(queue, routingKey, Exchange, false, nil); err != nil {
 		return fmt.Errorf("bind queue %s: %w", queue, err)
 	}
 
-	// Phase 5 Track 2.A: per-method retry-holding queue, no consumer. A
-	// message republished here with a per-message `expiration` (the
-	// computed backoff) sits for that TTL, then the broker dead-letters it
-	// back onto the routing key below — straight back onto `queue` — via
-	// this queue's own DLX args. Bound directly to Exchange/RoutingKeyFor so
-	// it's reachable the same way the main queue is, with no separate
-	// binding needed for the retry republish.
-	retryQueue := RetryQueueFor(method)
+	// Per-shard retry-holding queue, no consumer. A message republished here
+	// with a per-message `expiration` (the computed backoff) sits for that
+	// TTL, then the broker dead-letters it back onto the routing key below —
+	// straight back onto `queue` — via this queue's own DLX args. Bound
+	// directly to Exchange/routingKey so it's reachable the same way the
+	// main queue is, with no separate binding needed for the retry republish.
+	retryQueue := RetryQueueFor(stream, eventType, eventSubtype)
 	retryArgs := amqp.Table{
 		"x-queue-type":              "quorum",
 		"x-dead-letter-exchange":    Exchange,
-		"x-dead-letter-routing-key": RoutingKeyFor(method),
+		"x-dead-letter-routing-key": routingKey,
 	}
 	if _, err := ch.QueueDeclare(retryQueue, true, false, false, false, retryArgs); err != nil {
 		return fmt.Errorf("declare retry queue %s: %w", retryQueue, err)

@@ -1,13 +1,16 @@
-# Phase 3: shared shape for the per-method consumer-worker services below —
-# each binds via PAYMENT_QUEUE to exactly one RabbitMQ queue
-# (internal/infrastructure/rabbitmq.QueueFor), decoupling payment methods
-# from consumer scaling.
-x-consumer-worker-base: &consumer-worker-base
+# Shared shape for the order-consumer-worker/fulfillment-consumer-worker services below — each
+# binds via CONSUMER_QUEUE to exactly one RabbitMQ shard queue
+# (internal/infrastructure/rabbitmq.QueueFor), decoupling event types from
+# consumer scaling. Only a small representative subset of the full
+# (event_type, event_subtype) registry runs locally by default — add more
+# following the same pattern (a new CONSUMER_QUEUE + METRICS_PORT pair) to
+# exercise another shard.
+x-order-consumer-worker-base: &order-consumer-worker-base
   build:
     context: .
     dockerfile: Dockerfile
     args:
-      SERVICE: consumer-worker
+      SERVICE: order-consumer-worker
   # tempo is NOT a dependency here — the OTLP/HTTP exporter
   # (internal/infrastructure/telemetry) fails open if nothing's listening at
   # OTEL_EXPORTER_OTLP_ENDPOINT (traces are just dropped, not fatal), so a
@@ -17,7 +20,7 @@ x-consumer-worker-base: &consumer-worker-base
       condition: service_healthy
     rabbitmq:
       condition: service_healthy
-    migrate-payments:
+    migrate-events:
       condition: service_completed_successfully
     pgbouncer:
       condition: service_healthy
@@ -25,25 +28,61 @@ x-consumer-worker-base: &consumer-worker-base
     - outbox
   restart: unless-stopped
 
-x-consumer-worker-env: &consumer-worker-env
-  # Phase 5 Track 3.B — points at PgBouncer (transaction-pooling mode), not
-  # postgres directly, so the 0..N-per-method KEDA fan-out's many short-lived
-  # connections collapse onto a small server-side pool instead of each pod
-  # opening its own GORM pool straight against Postgres.
+x-order-consumer-worker-env: &order-consumer-worker-env
+  # Points at PgBouncer (transaction-pooling mode), not postgres directly, so
+  # the per-shard KEDA fan-out's many short-lived connections collapse onto a
+  # small server-side pool instead of each pod opening its own GORM pool
+  # straight against Postgres.
   #
-  # Two-DB split: consumer-worker is the only writer of payments_*, so it
-  # points at the `payments` database (PgBouncer's wildcard [databases] entry
-  # transparently pools whichever dbname the client requests).
-  DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@pgbouncer:6432/payments?sslmode=disable"
+  # Two-DB split: order-consumer-worker/fulfillment-consumer-worker are the only writers of the
+  # events domain, so they point at the `events` database (PgBouncer's
+  # wildcard [databases] entry transparently pools whichever dbname the
+  # client requests).
+  DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@pgbouncer:6432/events?sslmode=disable"
   RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
   PREFETCH_COUNT: "${CONSUMER_PREFETCH:-10}"
   MAX_DELIVERIES: "${RABBITMQ_MAX_REDELIVERIES:-5}"
   RETRY_BACKOFF_BASE: "${RETRY_BACKOFF_BASE:-1s}"
   RETRY_BACKOFF_CAP: "${RETRY_BACKOFF_CAP:-5m}"
-  # Phase 5 Track 4.B: traces now land in Tempo instead of Jaeger — same
-  # OTLP/HTTP protocol, just a different receiver container. The Go config
-  # default (internal/infrastructure/config) stays the bare "localhost:4318";
-  # compose always overrides it, same pattern as before.
+  # PAYMENT_PROVIDER selects the domain.PaymentGateway adapter order-consumer-worker
+  # opens checkouts through — "fake" (default, no network) locally.
+  PAYMENT_PROVIDER: "${PAYMENT_PROVIDER:-fake}"
+  STRIPE_SECRET_KEY: "${STRIPE_SECRET_KEY:-}"
+  STRIPE_WEBHOOK_SECRET: "${STRIPE_WEBHOOK_SECRET:-}"
+  CHECKOUT_SUCCESS_URL: "${CHECKOUT_SUCCESS_URL:-http://localhost:8080/orders/success}"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-tempo:4318}"
+  LOG_FORMAT: "${LOG_FORMAT:-json}"
+
+x-fulfillment-consumer-worker-base: &fulfillment-consumer-worker-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      SERVICE: fulfillment-consumer-worker
+  depends_on:
+    postgres:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+    migrate-events:
+      condition: service_completed_successfully
+    pgbouncer:
+      condition: service_healthy
+  networks:
+    - outbox
+  restart: unless-stopped
+
+x-fulfillment-consumer-worker-env: &fulfillment-consumer-worker-env
+  DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@pgbouncer:6432/events?sslmode=disable"
+  RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
+  PREFETCH_COUNT: "${CONSUMER_PREFETCH:-10}"
+  MAX_DELIVERIES: "${RABBITMQ_MAX_REDELIVERIES:-5}"
+  RETRY_BACKOFF_BASE: "${RETRY_BACKOFF_BASE:-1s}"
+  RETRY_BACKOFF_CAP: "${RETRY_BACKOFF_CAP:-5m}"
+  # HMAC key internal/adapter/ticketqr signs every issued ticket's
+  # validation code with — a fixed dev default here, a real secret via Helm
+  # in cloud.
+  TICKET_SIGNING_SECRET: "${TICKET_SIGNING_SECRET:-dev-ticket-signing-secret}"
   OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-tempo:4318}"
   LOG_FORMAT: "${LOG_FORMAT:-json}"
 
@@ -72,11 +111,11 @@ services:
       # single-version path /var/lib/postgresql/data — the single mount point
       # must be the parent /var/lib/postgresql instead.
       - postgres_data:/var/lib/postgresql
-      # Creates the second logical database (`payments`) on a fresh data dir,
+      # Creates the second logical database (`events`) on a fresh data dir,
       # alongside the image-created `outbox` (POSTGRES_DB). Runs once, only
       # when the volume is empty — `make down` (-v) wipes the volume so the
       # next `up` re-runs it. See the file's own comment for the two-DB split.
-      - ./observability/postgres/init-payments.sql:/docker-entrypoint-initdb.d/init-payments.sql:ro
+      - ./observability/postgres/init-events.sql:/docker-entrypoint-initdb.d/init-events.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-outbox} -d ${POSTGRES_DB:-outbox}"]
       interval: 5s
@@ -128,19 +167,17 @@ services:
       - outbox
     restart: unless-stopped
 
-  # Phase 5 Track 1: one-shot golang-migrate containers that apply
-  # migrations/<set>/*.up.sql before any app service starts — replaces the
-  # AutoMigrate/MigrateTimescale boot-time calls that used to live in
-  # cmd/ingestion-api/main.go and cmd/consumer-worker/main.go. Each exits 0
-  # (or a no-op if already at the latest version) and is left in "Exited"
-  # state, which `depends_on: condition: service_completed_successfully` below
-  # waits on.
+  # One-shot golang-migrate containers that apply migrations/<set>/*.up.sql
+  # before any app service starts. Each exits 0 (or a no-op if already at
+  # the latest version) and is left in "Exited" state, which
+  # `depends_on: condition: service_completed_successfully` below waits on.
   #
-  # Two sets now, one per logical database (the outbox/payments split): the
-  # outbox table + its notify trigger/indexes go to the `outbox` DB, the
-  # TimescaleDB payments_* hypertables go to the `payments` DB created by
-  # observability/postgres/init-payments.sql. golang-migrate tracks its own
-  # schema_migrations table per database, so these run independently.
+  # Two sets now, one per logical database (the outbox/events split): the
+  # two outbox tables + their notify trigger/indexes go to the `outbox` DB,
+  # the events domain (locations/events/orders/tickets/charges) go to the
+  # `events` DB created by observability/postgres/init-events.sql.
+  # golang-migrate tracks its own schema_migrations table per database, so
+  # these run independently.
   migrate-outbox:
     image: migrate/migrate:latest
     volumes:
@@ -157,15 +194,15 @@ services:
     networks:
       - outbox
 
-  migrate-payments:
+  migrate-events:
     image: migrate/migrate:latest
     volumes:
       - ./migrations:/migrations:ro
     entrypoint:
       - migrate
-      - -path=/migrations/payments
+      - -path=/migrations/events
       - -database
-      - "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@postgres:5432/payments?sslmode=disable"
+      - "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@postgres:5432/events?sslmode=disable"
       - up
     depends_on:
       postgres:
@@ -173,12 +210,12 @@ services:
     networks:
       - outbox
 
-  # Phase 5 Track 3.B — PgBouncer in transaction-pooling mode, in front of
-  # Postgres. Identical local/cloud topology (see
-  # helmcharts/transaction-outbox/templates/pgbouncer/): both ingestion-api
-  # and every per-method consumer-worker point DATABASE_URL here instead of
-  # at postgres directly, so the KEDA fan-out's many short-lived sessions
-  # collapse onto a small pool of real Postgres connections. GORM's
+  # PgBouncer in transaction-pooling mode, in front of Postgres. Identical
+  # local/cloud topology (see helmcharts/transaction-outbox/templates/pgbouncer/):
+  # every service (ingestion-api and each order-consumer-worker/fulfillment-consumer-worker
+  # shard) points DATABASE_URL here instead of at postgres directly, so the
+  # KEDA fan-out's many short-lived sessions collapse onto a small pool of
+  # real Postgres connections. GORM's
   # PrepareStmt is disabled (internal/infrastructure/database/database.go)
   # because transaction-mode pooling doesn't guarantee the same server
   # connection across statements.
@@ -258,13 +295,20 @@ services:
       # Empty locally: no ALB in front of compose, so c.ClientIP() falls back
       # to the direct RemoteAddr (correct without an XFF-injecting proxy).
       TRUSTED_PROXIES: "${TRUSTED_PROXIES:-}"
+      # ingestion-api needs its own PaymentGateway instance too — VerifyWebhook
+      # is called straight from the webhook handler, not via order-consumer-worker.
+      PAYMENT_PROVIDER: "${PAYMENT_PROVIDER:-fake}"
+      STRIPE_SECRET_KEY: "${STRIPE_SECRET_KEY:-}"
+      STRIPE_WEBHOOK_SECRET: "${STRIPE_WEBHOOK_SECRET:-}"
     ports:
       - "${APP_PORT:-8080}:8080"
       - "${METRICS_PORT:-9090}:9090"
-    # tempo is NOT a dependency here — see consumer-worker's note above;
-    # this lets `make loadtest-up` bring up a minimal subset of this same
-    # compose file without dragging Tempo along. rabbitmq is intentionally NOT
-    # a dependency either — ingestion-api never connects to it now.
+    # tempo is NOT a dependency here — the OTLP/HTTP exporter fails open if
+    # nothing's listening at OTEL_EXPORTER_OTLP_ENDPOINT (traces are just
+    # dropped, not fatal), so `make loadtest-up` can bring up a minimal subset
+    # of this same compose file without dragging Tempo along. rabbitmq is
+    # intentionally NOT a dependency either — ingestion-api never connects to
+    # it now.
     depends_on:
       postgres:
         condition: service_healthy
@@ -276,12 +320,11 @@ services:
       - outbox
     restart: unless-stopped
 
-  # The Transactional Outbox relay (DispatchOutbox), split out of ingestion-api
-  # into its own process so it scales on outbox backlog independently of the
-  # fixed-size HTTP front door. It is the only reader of the outbox table and
-  # the only publisher to RabbitMQ; it also declares the shared topology that
-  # the per-method consumer-worker services consume from. Points at the
-  # `outbox` database, same as ingestion-api.
+  # The Transactional Outbox relay (DispatchOutbox), run once for each of the
+  # two outboxes (order_outbox, payment_event_outbox). It is the only reader
+  # of either outbox table and the only publisher to RabbitMQ; it also
+  # declares the shared topology that order-consumer-worker/fulfillment-consumer-worker consume
+  # from. Points at the `outbox` database, same as ingestion-api.
   outbox-worker:
     build:
       context: .
@@ -316,85 +359,51 @@ services:
       - outbox
     restart: unless-stopped
 
-  # One consumer-worker service per payment method (Phase 3 Track 1) — each
-  # sets PAYMENT_QUEUE so it binds to and drains exactly one queue. `make seed`/
-  # `seed-pix`/`seed-boleto`/`seed-transfer` post to ingestion-api, which fans
-  # out to whichever of these queues matches the payment's method.
-  consumer-pix:
-    <<: *consumer-worker-base
+  # One order-consumer-worker + one fulfillment-consumer-worker per (event_type, event_subtype)
+  # shard actually exercised locally — each sets CONSUMER_QUEUE so it binds
+  # to and drains exactly one queue. Only two shards run by default
+  # (CONCERT/ROCK, SPORTS/FOOTBALL); add more following the same pattern (a
+  # new CONSUMER_QUEUE + METRICS_PORT pair) to exercise another registry
+  # entry (internal/infrastructure/rabbitmq.EventTypes).
+  order-consumer-worker-concert-rock:
+    <<: *order-consumer-worker-base
     environment:
-      <<: *consumer-worker-env
-      PAYMENT_QUEUE: "payments.pix.queue"
-      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-consumer-worker}-pix"
+      <<: *order-consumer-worker-env
+      CONSUMER_QUEUE: "events.concert.rock.queue"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-order-consumer-worker}-concert-rock"
       METRICS_PORT: "9091"
     ports:
       - "9091:9091"
 
-  # A second instance bound to the SAME queue as consumer-pix — RabbitMQ
-  # round-robins payments.pix.queue's deliveries between the two (the
-  # competing-consumers pattern), letting a load test compare 2 consumers'
-  # combined drain rate against consumer-transfer's single instance to see
-  # whether Postgres/PgBouncer becomes the bottleneck before consumer count
-  # does. Not part of the normal topology — only bring this up for that
-  # specific load test (loadtest/README.md's 6.3).
-  #
-  # Named "-extra", not "-2": this is a second, separately-named service,
-  # not a true `--scale consumer-pix=2` replica — consumer-pix's host port
-  # (9091) is fixed (every other consumer-* service follows the same
-  # documented fixed-port convention, see README.md's METRICS_PORT row),
-  # and two replicas of one service can't both bind the same host port.
-  # A name ending in a digit would also collide visually with Compose's own
-  # container suffix (every service gets "-1" appended, scaled or not), so
-  # "consumer-pix-2" would render as the confusing "consumer-pix-2-1".
-  consumer-pix-extra:
-    <<: *consumer-worker-base
+  order-consumer-worker-sports-football:
+    <<: *order-consumer-worker-base
     environment:
-      <<: *consumer-worker-env
-      PAYMENT_QUEUE: "payments.pix.queue"
-      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-consumer-worker}-pix-extra"
-      METRICS_PORT: "9097"
-    ports:
-      - "9097:9097"
-
-  consumer-boleto:
-    <<: *consumer-worker-base
-    environment:
-      <<: *consumer-worker-env
-      PAYMENT_QUEUE: "payments.boleto.queue"
-      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-consumer-worker}-boleto"
+      <<: *order-consumer-worker-env
+      CONSUMER_QUEUE: "events.sports.football.queue"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-order-consumer-worker}-sports-football"
       METRICS_PORT: "9092"
     ports:
       - "9092:9092"
 
-  consumer-transfer:
-    <<: *consumer-worker-base
+  fulfillment-consumer-worker-concert-rock:
+    <<: *fulfillment-consumer-worker-base
     environment:
-      <<: *consumer-worker-env
-      PAYMENT_QUEUE: "payments.transfer.queue"
-      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-consumer-worker}-transfer"
+      <<: *fulfillment-consumer-worker-env
+      CONSUMER_QUEUE: "payments.concert.rock.queue"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-fulfillment-consumer-worker}-concert-rock"
       METRICS_PORT: "9093"
     ports:
       - "9093:9093"
 
-  consumer-cartao-credito:
-    <<: *consumer-worker-base
+  fulfillment-consumer-worker-sports-football:
+    <<: *fulfillment-consumer-worker-base
     environment:
-      <<: *consumer-worker-env
-      PAYMENT_QUEUE: "payments.cartao_credito.queue"
-      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-consumer-worker}-cartao-credito"
+      <<: *fulfillment-consumer-worker-env
+      CONSUMER_QUEUE: "payments.sports.football.queue"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-fulfillment-consumer-worker}-sports-football"
       METRICS_PORT: "9094"
     ports:
       - "9094:9094"
-
-  consumer-cartao-debito:
-    <<: *consumer-worker-base
-    environment:
-      <<: *consumer-worker-env
-      PAYMENT_QUEUE: "payments.cartao_debito.queue"
-      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-consumer-worker}-cartao-debito"
-      METRICS_PORT: "9095"
-    ports:
-      - "9095:9095"
 
   # ── Observability (Phase 4 Track 3) ───────────────────────────────────────
 

@@ -1,14 +1,15 @@
 // Package main is the composition root for ingestion-api.
 //
-//	@title			Transaction Outbox — Ingestion API
+//	@title			Transaction Outbox — Event Ticket System Ingestion API
 //	@version		1.0
-//	@description	Accepts payment-provider webhook-shaped events and durably stores them in the
-//	@description	transactional outbox for asynchronous relay to RabbitMQ.
+//	@description	Accepts ticket orders and payment-gateway webhook confirmations, durably storing
+//	@description	both in the transactional outbox for asynchronous relay to RabbitMQ.
 //	@BasePath		/
 package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,20 +19,22 @@ import (
 
 	handler "github.com/alonsomachado/transaction-outbox-go/internal/adapter/http"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/http/ratelimit"
+	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/paymentgateway/abacatepay"
+	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/paymentgateway/fake"
+	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/paymentgateway/lemonsqueezy"
+	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/paymentgateway/stripe"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/persistence"
+	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/config"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/database"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/logging"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/telemetry"
-	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ingest"
-	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ticket"
+	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/order"
+	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/webhook"
 )
 
 func main() {
 	ctx := context.Background()
-	// Startup logger: telemetry.Setup (which installs the trace-correlating
-	// default logger) needs cfg first, so config-load failures use a bare
-	// logger with no trace correlation — there's no span yet anyway.
 	startupLog := logging.NewLogger("startup", "json", os.Stdout)
 
 	cfg, err := config.Load()
@@ -58,31 +61,37 @@ func main() {
 		slog.ErrorContext(ctx, "database connect failed", "err", err.Error())
 		os.Exit(1)
 	}
-	// Schema migrations are no longer applied here — Phase 5 Track 1 moved
-	// them to versioned golang-migrate files under migrations/outbox/, applied
-	// by `make migrate` / the migrate-outbox compose one-shot before the app
-	// starts (see docker-compose.yml).
+	// Schema migrations are applied by `make migrate` / the migrate-outbox
+	// compose one-shot before this starts, never here.
 	//
-	// ingestion-api no longer talks to RabbitMQ at all: the Transactional
-	// Outbox relay (DispatchOutbox) is now its own process, outbox-worker
-	// (cmd/outbox-worker). ingestion-api only writes the outbox row; the INSERT
-	// fires the LISTEN/NOTIFY trigger that wakes outbox-worker. This is also a
-	// resilience win — ingestion-api can keep accepting writes even when the
-	// broker is down, which is the whole point of the outbox.
+	// ingestion-api never talks to RabbitMQ or the events DB: the
+	// Transactional Outbox relay (DispatchOutbox) is outbox-worker, and the
+	// events domain is only ever written by
+	// order-consumer-worker/fulfillment-consumer-worker.
+	// ingestion-api only writes the two outbox tables; the INSERT fires the
+	// LISTEN/NOTIFY trigger that wakes outbox-worker. This keeps
+	// ingestion-api accepting writes even when the broker or the events DB
+	// is down.
 
 	uow := persistence.NewUnitOfWork(db)
-	outboxRepo := persistence.NewOutboxRepository(db, cfg.RetryBackoffBase, cfg.RetryBackoffCap)
-	ticketRepo := persistence.NewTicketOutboxRepository(db)
+	orderOutboxRepo := persistence.NewOutboxRepository(db, "order_outbox", cfg.RetryBackoffBase, cfg.RetryBackoffCap)
+	paymentEventOutboxRepo := persistence.NewOutboxRepository(db, "payment_event_outbox", cfg.RetryBackoffBase, cfg.RetryBackoffCap)
 
-	ingestUC := ingest.New(outboxRepo, uow)
-	ingestTicketUC := ticket.New(ticketRepo, uow)
+	placeOrderUC := order.New(orderOutboxRepo, uow)
+	receivePaymentEventUC := webhook.New(paymentEventOutboxRepo, uow)
 
-	paymentHandler := handler.NewPaymentHandler(ingestUC)
-	ticketHandler := handler.NewTicketHandler(ingestTicketUC)
+	gateway, err := newGateway(cfg)
+	if err != nil {
+		slog.ErrorContext(ctx, "payment gateway init failed", "err", err.Error())
+		os.Exit(1)
+	}
+
+	orderHandler := handler.NewOrderHandler(placeOrderUC)
+	webhookHandler := handler.NewWebhookHandler(gateway, receivePaymentEventUC, cfg.PaymentProvider)
 
 	rateLimitStore := ratelimit.NewInMemoryStore(10 * time.Minute)
 
-	router := handler.NewRouter(paymentHandler, ticketHandler, cfg.OtelServiceName, cfg.SwaggerEnabled, handler.RouterConfig{
+	router := handler.NewRouter(orderHandler, webhookHandler, cfg.OtelServiceName, cfg.SwaggerEnabled, handler.RouterConfig{
 		TrustedProxies:   cfg.TrustedProxies,
 		RateLimitEnabled: cfg.RateLimitEnabled,
 		RateLimitStore:   rateLimitStore,
@@ -126,5 +135,25 @@ func main() {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.ErrorContext(shutdownCtx, "graceful shutdown error", "err", err.Error())
+	}
+}
+
+// newGateway selects the domain.PaymentGateway adapter by
+// config.PaymentProvider. This composition-root wiring is duplicated (in
+// spirit) in cmd/order-consumer-worker/main.go — both processes need one, and it
+// can't live in internal/adapter, which must not import
+// internal/infrastructure/config.
+func newGateway(cfg *config.Config) (domain.PaymentGateway, error) {
+	switch cfg.PaymentProvider {
+	case "stripe":
+		return stripe.New(cfg.StripeSecretKey, cfg.StripeWebhookSecret), nil
+	case "abacatepay":
+		return abacatepay.New(), nil
+	case "lemonsqueezy":
+		return lemonsqueezy.New(), nil
+	case "fake", "":
+		return fake.New(""), nil
+	default:
+		return nil, fmt.Errorf("unknown PAYMENT_PROVIDER %q", cfg.PaymentProvider)
 	}
 }

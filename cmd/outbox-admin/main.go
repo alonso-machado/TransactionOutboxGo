@@ -1,14 +1,14 @@
-// Package main is a small, short-lived maintenance CLI (Phase 5 Track 2.C)
-// — NOT a third long-running service. DispatchOutbox stays a goroutine
-// inside ingestion-api; this binary is a one-shot `go run` / `make` target
-// invocation (or a one-shot K8s Job in cloud) for dead-letter maintenance:
+// Package main is a small, short-lived maintenance CLI — NOT a long-running
+// service. It shares DATABASE_URL/RABBITMQ_URL config with the other
+// services but never binds an HTTP port and is never reachable from the
+// edge.
 //
-//	replay-dead       --method PIX --limit 100   outbox DEAD_LETTER rows -> NEW
-//	drain-dlq         --method PIX                payments.pix.dlq -> payments.pix.queue
-//	purge-loadtest-dlq --method PIX                payments.pix.dlq: drop only providerName="LOADTEST" messages
-//
-// It shares the same DATABASE_URL/RABBITMQ_URL config as the two services,
-// but never binds an HTTP port and is never reachable from the edge.
+//	replay-dead        --outbox order|payment --event-type CONCERT --limit 100
+//	                    resets DEAD_LETTER rows in order_outbox/payment_event_outbox back to NEW
+//	drain-dlq          --stream order|payment --event-type CONCERT --event-subtype ROCK
+//	                    moves messages from a shard's DLQ back onto its queue
+//	purge-loadtest-dlq --stream order|payment --event-type CONCERT --event-subtype ROCK
+//	                    drops only messages a loadtest run marked (see loadtestMarker)
 package main
 
 import (
@@ -27,10 +27,10 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// loadtestProviderName is the providerName both loadtest/k6-baseline.js
-// (via payloads.js's envelope) and loadtest/k6-consumer.js stamp on every
-// message they produce — the marker purge-loadtest-dlq matches on.
-const loadtestProviderName = "LOADTEST"
+// loadtestMarker is the value loadtest/*.js stamps into an order's
+// customerName or a payment event's provider field — purge-loadtest-dlq
+// matches on either.
+const loadtestMarker = "LOADTEST"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -60,32 +60,55 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `outbox-admin: maintenance commands for the transactional outbox
 
 Usage:
-  outbox-admin replay-dead --method PIX --limit 100
-      Reset outbox DEAD_LETTER rows back to NEW (status=NEW, retry_count=0,
-      next_retry_at=NULL, last_error cleared) so the dispatch loop picks
-      them up and republishes. --method "" replays across every method.
+  outbox-admin replay-dead --outbox order --event-type CONCERT --limit 100
+      Reset DEAD_LETTER rows in order_outbox (or payment_event_outbox with
+      --outbox payment) back to NEW. --event-type "" replays every event type.
 
-  outbox-admin drain-dlq --method PIX
-      Move messages sitting in payments.<method>.dlq back onto
-      payments.<method>.queue, resetting the x-retry-count header.
+  outbox-admin drain-dlq --stream order --event-type CONCERT --event-subtype ROCK
+      Move messages sitting in the shard's DLQ back onto its queue,
+      resetting the x-retry-count header. --stream is "order" or "payment".
 
-  outbox-admin purge-loadtest-dlq --method PIX
-      Scan payments.<method>.dlq and permanently remove only messages whose
-      body has providerName="LOADTEST" (set by every loadtest/*.js script).
-      Any other message is left in the DLQ untouched (republished with its
-      original body/headers, never dropped) — safe to run against a DLQ
-      that has a mix of real and loadtest messages, e.g. in UAT.`)
+  outbox-admin purge-loadtest-dlq --stream order --event-type CONCERT --event-subtype ROCK
+      Scan the shard's DLQ and permanently remove only messages a loadtest
+      run marked (see loadtestMarker). Any other message is left in the DLQ
+      untouched — safe to run against a DLQ with a mix of real and loadtest
+      messages, e.g. in UAT.`)
+}
+
+func outboxTable(name string) (string, error) {
+	switch name {
+	case "order":
+		return "order_outbox", nil
+	case "payment":
+		return "payment_event_outbox", nil
+	default:
+		return "", fmt.Errorf("--outbox must be \"order\" or \"payment\", got %q", name)
+	}
+}
+
+func streamFor(name string) (rmq.Stream, error) {
+	switch name {
+	case "order":
+		return rmq.OrderStream, nil
+	case "payment":
+		return rmq.PaymentEventStream, nil
+	default:
+		return rmq.Stream{}, fmt.Errorf("--stream must be \"order\" or \"payment\", got %q", name)
+	}
 }
 
 func runReplayDead(cfg *config.Config, args []string) {
 	fs := flag.NewFlagSet("replay-dead", flag.ExitOnError)
-	method := fs.String("method", "", "payment method to replay (empty = all methods)")
+	outbox := fs.String("outbox", "order", "which outbox: order | payment")
+	eventType := fs.String("event-type", "", "event type to replay (empty = all)")
 	limit := fs.Int("limit", 100, "max number of rows to reset")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("parse args: %v", err)
 	}
-	if *method != "" && !rmq.IsValidMethod(*method) {
-		log.Fatalf("unknown method %q (expected one of: %v)", *method, rmq.Methods)
+
+	table, err := outboxTable(*outbox)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	db, err := database.Connect(cfg.DatabaseURL, cfg.DBSSLMode)
@@ -93,26 +116,32 @@ func runReplayDead(cfg *config.Config, args []string) {
 		log.Fatalf("database: %v", err)
 	}
 
-	replayer := persistence.NewOutboxRepository(db, cfg.RetryBackoffBase, cfg.RetryBackoffCap)
+	replayer := persistence.NewOutboxRepository(db, table, cfg.RetryBackoffBase, cfg.RetryBackoffCap)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	n, err := replayer.ReplayDeadLetters(ctx, *method, *limit)
+	n, err := replayer.ReplayDeadLetters(ctx, *eventType, *limit)
 	if err != nil {
 		log.Fatalf("replay dead letters: %v", err)
 	}
-	log.Printf("replay-dead: reset %d row(s) to NEW (method=%q, limit=%d)", n, *method, *limit)
+	log.Printf("replay-dead: reset %d row(s) to NEW (outbox=%q, event_type=%q, limit=%d)", n, table, *eventType, *limit)
 }
 
 func runDrainDLQ(cfg *config.Config, args []string) {
 	fs := flag.NewFlagSet("drain-dlq", flag.ExitOnError)
-	method := fs.String("method", "", "payment method whose DLQ to drain (required)")
+	streamName := fs.String("stream", "", "stream whose shard to drain: order | payment (required)")
+	eventType := fs.String("event-type", "", "event type (required)")
+	eventSubtype := fs.String("event-subtype", "", "event subtype (required)")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("parse args: %v", err)
 	}
-	if *method == "" || !rmq.IsValidMethod(*method) {
-		log.Fatalf("--method is required and must be one of: %v", rmq.Methods)
+	stream, err := streamFor(*streamName)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if !rmq.IsValidEventType(*eventType, *eventSubtype) {
+		log.Fatalf("unknown (event-type, event-subtype) = (%q, %q)", *eventType, *eventSubtype)
 	}
 
 	conn, err := rmq.Connect(cfg.RabbitMQURL, cfg.RabbitMQTLS)
@@ -127,7 +156,7 @@ func runDrainDLQ(cfg *config.Config, args []string) {
 	}
 	defer func() { _ = ch.Close() }()
 
-	if err := rmq.DeclareQueue(ch, *method); err != nil {
+	if err := rmq.DeclareQueue(ch, stream, *eventType, *eventSubtype); err != nil {
 		log.Fatalf("declare queue: %v", err)
 	}
 	if err := ch.Confirm(false); err != nil {
@@ -135,9 +164,9 @@ func runDrainDLQ(cfg *config.Config, args []string) {
 	}
 	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
 
-	dlq := rmq.DLQFor(*method)
-	queue := rmq.QueueFor(*method)
-	routingKey := rmq.RoutingKeyFor(*method)
+	dlq := rmq.DLQFor(stream, *eventType, *eventSubtype)
+	queue := rmq.QueueFor(stream, *eventType, *eventSubtype)
+	routingKey := rmq.RoutingKeyFor(stream, *eventType, *eventSubtype)
 
 	moved := 0
 	for {
@@ -190,12 +219,18 @@ func runDrainDLQ(cfg *config.Config, args []string) {
 
 func runPurgeLoadtestDLQ(cfg *config.Config, args []string) {
 	fs := flag.NewFlagSet("purge-loadtest-dlq", flag.ExitOnError)
-	method := fs.String("method", "", "payment method whose DLQ to clean (required)")
+	streamName := fs.String("stream", "", "stream whose shard to clean: order | payment (required)")
+	eventType := fs.String("event-type", "", "event type (required)")
+	eventSubtype := fs.String("event-subtype", "", "event subtype (required)")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("parse args: %v", err)
 	}
-	if *method == "" || !rmq.IsValidMethod(*method) {
-		log.Fatalf("--method is required and must be one of: %v", rmq.Methods)
+	stream, err := streamFor(*streamName)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if !rmq.IsValidEventType(*eventType, *eventSubtype) {
+		log.Fatalf("unknown (event-type, event-subtype) = (%q, %q)", *eventType, *eventSubtype)
 	}
 
 	conn, err := rmq.Connect(cfg.RabbitMQURL, cfg.RabbitMQTLS)
@@ -210,7 +245,7 @@ func runPurgeLoadtestDLQ(cfg *config.Config, args []string) {
 	}
 	defer func() { _ = ch.Close() }()
 
-	if err := rmq.DeclareQueue(ch, *method); err != nil {
+	if err := rmq.DeclareQueue(ch, stream, *eventType, *eventSubtype); err != nil {
 		log.Fatalf("declare queue: %v", err)
 	}
 	if err := ch.Confirm(false); err != nil {
@@ -218,7 +253,7 @@ func runPurgeLoadtestDLQ(cfg *config.Config, args []string) {
 	}
 	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
 
-	dlq := rmq.DLQFor(*method)
+	dlq := rmq.DLQFor(stream, *eventType, *eventSubtype)
 
 	// Bound the scan to the queue's depth at start: a kept (non-loadtest)
 	// message is republished onto the back of the same queue before its
@@ -240,10 +275,7 @@ func runPurgeLoadtestDLQ(cfg *config.Config, args []string) {
 			break
 		}
 
-		var payload struct {
-			ProviderName string `json:"providerName"`
-		}
-		if json.Unmarshal(msg.Body, &payload) == nil && payload.ProviderName == loadtestProviderName {
+		if isLoadtestMessage(msg.Body) {
 			if err := msg.Ack(false); err != nil {
 				log.Fatalf("ack loadtest message %s: %v", msg.MessageId, err)
 			}
@@ -285,4 +317,18 @@ func runPurgeLoadtestDLQ(cfg *config.Config, args []string) {
 	}
 
 	log.Printf("purge-loadtest-dlq: removed %d loadtest message(s), kept %d real message(s) in %s", removed, kept, dlq)
+}
+
+// isLoadtestMessage reports whether body's payload carries loadtestMarker in
+// either the order stream's customerName or the payment-event stream's
+// provider field.
+func isLoadtestMessage(body []byte) bool {
+	var payload struct {
+		CustomerName string `json:"customerName"`
+		Provider     string `json:"provider"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return false
+	}
+	return payload.CustomerName == loadtestMarker || payload.Provider == loadtestMarker
 }

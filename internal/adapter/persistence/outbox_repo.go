@@ -11,29 +11,35 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+// GORMOutboxRepository implements domain.OutboxRepository against a single
+// table, given at construction time — order_outbox and payment_event_outbox
+// both use this same implementation (see cmd/outbox-worker/main.go), rather
+// than two hand-duplicated repositories, since their schema and state
+// machine are identical.
 type GORMOutboxRepository struct {
 	db               *gorm.DB
+	table            string
 	retryBackoffBase time.Duration
 	retryBackoffCap  time.Duration
 }
 
-// NewOutboxRepository wires the repository with the retry-backoff
-// base/cap used by MarkRetrying (Phase 5 Track 2.A) — falls back to the
-// config defaults (1s/5m) if zero values are passed so existing callers
-// (and tests) that don't care about backoff still get sane behavior.
-func NewOutboxRepository(db *gorm.DB, retryBackoffBase, retryBackoffCap time.Duration) *GORMOutboxRepository {
+// NewOutboxRepository wires the repository to table (e.g. "order_outbox" or
+// "payment_event_outbox") with the retry-backoff base/cap used by
+// MarkRetrying — falls back to 1s/5m if zero values are passed so tests that
+// don't care about backoff still get sane behavior.
+func NewOutboxRepository(db *gorm.DB, table string, retryBackoffBase, retryBackoffCap time.Duration) *GORMOutboxRepository {
 	if retryBackoffBase <= 0 {
 		retryBackoffBase = time.Second
 	}
 	if retryBackoffCap <= 0 {
 		retryBackoffCap = 5 * time.Minute
 	}
-	return &GORMOutboxRepository{db: db, retryBackoffBase: retryBackoffBase, retryBackoffCap: retryBackoffCap}
+	return &GORMOutboxRepository{db: db, table: table, retryBackoffBase: retryBackoffBase, retryBackoffCap: retryBackoffCap}
 }
 
 func (r *GORMOutboxRepository) Enqueue(ctx context.Context, uow domain.UnitOfWork, msg *domain.OutboxMessage) (bool, error) {
 	headersJSON, _ := json.Marshal(msg.Headers)
-	m := OutboxMessageModel{
+	m := outboxRow{
 		ID:             msg.ID,
 		IdempotencyKey: msg.IdempotencyKey,
 		AggregateType:  msg.AggregateType,
@@ -44,10 +50,11 @@ func (r *GORMOutboxRepository) Enqueue(ctx context.Context, uow domain.UnitOfWor
 		Status:         string(msg.Status),
 		RetryCount:     msg.RetryCount,
 		CreatedAt:      msg.CreatedAt,
-		PaymentMethod:  msg.PaymentMethod,
+		EventType:      msg.EventType,
+		EventSubtype:   msg.EventSubtype,
 	}
 	db := TxFromContext(ctx, r.db)
-	tx := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&m)
+	tx := db.Table(r.table).Clauses(clause.OnConflict{DoNothing: true}).Create(&m)
 	if tx.Error != nil {
 		return false, tx.Error
 	}
@@ -55,21 +62,21 @@ func (r *GORMOutboxRepository) Enqueue(ctx context.Context, uow domain.UnitOfWor
 }
 
 func (r *GORMOutboxRepository) FetchPending(ctx context.Context, limit int) ([]*domain.OutboxMessage, error) {
-	var models []OutboxMessageModel
+	var rows []outboxRow
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		return tx.
+		return tx.Table(r.table).
 			Where("status IN ?", []string{string(domain.OutboxStatusNew), string(domain.OutboxStatusRetrying)}).
 			Where("next_retry_at IS NULL OR next_retry_at <= ?", time.Now().UTC()).
 			Order("created_at ASC, id ASC").
 			Limit(limit).
 			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Find(&models).Error
+			Find(&rows).Error
 	})
 	if err != nil {
 		return nil, err
 	}
-	msgs := make([]*domain.OutboxMessage, len(models))
-	for i, m := range models {
+	msgs := make([]*domain.OutboxMessage, len(rows))
+	for i, m := range rows {
 		msgs[i] = toDomainOutbox(m)
 	}
 	return msgs, nil
@@ -79,22 +86,22 @@ func (r *GORMOutboxRepository) MarkPublished(ctx context.Context, ids []uuid.UUI
 	if len(ids) == 0 {
 		return nil
 	}
-	return r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
+	return r.db.WithContext(ctx).Table(r.table).
 		Where("id IN ?", ids).
 		Updates(map[string]any{"status": string(domain.OutboxStatusPublished), "published_at": publishedAt}).Error
 }
 
 // MarkRetrying bumps retry_count and sets next_retry_at = now() +
-// backoff(retry_count) — exponential with full jitter (Phase 5 Track 2.A) —
-// so FetchPending's new predicate makes the row wait out its backoff
-// instead of being re-fetched on the very next dispatch tick.
+// backoff(retry_count) — exponential with full jitter — so FetchPending's
+// predicate makes the row wait out its backoff instead of being re-fetched
+// on the very next dispatch tick.
 func (r *GORMOutboxRepository) MarkRetrying(ctx context.Context, id uuid.UUID, lastError string) error {
-	var m OutboxMessageModel
-	if err := r.db.WithContext(ctx).Select("retry_count").Where("id = ?", id).First(&m).Error; err != nil {
+	var m outboxRow
+	if err := r.db.WithContext(ctx).Table(r.table).Select("retry_count").Where("id = ?", id).First(&m).Error; err != nil {
 		return err
 	}
 	nextRetryAt := time.Now().UTC().Add(domain.Backoff(m.RetryCount+1, r.retryBackoffBase, r.retryBackoffCap))
-	return r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
+	return r.db.WithContext(ctx).Table(r.table).
 		Where("id = ?", id).
 		Updates(map[string]any{
 			"status":        string(domain.OutboxStatusRetrying),
@@ -105,46 +112,45 @@ func (r *GORMOutboxRepository) MarkRetrying(ctx context.Context, id uuid.UUID, l
 }
 
 func (r *GORMOutboxRepository) MarkDeadLetter(ctx context.Context, id uuid.UUID, lastError string) error {
-	return r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
+	return r.db.WithContext(ctx).Table(r.table).
 		Where("id = ?", id).
 		Updates(map[string]any{"status": string(domain.OutboxStatusDeadLetter), "last_error": lastError}).Error
 }
 
 func (r *GORMOutboxRepository) DeleteOldPublished(ctx context.Context, olderThan time.Duration) error {
 	cutoff := time.Now().UTC().Add(-olderThan)
-	return r.db.WithContext(ctx).
+	return r.db.WithContext(ctx).Table(r.table).
 		Where("status = ? AND published_at < ?", string(domain.OutboxStatusPublished), cutoff).
-		Delete(&OutboxMessageModel{}).Error
+		Delete(&outboxRow{}).Error
 }
 
-// CountPending returns the true count of NEW/RETRYING rows — Phase 5 Track
-// 2.B fix for the pending_count gauge being capped at batchSize.
+// CountPending returns the true count of NEW/RETRYING rows.
 func (r *GORMOutboxRepository) CountPending(ctx context.Context) (int64, error) {
 	var n int64
-	err := r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
+	err := r.db.WithContext(ctx).Table(r.table).
 		Where("status IN ?", []string{string(domain.OutboxStatusNew), string(domain.OutboxStatusRetrying)}).
 		Count(&n).Error
 	return n, err
 }
 
-// CountDeadLetter returns the count of DEAD_LETTER rows (Track 2.B).
+// CountDeadLetter returns the count of DEAD_LETTER rows.
 func (r *GORMOutboxRepository) CountDeadLetter(ctx context.Context) (int64, error) {
 	var n int64
-	err := r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
+	err := r.db.WithContext(ctx).Table(r.table).
 		Where("status = ?", string(domain.OutboxStatusDeadLetter)).
 		Count(&n).Error
 	return n, err
 }
 
-// ReplayDeadLetters implements domain.DLQReplayer (Phase 5 Track 2.C):
-// resets DEAD_LETTER rows back to NEW so the existing dispatch loop picks
-// them up and republishes. method == "" replays across every method.
-func (r *GORMOutboxRepository) ReplayDeadLetters(ctx context.Context, method string, limit int) (int64, error) {
+// ReplayDeadLetters implements domain.DLQReplayer: resets DEAD_LETTER rows
+// back to NEW so the existing dispatch loop picks them up and republishes.
+// eventType == "" replays across every event type.
+func (r *GORMOutboxRepository) ReplayDeadLetters(ctx context.Context, eventType string, limit int) (int64, error) {
 	var ids []uuid.UUID
-	q := r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
+	q := r.db.WithContext(ctx).Table(r.table).
 		Where("status = ?", string(domain.OutboxStatusDeadLetter))
-	if method != "" {
-		q = q.Where("payment_method = ?", method)
+	if eventType != "" {
+		q = q.Where("event_type = ?", eventType)
 	}
 	if limit > 0 {
 		q = q.Limit(limit)
@@ -155,7 +161,7 @@ func (r *GORMOutboxRepository) ReplayDeadLetters(ctx context.Context, method str
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	res := r.db.WithContext(ctx).Model(&OutboxMessageModel{}).
+	res := r.db.WithContext(ctx).Table(r.table).
 		Where("id IN ?", ids).
 		Updates(map[string]any{
 			"status":        string(domain.OutboxStatusNew),
@@ -166,7 +172,7 @@ func (r *GORMOutboxRepository) ReplayDeadLetters(ctx context.Context, method str
 	return res.RowsAffected, res.Error
 }
 
-func toDomainOutbox(m OutboxMessageModel) *domain.OutboxMessage {
+func toDomainOutbox(m outboxRow) *domain.OutboxMessage {
 	var headers map[string]string
 	_ = json.Unmarshal(m.Headers, &headers)
 	return &domain.OutboxMessage{
@@ -182,7 +188,8 @@ func toDomainOutbox(m OutboxMessageModel) *domain.OutboxMessage {
 		LastError:      m.LastError,
 		CreatedAt:      m.CreatedAt,
 		PublishedAt:    m.PublishedAt,
-		PaymentMethod:  m.PaymentMethod,
+		EventType:      m.EventType,
+		EventSubtype:   m.EventSubtype,
 		NextRetryAt:    m.NextRetryAt,
 	}
 }

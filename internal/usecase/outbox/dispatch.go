@@ -172,11 +172,15 @@ func (d *DispatchOutbox) dispatch(ctx context.Context) {
 		if markErr := d.outboxRepo.MarkPublished(ctx, ids, time.Now().UTC()); markErr != nil {
 			slog.ErrorContext(ctx, "outbox mark published error", "err", markErr.Error())
 		}
-		// Per-message, not batched, so the counter carries a `method`
-		// dimension — a Grafana panel can show publish rate per method,
-		// feeding capacity planning for the per-method KEDA limits.
+		// Per-message, not batched, so the counter carries event_type/
+		// event_subtype dimensions — a Grafana panel can show publish rate
+		// per (type, subtype), feeding capacity planning for the per-shard
+		// KEDA limits.
 		for _, msg := range published {
-			d.publishedTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("method", msg.PaymentMethod)))
+			d.publishedTotal.Add(ctx, 1, metric.WithAttributes(
+				attribute.String("event_type", msg.EventType),
+				attribute.String("event_subtype", msg.EventSubtype),
+			))
 		}
 	}
 

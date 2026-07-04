@@ -7,9 +7,9 @@ import (
 )
 
 func TestRedact_PlainTextKeyValue_Masked(t *testing.T) {
-	got := Redact(`payerDocument: 12345678900`)
+	got := Redact(`document: 12345678900`)
 	if strings.Contains(got, "12345678900") {
-		t.Fatalf("expected payerDocument value to be masked, got %q", got)
+		t.Fatalf("expected document value to be masked, got %q", got)
 	}
 	if !strings.Contains(got, mask) {
 		t.Fatalf("expected mask in output, got %q", got)
@@ -24,14 +24,14 @@ func TestRedact_NonJSONNonMatchingText_Unchanged(t *testing.T) {
 }
 
 func TestRedact_JSONObject_MasksSensitiveKeysOnly(t *testing.T) {
-	in := `{"payerDocument":"12345678900","barcode":"000111","amount":100,"endToEndId":"E1","txid":"T1","currency":"BRL"}`
+	in := `{"email":"buyer@example.com","document":"12345678900","amount":100,"validationCode":"vc1","signature":"sig1","currency":"BRL"}`
 	got := Redact(in)
 
 	var out map[string]interface{}
 	if err := json.Unmarshal([]byte(got), &out); err != nil {
 		t.Fatalf("expected valid JSON output, got error %v (output: %s)", err, got)
 	}
-	for _, k := range []string{"payerDocument", "barcode", "endToEndId", "txid"} {
+	for _, k := range []string{"email", "document", "validationCode", "signature"} {
 		if out[k] != mask {
 			t.Errorf("expected %s to be masked, got %v", k, out[k])
 		}
@@ -45,24 +45,24 @@ func TestRedact_JSONObject_MasksSensitiveKeysOnly(t *testing.T) {
 }
 
 func TestRedactJSON_NestedObjectsAndArrays_Masked(t *testing.T) {
-	in := []byte(`{"boleto":{"barcode":"123","dueDate":"2026-01-01"},"items":[{"payerDocument":"999"},{"other":"x"}]}`)
+	in := []byte(`{"customer":{"email":"buyer@example.com","name":"Jane"},"items":[{"document":"999"},{"other":"x"}]}`)
 	out := RedactJSON(in)
 
 	var v map[string]interface{}
 	if err := json.Unmarshal(out, &v); err != nil {
 		t.Fatalf("expected valid JSON, got error %v", err)
 	}
-	boleto := v["boleto"].(map[string]interface{})
-	if boleto["barcode"] != mask {
-		t.Errorf("expected nested barcode masked, got %v", boleto["barcode"])
+	customer := v["customer"].(map[string]interface{})
+	if customer["email"] != mask {
+		t.Errorf("expected nested email masked, got %v", customer["email"])
 	}
-	if boleto["dueDate"] != "2026-01-01" {
-		t.Errorf("expected dueDate untouched, got %v", boleto["dueDate"])
+	if customer["name"] != "Jane" {
+		t.Errorf("expected name untouched, got %v", customer["name"])
 	}
 	items := v["items"].([]interface{})
 	first := items[0].(map[string]interface{})
-	if first["payerDocument"] != mask {
-		t.Errorf("expected payerDocument inside array element masked, got %v", first["payerDocument"])
+	if first["document"] != mask {
+		t.Errorf("expected document inside array element masked, got %v", first["document"])
 	}
 	second := items[1].(map[string]interface{})
 	if second["other"] != "x" {
@@ -78,28 +78,28 @@ func TestRedactJSON_InvalidJSON_ReturnedUnchanged(t *testing.T) {
 	}
 }
 
-func TestRedact_CardNumber_MaskedInJSONAndText(t *testing.T) {
-	inJSON := `{"cardNumber":"4111111111111111","cardType":"CREDIT"}`
+func TestRedact_Signature_MaskedInJSONAndText(t *testing.T) {
+	inJSON := `{"signature":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","status":"VALID"}`
 	gotJSON := Redact(inJSON)
-	if strings.Contains(gotJSON, "4111111111111111") {
-		t.Fatalf("expected cardNumber value to be masked in JSON, got %q", gotJSON)
+	if strings.Contains(gotJSON, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") {
+		t.Fatalf("expected signature value to be masked in JSON, got %q", gotJSON)
 	}
 
-	inText := "cardNumber: 4111111111111111"
+	inText := "signature: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 	gotText := Redact(inText)
-	if strings.Contains(gotText, "4111111111111111") {
-		t.Fatalf("expected cardNumber value to be masked in text, got %q", gotText)
+	if strings.Contains(gotText, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") {
+		t.Fatalf("expected signature value to be masked in text, got %q", gotText)
 	}
 }
 
 func TestRedactJSON_KeyMatchIsCaseInsensitive(t *testing.T) {
-	in := []byte(`{"PAYERDOCUMENT":"12345678900"}`)
+	in := []byte(`{"DOCUMENT":"12345678900"}`)
 	out := RedactJSON(in)
 	var v map[string]interface{}
 	if err := json.Unmarshal(out, &v); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if v["PAYERDOCUMENT"] != mask {
-		t.Errorf("expected case-insensitive key match to mask value, got %v", v["PAYERDOCUMENT"])
+	if v["DOCUMENT"] != mask {
+		t.Errorf("expected case-insensitive key match to mask value, got %v", v["DOCUMENT"])
 	}
 }

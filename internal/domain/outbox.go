@@ -19,17 +19,23 @@ const (
 type OutboxMessage struct {
 	ID             uuid.UUID
 	IdempotencyKey string
-	AggregateType  string
-	HTTPMethod     string
-	Route          string
-	Payload        []byte
-	Headers        map[string]string
-	Status         OutboxStatus
-	RetryCount     int
-	LastError      string
-	CreatedAt      time.Time
-	PublishedAt    *time.Time
-	PaymentMethod  string // e.g. "PIX" — drives the per-method routing key
+	// AggregateType is "order" or "payment_event" — which of the two
+	// outboxes (order_outbox / payment_event_outbox) this row belongs to.
+	// The publisher uses it to pick the RabbitMQ stream (queue-name/
+	// routing-key prefix) a message routes to (rmq.StreamForAggregateType);
+	// EventType/EventSubtype pick the specific queue within that stream.
+	AggregateType string
+	HTTPMethod    string
+	Route         string
+	Payload       []byte
+	Headers       map[string]string
+	Status        OutboxStatus
+	RetryCount    int
+	LastError     string
+	CreatedAt     time.Time
+	PublishedAt   *time.Time
+	EventType     string // e.g. "CONCERT" — drives per-(type,subtype) routing
+	EventSubtype  string // e.g. "ROCK"
 	// NextRetryAt gates FetchPending eligibility (Phase 5 Track 2.A): NULL
 	// for NEW rows (eligible immediately), set to now()+backoff(RetryCount)
 	// by MarkRetrying so RETRYING rows wait out their backoff instead of
@@ -70,11 +76,11 @@ type OutboxRepository interface {
 // (rather than folded into OutboxRepository) so cmd/outbox-admin depends on
 // exactly the operation it needs.
 type DLQReplayer interface {
-	// ReplayDeadLetters resets up to limit DEAD_LETTER rows for method (or
-	// all methods if method is "") back to status=NEW, retry_count=0,
-	// next_retry_at=NULL, last_error cleared. Returns the number of rows
-	// reset.
-	ReplayDeadLetters(ctx context.Context, method string, limit int) (int64, error)
+	// ReplayDeadLetters resets up to limit DEAD_LETTER rows for eventType
+	// (or every event type if eventType is "") back to status=NEW,
+	// retry_count=0, next_retry_at=NULL, last_error cleared. Returns the
+	// number of rows reset.
+	ReplayDeadLetters(ctx context.Context, eventType string, limit int) (int64, error)
 }
 
 type Publisher interface {

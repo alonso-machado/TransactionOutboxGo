@@ -33,7 +33,7 @@ func healthz(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
-func NewRouter(paymentHandler *PaymentHandler, ticketHandler *TicketHandler, serviceName string, swaggerEnabled bool, rl RouterConfig) *gin.Engine {
+func NewRouter(orderHandler *OrderHandler, webhookHandler *WebhookHandler, serviceName string, swaggerEnabled bool, rl RouterConfig) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(gin.Logger())
@@ -50,11 +50,13 @@ func NewRouter(paymentHandler *PaymentHandler, ticketHandler *TicketHandler, ser
 		v1.Use(ratelimit.Middleware(rl.RateLimitStore, rl.RateLimitRate, rl.RateLimitBurst))
 	}
 	{
-		v1.POST("/payments", paymentHandler.Handle)
-		v1.PUT("/payments/:id", paymentHandler.Handle)
-		v1.PATCH("/payments/:id", paymentHandler.Handle)
-		v1.POST("/ticket", ticketHandler.Handle)
+		v1.POST("/orders", orderHandler.Handle)
 	}
+
+	// The gateway webhook route sits OUTSIDE the rate-limited v1 group: a
+	// payment gateway calls back from its own infrastructure, not a single
+	// client IP, and must never be throttled by the leaky-bucket limiter.
+	r.POST("/api/v1/webhooks/payments/:provider", webhookHandler.Handle)
 
 	if swaggerEnabled {
 		docs.SwaggerInfo.Title = serviceName

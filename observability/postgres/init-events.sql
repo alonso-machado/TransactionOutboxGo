@@ -1,0 +1,14 @@
+-- Runs once, on a fresh Postgres data dir, via the official image's
+-- /docker-entrypoint-initdb.d hook (see docker-compose.yml's postgres volume
+-- mount). The image already creates POSTGRES_DB (the `outbox` database, which
+-- holds order_outbox/payment_event_outbox); this adds the second logical
+-- database in the SAME instance for the events domain
+-- (locations/events/orders/tickets/charges).
+--
+-- Why two databases: ingestion-api/outbox-worker only ever touch the outbox
+-- tables, order-worker/fulfillment-worker only ever touch the events domain,
+-- and no transaction spans the two — so splitting them keeps the ingestion
+-- side and the domain side on independent schemas (and independent
+-- golang-migrate version histories) without giving up the
+-- transactional-outbox guarantee.
+CREATE DATABASE events;

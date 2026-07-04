@@ -23,10 +23,28 @@ type Config struct {
 	RetryBackoffCap  time.Duration `envconfig:"RETRY_BACKOFF_CAP" default:"5m"`
 	PrefetchCount    int           `envconfig:"PREFETCH_COUNT" default:"10"`
 	MaxDeliveries    int           `envconfig:"MAX_DELIVERIES" default:"5"`
-	// PaymentQueue is consumer-worker-only. Not `required` here because Config
-	// is shared with ingestion-api, which never sets it — consumer-worker's
-	// main.go fails fast itself if this is empty or not a known queue.
-	PaymentQueue    string `envconfig:"PAYMENT_QUEUE"`
+	// ConsumerQueue is order-consumer-worker/fulfillment-consumer-worker-only — the single
+	// RabbitMQ queue name that process instance binds to (one shard, e.g.
+	// "events.concert.rock.queue"). Not `required` here because Config is
+	// shared with ingestion-api, which never sets it — each consumer
+	// binary's main.go fails fast itself if this is empty or not a known
+	// queue (rmq.ParseQueueName).
+	ConsumerQueue string `envconfig:"CONSUMER_QUEUE"`
+
+	// PaymentProvider selects the domain.PaymentGateway adapter order-consumer-worker
+	// (CreateCheckout) and ingestion-api (VerifyWebhook) wire up: "fake" (no
+	// network, the default — local dev/tests/k6), "stripe" (real), or a
+	// scaffolded stub ("abacatepay", "lemonsqueezy").
+	PaymentProvider     string `envconfig:"PAYMENT_PROVIDER" default:"fake"`
+	StripeSecretKey     string `envconfig:"STRIPE_SECRET_KEY"`
+	StripeWebhookSecret string `envconfig:"STRIPE_WEBHOOK_SECRET"`
+	// CheckoutSuccessURL is where the gateway redirects the customer after a
+	// successful hosted checkout.
+	CheckoutSuccessURL string `envconfig:"CHECKOUT_SUCCESS_URL" default:"http://localhost:8080/orders/success"`
+	// TicketSigningSecret is the HMAC key internal/adapter/ticketqr signs
+	// every issued ticket's validation code with.
+	TicketSigningSecret string `envconfig:"TICKET_SIGNING_SECRET" default:"dev-ticket-signing-secret"`
+
 	OtelServiceName string `envconfig:"OTEL_SERVICE_NAME" default:"transaction-outbox-go"`
 	OtelEndpoint    string `envconfig:"OTEL_EXPORTER_OTLP_ENDPOINT" default:"localhost:4318"`
 	MetricsPort     string `envconfig:"METRICS_PORT" default:"9090"`

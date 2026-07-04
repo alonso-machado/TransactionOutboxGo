@@ -1,16 +1,19 @@
 // Package main is the composition root for outbox-worker.
 //
-// outbox-worker is the Transactional Outbox relay (DispatchOutbox): it polls
-// the outbox_messages table (with a LISTEN/NOTIFY fast path), publishes NEW/
-// RETRYING rows to RabbitMQ with publisher confirms, and marks them
-// PUBLISHED / RETRYING / DEAD_LETTER. It was split out of ingestion-api so the
-// relay can scale on outbox backlog (KEDA) independently of the fixed-size
-// HTTP front door — ingestion-api now only writes the outbox row, and this
-// process is the only thing that reads it and talks to RabbitMQ.
+// outbox-worker is the Transactional Outbox relay (DispatchOutbox), run
+// twice over: once for order_outbox (order intake -> order-consumer-worker,
+// with a LISTEN/NOTIFY fast path) and once for payment_event_outbox (payment-
+// gateway webhook confirmations -> fulfillment-consumer-worker, poll-only — lower
+// volume, doesn't need the low-latency path). Both publish with confirms
+// and mark PUBLISHED/RETRYING/DEAD_LETTER; it was split out of ingestion-api
+// so the relay scales on outbox backlog (KEDA) independently of the
+// fixed-size HTTP front door — ingestion-api only writes the outbox rows,
+// and this process is the only thing that reads them and talks to
+// RabbitMQ.
 //
 // It connects to the *outbox* database (the same Postgres instance as the
-// payments DB, different logical database) and shares the RabbitMQ topology it
-// declares here with consumer-worker.
+// events DB, different logical database) and declares the RabbitMQ topology
+// shared with order-consumer-worker/fulfillment-consumer-worker.
 package main
 
 import (
@@ -33,9 +36,6 @@ import (
 
 func main() {
 	ctx := context.Background()
-	// Startup logger: telemetry.Setup (which installs the trace-correlating
-	// default logger) needs cfg first, so config-load failures use a bare
-	// logger with no trace correlation — there's no span yet anyway.
 	startupLog := logging.NewLogger("startup", "json", os.Stdout)
 
 	cfg, err := config.Load()
@@ -62,9 +62,9 @@ func main() {
 		slog.ErrorContext(ctx, "database connect failed", "err", err.Error())
 		os.Exit(1)
 	}
-	// Schema migrations are applied by the migrate/migrate one-shot against the
-	// outbox DB before this starts (see docker-compose.yml's migrate-outbox
-	// service / `make migrate`), never here.
+	// Schema migrations are applied by the migrate/migrate one-shot against
+	// the outbox DB before this starts (see docker-compose.yml's
+	// migrate-outbox service / `make migrate`), never here.
 
 	conn, err := rmq.Connect(cfg.RabbitMQURL, cfg.RabbitMQTLS)
 	if err != nil {
@@ -74,8 +74,9 @@ func main() {
 	defer func() { _ = conn.Close() }()
 
 	// outbox-worker is the sole publisher, so it owns topology declaration
-	// (the shared exchange/DLX + every method's queue/retry/DLQ). Idempotent —
-	// consumer-worker never declares, it relies on this having run.
+	// (the shared exchange/DLX + every shard's queue/retry/DLQ, on both
+	// streams). Idempotent — order-consumer-worker/fulfillment-consumer-worker never declare
+	// the full topology, they rely on this having run.
 	ch, err := conn.Channel()
 	if err != nil {
 		slog.ErrorContext(ctx, "rabbitmq channel failed", "err", err.Error())
@@ -89,29 +90,25 @@ func main() {
 		slog.ErrorContext(ctx, "close topology channel error", "err", err.Error())
 	}
 
-	outboxRepo := persistence.NewOutboxRepository(db, cfg.RetryBackoffBase, cfg.RetryBackoffCap)
 	publisher := messaging.NewPublisher(conn)
+	dispatchInterval := time.Duration(cfg.DispatchInterval) * time.Millisecond
+	pruneAfter := time.Duration(cfg.PruneAfterHours) * time.Hour
 
-	dispatchUC := outboxuc.New(
-		outboxRepo,
-		publisher,
-		cfg.DispatchBatchSize,
-		cfg.MaxRetries,
-		time.Duration(cfg.DispatchInterval)*time.Millisecond,
-		time.Duration(cfg.PruneAfterHours)*time.Hour,
-	)
+	orderOutboxRepo := persistence.NewOutboxRepository(db, "order_outbox", cfg.RetryBackoffBase, cfg.RetryBackoffCap)
+	orderDispatchUC := outboxuc.New(orderOutboxRepo, publisher, cfg.DispatchBatchSize, cfg.MaxRetries, dispatchInterval, pruneAfter)
+
+	paymentEventOutboxRepo := persistence.NewOutboxRepository(db, "payment_event_outbox", cfg.RetryBackoffBase, cfg.RetryBackoffCap)
+	paymentEventDispatchUC := outboxuc.New(paymentEventOutboxRepo, publisher, cfg.DispatchBatchSize, cfg.MaxRetries, dispatchInterval, pruneAfter)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Phase 5 Track 3.A — a dedicated LISTEN connection wakes DispatchOutbox
-	// immediately on enqueue; the poll ticker inside Run remains the
-	// correctness fallback if this connection ever drops. Now that the relay
-	// is a separate process, the NOTIFY emitted by ingestion-api's INSERT
-	// (migrations/outbox/..._outbox_notify) still wakes this listener — NOTIFY
-	// is delivered to every backend LISTENing on the channel, across processes.
-	notifyListener := database.NewListener(cfg.DatabaseURL)
-	go notifyListener.Run(ctx)
+	// A dedicated LISTEN connection wakes the order dispatcher immediately
+	// on enqueue; the poll ticker inside Run remains the correctness
+	// fallback if this connection ever drops. payment_event_outbox has no
+	// Listener — it's poll-only (lower volume, no low-latency need).
+	orderNotifyListener := database.NewListener(cfg.DatabaseURL, "order_outbox_new")
+	go orderNotifyListener.Run(ctx)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -122,5 +119,6 @@ func main() {
 	}()
 
 	slog.InfoContext(ctx, "outbox-worker started")
-	dispatchUC.Run(ctx, notifyListener.Notify)
+	go paymentEventDispatchUC.Run(ctx, nil)
+	orderDispatchUC.Run(ctx, orderNotifyListener.Notify)
 }

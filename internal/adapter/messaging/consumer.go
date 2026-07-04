@@ -12,7 +12,6 @@ import (
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain/pii"
 	rmq "github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/rabbitmq"
 	"github.com/alonsomachado/transaction-outbox-go/internal/observability"
-	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/consume"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -26,10 +25,23 @@ import (
 // for why.
 const retryCountHeader = "x-retry-count"
 
+// MessageProcessor is what AMQPConsumer hands each delivery's body to.
+// order-consumer-worker's usecase/checkout.ProcessOrder and fulfillment-consumer-worker's
+// usecase/fulfillment.IssueTickets both implement this same signature, so
+// one generic consumer serves both streams instead of two near-identical
+// copies (the old per-payment-method consumer only ever had one use-case to
+// call; the pivot's two independent consumer roles are the reason this is
+// now an interface).
+type MessageProcessor interface {
+	Execute(ctx context.Context, messageID string, body []byte) (created bool, err error)
+}
+
 type AMQPConsumer struct {
 	conn             *amqp.Connection
-	processMsg       *consume.ProcessMessage
-	method           string
+	processor        MessageProcessor
+	stream           rmq.Stream
+	eventType        string
+	eventSubtype     string
 	prefetch         int
 	maxDeliveries    int
 	retryBackoffBase time.Duration
@@ -38,12 +50,13 @@ type AMQPConsumer struct {
 	retryAttempts    metric.Int64Counter
 }
 
-// NewConsumer builds a consumer bound to method's queue (e.g. "PIX" ->
-// payments.pix.queue) — each consumer-worker instance consumes exactly one
-// method's queue, decoupling payment methods from consumer scaling.
-// retryBackoffBase/Cap drive the per-message TTL on the *.retry queue
-// (Phase 5 Track 2.A); zero values fall back to 1s/5m.
-func NewConsumer(conn *amqp.Connection, processMsg *consume.ProcessMessage, method string, prefetch, maxDeliveries int, retryBackoffBase, retryBackoffCap time.Duration) *AMQPConsumer {
+// NewConsumer builds a consumer bound to (stream, eventType, eventSubtype)'s
+// queue, e.g. (OrderStream, "CONCERT", "ROCK") -> events.concert.rock.queue.
+// Each order-consumer-worker/fulfillment-consumer-worker instance consumes exactly one shard's
+// queue, decoupling event types from consumer scaling. retryBackoffBase/Cap
+// drive the per-message TTL on the shard's *.retry queue; zero values fall
+// back to 1s/5m.
+func NewConsumer(conn *amqp.Connection, processor MessageProcessor, stream rmq.Stream, eventType, eventSubtype string, prefetch, maxDeliveries int, retryBackoffBase, retryBackoffCap time.Duration) *AMQPConsumer {
 	if retryBackoffBase <= 0 {
 		retryBackoffBase = time.Second
 	}
@@ -53,8 +66,10 @@ func NewConsumer(conn *amqp.Connection, processMsg *consume.ProcessMessage, meth
 	meter := otel.GetMeterProvider().Meter("adapter/messaging")
 	return &AMQPConsumer{
 		conn:             conn,
-		processMsg:       processMsg,
-		method:           method,
+		processor:        processor,
+		stream:           stream,
+		eventType:        eventType,
+		eventSubtype:     eventSubtype,
 		prefetch:         prefetch,
 		maxDeliveries:    maxDeliveries,
 		retryBackoffBase: retryBackoffBase,
@@ -64,15 +79,16 @@ func NewConsumer(conn *amqp.Connection, processMsg *consume.ProcessMessage, meth
 	}
 }
 
-// metricAttrs are the dimensions every consumer metric is sliced by — method
-// and its bound queue/routing (binding) key, so a Grafana panel can isolate
-// one payment method's throughput/retry/poison rate from the others even
-// though every method's consumer shares this same code path.
+// metricAttrs are the dimensions every consumer metric is sliced by — the
+// shard's event_type/event_subtype/queue/routing key, so a Grafana panel can
+// isolate one shard's throughput/retry/poison rate from the others even
+// though every shard's consumer shares this same code path.
 func (c *AMQPConsumer) metricAttrs(extra ...attribute.KeyValue) metric.AddOption {
 	attrs := append([]attribute.KeyValue{
-		attribute.String("payment_method", c.method),
-		attribute.String("payment_queue", rmq.QueueFor(c.method)),
-		attribute.String("routing_key", rmq.RoutingKeyFor(c.method)),
+		attribute.String("event_type", c.eventType),
+		attribute.String("event_subtype", c.eventSubtype),
+		attribute.String("queue", rmq.QueueFor(c.stream, c.eventType, c.eventSubtype)),
+		attribute.String("routing_key", rmq.RoutingKeyFor(c.stream, c.eventType, c.eventSubtype)),
 	}, extra...)
 	return metric.WithAttributes(attrs...)
 }
@@ -84,7 +100,7 @@ func (c *AMQPConsumer) Run(ctx context.Context) error {
 	}
 	defer func() { _ = ch.Close() }()
 
-	if err := rmq.DeclareQueue(ch, c.method); err != nil {
+	if err := rmq.DeclareQueue(ch, c.stream, c.eventType, c.eventSubtype); err != nil {
 		return fmt.Errorf("declare queue: %w", err)
 	}
 
@@ -92,7 +108,8 @@ func (c *AMQPConsumer) Run(ctx context.Context) error {
 		return err
 	}
 
-	deliveries, err := ch.Consume(rmq.QueueFor(c.method), "", false, false, false, false, nil)
+	queue := rmq.QueueFor(c.stream, c.eventType, c.eventSubtype)
+	deliveries, err := ch.Consume(queue, "", false, false, false, false, nil)
 	if err != nil {
 		return err
 	}
@@ -114,19 +131,17 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 	ctx = otel.GetTextMapPropagator().Extract(ctx, amqpHeaderCarrier(d.Headers))
 	retryCount := retryCountFromHeaders(d.Headers)
 	isRetry := retryCount > 0
-	routingKey := rmq.RoutingKeyFor(c.method)
+	routingKey := rmq.RoutingKeyFor(c.stream, c.eventType, c.eventSubtype)
 	ctx, span := tracer.Start(ctx, "rabbitmq.consume", trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(
 			attribute.String("message_id", d.MessageId),
 			attribute.Bool("redelivered", d.Redelivered),
 			attribute.Int("retry_count", retryCount),
 			attribute.Bool("is_retry", isRetry),
-			// Lets traces/logs be sliced per payment method even though
-			// every method's consumer shares this same code path — each
-			// consumer-worker instance only ever handles its own method.
-			attribute.String("payment_method", c.method),
-			attribute.String("payment_queue", rmq.QueueFor(c.method)),
-			attribute.String("routing_key", routingKey), // the topic-exchange binding key this message arrived on
+			attribute.String("event_type", c.eventType),
+			attribute.String("event_subtype", c.eventSubtype),
+			attribute.String("queue", rmq.QueueFor(c.stream, c.eventType, c.eventSubtype)),
+			attribute.String("routing_key", routingKey),
 		),
 	)
 	defer span.End()
@@ -135,7 +150,7 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 		c.retryAttempts.Add(ctx, 1, c.metricAttrs(attribute.Int("retry_count", retryCount)))
 	}
 
-	created, err := c.processMsg.Execute(ctx, d.MessageId, d.Body)
+	created, err := c.processor.Execute(ctx, d.MessageId, d.Body)
 	if err != nil {
 		slog.ErrorContext(ctx, "process message error", "message_id", d.MessageId, "err", pii.Redact(err.Error()), "attempt", retryCount+1)
 		span.RecordError(errors.New(pii.Redact(err.Error())))
@@ -144,8 +159,8 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 		// An unknown/newer schema version can never succeed on retry — it's
 		// a structural incompatibility, not a transient failure — so reject
 		// straight to DLQ on the first attempt instead of burning through
-		// maxDeliveries (Phase 5 Track 2.D).
-		if errors.Is(err, consume.ErrUnknownSchemaVersion) {
+		// maxDeliveries.
+		if errors.Is(err, domain.ErrUnknownSchemaVersion) {
 			slog.ErrorContext(ctx, "unknown schema version — rejecting to DLQ", "message_id", d.MessageId, "outcome", "unknown_schema_version")
 			span.SetAttributes(attribute.String("outcome", "unknown_schema_version"))
 			c.messagesTotal.Add(ctx, 1, c.metricAttrs(attribute.String("outcome", "unknown_schema_version")))
@@ -173,10 +188,10 @@ func (c *AMQPConsumer) handle(ctx context.Context, d amqp.Delivery) {
 	}
 
 	// A redelivery of an already-processed message lands here with
-	// created=false (the (source_message_id, occurred_at) UNIQUE constraint
-	// absorbed it as a no-op, not an error) — tagged "duplicate" rather than
-	// "ack" so it's visible as its own outcome, distinct from both a fresh
-	// save and any error/DLQ path above.
+	// created=false (a UNIQUE constraint absorbed it as a no-op, not an
+	// error) — tagged "duplicate" rather than "ack" so it's visible as its
+	// own outcome, distinct from both a fresh save and any error/DLQ path
+	// above.
 	outcome := "ack"
 	if !created {
 		outcome = "duplicate"
@@ -200,15 +215,14 @@ func retryCountFromHeaders(h amqp.Table) int {
 	}
 }
 
-// requeueWithRetryCount publishes the delivery onto the per-method
-// *.retry queue (Phase 5 Track 2.A) with its retry count incremented and a
-// per-message `expiration` (TTL) set to the computed backoff, then the
-// caller Acks the original delivery — a plain Nack(requeue=true) can't
-// carry an updated header or a delay, so the retry has to be a fresh
-// publish. The retry queue has no consumer; once its TTL elapses the broker
-// dead-letters the message back onto the main queue (see
-// rmq.declareMethodQueue's retryArgs), giving variable per-message
-// exponential backoff with no broker plugin.
+// requeueWithRetryCount publishes the delivery onto the shard's *.retry
+// queue with its retry count incremented and a per-message `expiration`
+// (TTL) set to the computed backoff, then the caller Acks the original
+// delivery — a plain Nack(requeue=true) can't carry an updated header or a
+// delay, so the retry has to be a fresh publish. The retry queue has no
+// consumer; once its TTL elapses the broker dead-letters the message back
+// onto the main queue (see rmq.declareShardQueue's retryArgs), giving
+// variable per-message exponential backoff with no broker plugin.
 func (c *AMQPConsumer) requeueWithRetryCount(d amqp.Delivery, retryCount int) error {
 	ch, err := c.conn.Channel()
 	if err != nil {
@@ -230,11 +244,13 @@ func (c *AMQPConsumer) requeueWithRetryCount(d amqp.Delivery, retryCount int) er
 	backoff := domain.Backoff(retryCount, c.retryBackoffBase, c.retryBackoffCap)
 	expirationMs := strconv.FormatInt(backoff.Milliseconds(), 10)
 
+	retryQueue := rmq.RetryQueueFor(c.stream, c.eventType, c.eventSubtype)
+
 	// Publish directly to the retry queue (default exchange, routing key =
 	// queue name) — it isn't bound to rmq.Exchange, it's a holding pen the
 	// message sits in for its TTL before the broker's own DLX redelivers it
 	// onto the main queue.
-	err = ch.PublishWithContext(context.Background(), "", rmq.RetryQueueFor(c.method), false, false, amqp.Publishing{
+	err = ch.PublishWithContext(context.Background(), "", retryQueue, false, false, amqp.Publishing{
 		ContentType:  d.ContentType,
 		DeliveryMode: amqp.Persistent,
 		MessageId:    d.MessageId,

@@ -108,7 +108,13 @@ func (p *AMQPPublisher) fire(ctx context.Context, ch *amqp.Channel, msg *domain.
 	}
 	otel.GetTextMapPropagator().Inject(ctx, amqpHeaderCarrier(headers))
 
-	return ch.PublishWithContext(ctx, rmq.Exchange, rmq.RoutingKeyFor(msg.PaymentMethod), false, false, amqp.Publishing{
+	stream, ok := rmq.StreamForAggregateType(msg.AggregateType)
+	if !ok {
+		return fmt.Errorf("unknown aggregate type %q for message %s", msg.AggregateType, msg.IdempotencyKey)
+	}
+	routingKey := rmq.RoutingKeyFor(stream, msg.EventType, msg.EventSubtype)
+
+	return ch.PublishWithContext(ctx, rmq.Exchange, routingKey, false, false, amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		MessageId:    msg.IdempotencyKey,

@@ -23,37 +23,61 @@ func TestWithAMQPS(t *testing.T) {
 	}
 }
 
-func TestIsValidMethod(t *testing.T) {
-	for _, m := range Methods {
-		if !IsValidMethod(m) {
-			t.Errorf("expected %q to be a valid method", m)
+func TestIsValidEventType(t *testing.T) {
+	for eventType, subtypes := range EventTypes {
+		for _, subtype := range subtypes {
+			if !IsValidEventType(eventType, subtype) {
+				t.Errorf("expected (%q, %q) to be valid", eventType, subtype)
+			}
 		}
 	}
-	if IsValidMethod("CARD") {
-		t.Error("expected an unknown method to be rejected")
+	if IsValidEventType("CONCERT", "OPERA") {
+		t.Error("expected an unknown subtype to be rejected")
+	}
+	if IsValidEventType("UNKNOWN", "ROCK") {
+		t.Error("expected an unknown event type to be rejected")
 	}
 }
 
-func TestMethodForQueue(t *testing.T) {
-	if m, ok := MethodForQueue(QueueFor("PIX")); !ok || m != "PIX" {
-		t.Fatalf("MethodForQueue(%q) = %q,%v; want PIX,true", QueueFor("PIX"), m, ok)
+func TestParseQueueName(t *testing.T) {
+	queue := QueueFor(OrderStream, "CONCERT", "ROCK")
+	stream, eventType, eventSubtype, ok := ParseQueueName(queue)
+	if !ok || stream != OrderStream || eventType != "CONCERT" || eventSubtype != "ROCK" {
+		t.Fatalf("ParseQueueName(%q) = %v,%q,%q,%v; want OrderStream,CONCERT,ROCK,true", queue, stream, eventType, eventSubtype, ok)
 	}
-	if _, ok := MethodForQueue("payments.unknown.queue"); ok {
+	if _, _, _, ok := ParseQueueName("events.unknown.unknown.queue"); ok {
 		t.Fatal("expected an unmapped queue name to return ok=false")
 	}
 }
 
 func TestQueueNameHelpers(t *testing.T) {
 	cases := map[string]string{
-		QueueFor("PIX"):         "payments.pix.queue",
-		DLQFor("PIX"):           "payments.pix.dlq",
-		RetryQueueFor("PIX"):    "payments.pix.retry",
-		RoutingKeyFor("PIX"):    "payment.pix",
-		DLXRoutingKeyFor("PIX"): "payment.pix.dead",
+		QueueFor(OrderStream, "CONCERT", "ROCK"):               "events.concert.rock.queue",
+		DLQFor(OrderStream, "CONCERT", "ROCK"):                 "events.concert.rock.dlq",
+		RetryQueueFor(OrderStream, "CONCERT", "ROCK"):          "events.concert.rock.retry",
+		RoutingKeyFor(OrderStream, "CONCERT", "ROCK"):          "order.concert.rock",
+		DLXRoutingKeyFor(OrderStream, "CONCERT", "ROCK"):       "order.concert.rock.dead",
+		QueueFor(PaymentEventStream, "CONCERT", "ROCK"):        "payments.concert.rock.queue",
+		DLQFor(PaymentEventStream, "CONCERT", "ROCK"):          "payments.concert.rock.dlq",
+		RetryQueueFor(PaymentEventStream, "CONCERT", "ROCK"):   "payments.concert.rock.retry",
+		RoutingKeyFor(PaymentEventStream, "CONCERT", "ROCK"):   "payment.concert.rock",
+		DLXRoutingKeyFor(PaymentEventStream, "CONCERT", "ROCK"): "payment.concert.rock.dead",
 	}
 	for got, want := range cases {
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)
 		}
+	}
+}
+
+func TestStreamForAggregateType(t *testing.T) {
+	if s, ok := StreamForAggregateType("order"); !ok || s != OrderStream {
+		t.Fatalf("StreamForAggregateType(order) = %v,%v; want OrderStream,true", s, ok)
+	}
+	if s, ok := StreamForAggregateType("payment_event"); !ok || s != PaymentEventStream {
+		t.Fatalf("StreamForAggregateType(payment_event) = %v,%v; want PaymentEventStream,true", s, ok)
+	}
+	if _, ok := StreamForAggregateType("unknown"); ok {
+		t.Fatal("expected an unknown aggregate type to return ok=false")
 	}
 }

@@ -3,7 +3,7 @@ COMPOSE_FILE := docker-compose.yml
 COMPOSE      := podman compose -f $(COMPOSE_FILE)
 GO           := podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine
 
-.PHONY: up down logs build test tidy seed seed-pix seed-boleto seed-transfer seed-card lint swag test-unit test-integration coverage coverage-all observability-up migrate migrate-down replay-dead drain-dlq purge-loadtest-dlq
+.PHONY: up down logs build test tidy seed seed-order seed-order-sports seed-webhook-confirm lint swag test-unit test-integration coverage coverage-all observability-up migrate migrate-down replay-dead drain-dlq purge-loadtest-dlq
 
 ## ── Docker Compose ────────────────────────────────────────────────────────────
 
@@ -13,75 +13,79 @@ up: migrate
 down:
 	$(COMPOSE) down -v
 
-# Phase 5 Track 1: golang-migrate as a container, not the app, applies
-# migrations/<set>/*.up.sql against the compose Postgres before `up` brings up
-# the app services. Connects on localhost using compose's published Postgres
-# port, so Postgres must already be up — `make up`'s dependency on this target
-# starts it first.
+# golang-migrate as a container, not the app, applies migrations/<set>/*.up.sql
+# against the compose Postgres before `up` brings up the app services.
+# Connects on localhost using compose's published Postgres port, so Postgres
+# must already be up — `make up`'s dependency on this target starts it first.
 #
-# Two sets, one per logical database (the outbox/payments split): outbox/ ->
-# the `outbox` DB, payments/ -> the `payments` DB. The compose postgres init
-# script (observability/postgres/init-payments.sql) creates `payments` only on
-# a fresh volume, so migrate also CREATE-DATABASEs it if missing — keeps this
+# Two sets, one per logical database (the outbox/events split): outbox/ ->
+# the `outbox` DB, events/ -> the `events` DB. The compose postgres init
+# script (observability/postgres/init-events.sql) creates `events` only on a
+# fresh volume, so migrate also CREATE-DATABASEs it if missing — keeps this
 # target idempotent against a pre-existing single-DB volume.
 POSTGRES_USER     ?= outbox
 POSTGRES_PASSWORD ?= outbox
 POSTGRES_PORT     ?= 5432
 POSTGRES_DB       ?= outbox
-PAYMENTS_DB       ?= payments
-MIGRATE_DSN_OUTBOX   := postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable
-MIGRATE_DSN_PAYMENTS := postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/$(PAYMENTS_DB)?sslmode=disable
+EVENTS_DB         ?= events
+MIGRATE_DSN_OUTBOX := postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable
+MIGRATE_DSN_EVENTS := postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/$(EVENTS_DB)?sslmode=disable
 
-# Roll back one step in this set (default outbox); override with DB=payments.
+# Roll back one step in this set (default outbox); override with DB=events.
 MIGRATE_DOWN_PATH ?= migrations/outbox
 MIGRATE_DOWN_DSN  ?= $(MIGRATE_DSN_OUTBOX)
 
 migrate:
 	$(COMPOSE) up --build -d postgres
 	$(COMPOSE) exec -T postgres sh -c \
-		"psql -U $(POSTGRES_USER) -tc \"SELECT 1 FROM pg_database WHERE datname='$(PAYMENTS_DB)'\" | grep -q 1 || createdb -U $(POSTGRES_USER) $(PAYMENTS_DB)"
+		"psql -U $(POSTGRES_USER) -tc \"SELECT 1 FROM pg_database WHERE datname='$(EVENTS_DB)'\" | grep -q 1 || createdb -U $(POSTGRES_USER) $(EVENTS_DB)"
 	podman run --rm -v "$(CURDIR)/migrations:/migrations" --network host \
 		migrate/migrate -path=/migrations/outbox -database "$(MIGRATE_DSN_OUTBOX)" up
 	podman run --rm -v "$(CURDIR)/migrations:/migrations" --network host \
-		migrate/migrate -path=/migrations/payments -database "$(MIGRATE_DSN_PAYMENTS)" up
+		migrate/migrate -path=/migrations/events -database "$(MIGRATE_DSN_EVENTS)" up
 
 migrate-down:
 	podman run --rm -v "$(CURDIR)/migrations:/migrations" --network host \
 		migrate/migrate -path=/$(MIGRATE_DOWN_PATH) -database "$(MIGRATE_DOWN_DSN)" down 1
 
-# Phase 5 Track 2.C — DLQ replay convenience targets. METHOD="" (default)
-# replays across every method for replay-dead; drain-dlq requires METHOD.
-# --network host + localhost DSNs so this reaches the compose Postgres/
-# RabbitMQ published ports, same pattern as test-integration.
-LIMIT ?= 100
+# DLQ replay convenience targets. EVENT_TYPE="" (default) replays across
+# every event type for replay-dead; drain-dlq/purge-loadtest-dlq require
+# STREAM, EVENT_TYPE, EVENT_SUBTYPE. --network host + localhost DSNs so this
+# reaches the compose Postgres/RabbitMQ published ports, same pattern as
+# test-integration.
+LIMIT       ?= 100
+OUTBOX      ?= order
+STREAM      ?= order
+EVENT_TYPE    ?=
+EVENT_SUBTYPE ?=
 ADMIN_DATABASE_URL := postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable
 ADMIN_RABBITMQ_URL  := amqp://$${RABBITMQ_USER:-guest}:$${RABBITMQ_PASSWORD:-guest}@localhost:$${RABBITMQ_AMQP_PORT:-5672}/
 
 replay-dead:
 	podman run --rm --network host -v "$(CURDIR):/app" -w /app \
 		-e DATABASE_URL="$(ADMIN_DATABASE_URL)" -e RABBITMQ_URL="$(ADMIN_RABBITMQ_URL)" \
-		golang:1.26-alpine go run ./cmd/outbox-admin replay-dead --method "$(METHOD)" --limit "$(LIMIT)"
+		golang:1.26-alpine go run ./cmd/outbox-admin replay-dead --outbox "$(OUTBOX)" --event-type "$(EVENT_TYPE)" --limit "$(LIMIT)"
 
 drain-dlq:
 	podman run --rm --network host -v "$(CURDIR):/app" -w /app \
 		-e DATABASE_URL="$(ADMIN_DATABASE_URL)" -e RABBITMQ_URL="$(ADMIN_RABBITMQ_URL)" \
-		golang:1.26-alpine go run ./cmd/outbox-admin drain-dlq --method "$(METHOD)"
+		golang:1.26-alpine go run ./cmd/outbox-admin drain-dlq --stream "$(STREAM)" --event-type "$(EVENT_TYPE)" --event-subtype "$(EVENT_SUBTYPE)"
 
-# Removes only providerName="LOADTEST" messages from a DLQ (set by every
-# loadtest/*.js script) — any other message is left in place untouched.
+# Removes only messages a loadtest run marked (see cmd/outbox-admin's
+# loadtestMarker) from a DLQ — any other message is left in place untouched.
 # Safe to run against a DLQ that has a mix of real and loadtest messages,
 # e.g. after load-testing in a UAT environment.
 purge-loadtest-dlq:
 	podman run --rm --network host -v "$(CURDIR):/app" -w /app \
 		-e DATABASE_URL="$(ADMIN_DATABASE_URL)" -e RABBITMQ_URL="$(ADMIN_RABBITMQ_URL)" \
-		golang:1.26-alpine go run ./cmd/outbox-admin purge-loadtest-dlq --method "$(METHOD)"
+		golang:1.26-alpine go run ./cmd/outbox-admin purge-loadtest-dlq --stream "$(STREAM)" --event-type "$(EVENT_TYPE)" --event-subtype "$(EVENT_SUBTYPE)"
 
 # Minimal subset for working on dashboards without the full stack: the app
 # services (so there's something to scrape) plus Prometheus/Grafana/the
 # postgres exporter. Grafana: http://localhost:3000 (admin/admin by default,
 # see GRAFANA_ADMIN_USER/PASSWORD in .env.example).
 observability-up:
-	$(COMPOSE) up --build -d postgres rabbitmq ingestion-api consumer-pix prometheus grafana postgres_exporter
+	$(COMPOSE) up --build -d postgres rabbitmq ingestion-api order-consumer-worker-concert-rock prometheus grafana postgres_exporter
 
 logs:
 	$(COMPOSE) logs -f
@@ -146,35 +150,31 @@ swag:
 ## ── Dev helpers ───────────────────────────────────────────────────────────────
 
 # Send sample POSTs to the ingestion-api (requires the stack to be running).
-# `seed` defaults to the PIX sample; seed-boleto/seed-transfer/seed-card cover the other methods.
-seed: seed-pix
+# `seed` defaults to the CONCERT/ROCK sample; seed-order-sports covers the
+# other shard running locally by default (order-consumer-worker-sports-football).
+seed: seed-order
 
-seed-pix:
-	curl -i -X POST http://localhost:8080/api/v1/payments \
+seed-order:
+	curl -i -X POST http://localhost:8080/api/v1/orders \
 		-H "Content-Type: application/json" \
-		-H "Idempotency-Key: seed-pix-$(shell date +%s)" \
-		-d '{"eventId":"evt_seed_pix_1","provider":{"name":"MERCADO_PAGO","providerPaymentId":"987654321"},"payment":{"paymentId":"pay_123","amount":100.50,"currency":"BRL","method":"PIX"},"pix":{"endToEndId":"E123456789ABCDEF","txid":"ORDER123"},"occurredAt":"2026-06-19T18:30:00Z"}'
+		-H "Idempotency-Key: seed-order-$(shell date +%s)" \
+		-d '{"sourceOrderId":"order-seed-concert-rock-1","eventType":"CONCERT","eventSubtype":"ROCK","eventId":"evt_concert_1","eventName":"Rock in Rio","venue":{"id":"venue-1","name":"Estadio Nacional","city":"Sao Paulo"},"tickets":[{"id":"TKT-1","section":"A","row":"10","seat":"5","price":150.00,"currency":"BRL"}],"customer":{"name":"Jane Doe","email":"jane@example.com","document":"12345678900"}}'
 
-seed-boleto:
-	curl -i -X POST http://localhost:8080/api/v1/payments \
+seed-order-sports:
+	curl -i -X POST http://localhost:8080/api/v1/orders \
 		-H "Content-Type: application/json" \
-		-H "Idempotency-Key: seed-boleto-$(shell date +%s)" \
-		-d '{"eventId":"evt_seed_boleto_1","provider":{"name":"BOLETO_BANCARIO","providerPaymentId":"555000111"},"payment":{"paymentId":"pay_456","amount":250.00,"currency":"BRL","method":"BOLETO"},"boleto":{"barcode":"34191790010104351004791020150008291070026000","dueDate":"2026-07-01","payerDocument":"12345678900"},"occurredAt":"2026-06-19T18:30:00Z"}'
+		-H "Idempotency-Key: seed-order-sports-$(shell date +%s)" \
+		-d '{"sourceOrderId":"order-seed-sports-football-1","eventType":"SPORTS","eventSubtype":"FOOTBALL","eventId":"evt_sports_1","eventName":"Championship Final","venue":{"id":"venue-2","name":"Arena Sul","city":"Porto Alegre"},"tickets":[{"id":"TKT-2","section":"B","row":"3","seat":"12","price":80.00,"currency":"BRL"}],"customer":{"name":"John Roe","email":"john@example.com","document":"98765432100"}}'
 
-seed-transfer:
-	curl -i -X POST http://localhost:8080/api/v1/payments \
+# Simulates the fake gateway's webhook confirming payment for an order placed
+# via seed-order — look up the order's Charge.ProviderRef first (e.g.
+# `SELECT provider_ref FROM charges WHERE order_id = '<uuid>'` against the
+# events DB) and pass it as PROVIDER_REF.
+PROVIDER_REF ?=
+seed-webhook-confirm:
+	curl -i -X POST http://localhost:8080/api/v1/webhooks/payments/fake \
 		-H "Content-Type: application/json" \
-		-H "Idempotency-Key: seed-transfer-$(shell date +%s)" \
-		-d '{"eventId":"evt_seed_transfer_1","provider":{"name":"INTERNAL","providerPaymentId":"internal-1"},"payment":{"paymentId":"pay_789","amount":75.00,"currency":"USD","method":"TRANSFER","payerId":"018f7f9e-6e8b-7c3a-8f2a-000000000001","recipientId":"018f7f9e-6e8b-7c3a-8f2a-000000000002"},"occurredAt":"2026-06-19T18:30:00Z"}'
-
-# Sends a CARTAO_CREDITO sample; cardNumber here is a well-known test PAN
-# (never a real one) and is masked to its last 4 digits by the handler
-# before it's stored or published — see CardDetailsDTO/maskPAN.
-seed-card:
-	curl -i -X POST http://localhost:8080/api/v1/payments \
-		-H "Content-Type: application/json" \
-		-H "Idempotency-Key: seed-card-$(shell date +%s)" \
-		-d '{"eventId":"evt_seed_card_1","provider":{"name":"ACQUIRER","providerPaymentId":"card-001"},"payment":{"paymentId":"pay_card_1","amount":199.90,"currency":"BRL","method":"CARTAO_CREDITO"},"cartao_credito":{"cardNumber":"4111111111111111","cardType":"CREDIT","cardIssuer":"VISA"},"occurredAt":"2026-06-19T18:30:00Z"}'
+		-d '{"provider_ref":"$(PROVIDER_REF)","event_id":"seed-webhook-$(shell date +%s)","outcome":"CONFIRMED","event_type":"CONCERT","event_subtype":"ROCK"}'
 
 # Tail a single service: make service=ingestion-api tail
 tail:
@@ -185,10 +185,10 @@ tail:
 .PHONY: k8s-apply k8s-delete k8s-status k8s-lint k8s-template
 
 # helmcharts/transaction-outbox is a Helm chart: one ingestion-api
-# Deployment/Service/HPA, plus one consumer-worker Deployment + KEDA
-# ScaledObject pair per entry in values.yaml's paymentMethods list (rendered
-# via {{ range }}, not hand-duplicated). Assumes `helm` and `kubectl` are on
-# PATH and pointed at the target cluster.
+# Deployment/Service/HPA, plus one order-consumer-worker and one fulfillment-consumer-worker
+# Deployment + KEDA ScaledObject pair per (event_type, event_subtype) entry
+# in values.yaml (rendered via {{ range }}, not hand-duplicated). Assumes
+# `helm` and `kubectl` are on PATH and pointed at the target cluster.
 CHART   := helmcharts/transaction-outbox
 RELEASE := transaction-outbox
 NS      := transaction-outbox
@@ -216,14 +216,12 @@ k8s-template:
 
 # Minimal-footprint subset of the SAME docker-compose.yml for running k6 on
 # a small machine: one Postgres + one RabbitMQ + ingestion-api + a single
-# consumer-worker bound to PIX only — no Jaeger, no other 4 consumers.
-# `up <services>` only starts what's named here plus their depends_on
-# (jaeger is deliberately not a dependency of either service — see
-# docker-compose.yml's comments — so it's correctly excluded). Use the full
-# `make up` instead when you need every method actually consumed.
+# order-consumer-worker shard (CONCERT/ROCK) — no Tempo, no other shards. `up
+# <services>` only starts what's named here plus their depends_on. Use the
+# full `make up` instead when you need every shard actually consumed.
 # Tear down with the regular `make down` — same compose project either way.
 loadtest-up:
-	$(COMPOSE) up --build -d postgres rabbitmq ingestion-api consumer-pix
+	$(COMPOSE) up --build -d postgres rabbitmq ingestion-api order-consumer-worker-concert-rock
 
 # 6.1 — two-phase latency baseline (P95/P99). VUS defaults to 100 (the
 # original two-phase design) but override it down for a small machine, e.g.
