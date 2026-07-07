@@ -34,7 +34,8 @@ type Config struct {
 	// PaymentProvider selects the domain.PaymentGateway adapter order-consumer-worker
 	// (CreateCheckout) and ingestion-api (VerifyWebhook) wire up: "fake" (no
 	// network, the default — local dev/tests/k6), "stripe" (real), or a
-	// scaffolded stub ("abacatepay", "lemonsqueezy").
+	// scaffolded stub ("abacatepay", "lemonsqueezy", "pagarme", "mercadopago",
+	// "pagseguro", "sumup").
 	PaymentProvider     string `envconfig:"PAYMENT_PROVIDER" default:"fake"`
 	StripeSecretKey     string `envconfig:"STRIPE_SECRET_KEY"`
 	StripeWebhookSecret string `envconfig:"STRIPE_WEBHOOK_SECRET"`

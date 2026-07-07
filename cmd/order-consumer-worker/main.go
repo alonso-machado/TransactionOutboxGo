@@ -24,7 +24,11 @@ import (
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/paymentgateway/abacatepay"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/paymentgateway/fake"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/paymentgateway/lemonsqueezy"
+	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/paymentgateway/mercadopago"
+	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/paymentgateway/pagarme"
+	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/paymentgateway/pagseguro"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/paymentgateway/stripe"
+	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/paymentgateway/sumup"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/persistence"
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/config"
@@ -126,6 +130,14 @@ func newGateway(cfg *config.Config) (domain.PaymentGateway, error) {
 		return abacatepay.New(), nil
 	case "lemonsqueezy":
 		return lemonsqueezy.New(), nil
+	case "pagarme":
+		return pagarme.New(), nil
+	case "mercadopago":
+		return mercadopago.New(), nil
+	case "pagseguro":
+		return pagseguro.New(), nil
+	case "sumup":
+		return sumup.New(), nil
 	case "fake", "":
 		return fake.New(""), nil
 	default:

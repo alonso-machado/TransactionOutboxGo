@@ -54,7 +54,11 @@ is the only place the system touches payment: `order-consumer-worker` calls
 gateway's own webhook (verified via `VerifyWebhook` in `ingestion-api`)
 confirms or fails it. Adapters: `stripe` (real, `stripe-go` v82), `fake`
 (default sandbox — no network, used locally/in tests/k6), `abacatepay`/
-`lemonsqueezy` (stubs). `event_type`/`event_subtype` round-trip through the
+`lemonsqueezy`/`pagarme`/`mercadopago`/`pagseguro`/`sumup` (stubs — all
+Brazilian gateways except LemonSqueezy/SumUp; each stub package's doc
+comment documents the provider's real request/response/webhook JSON
+shapes, with doc links, researched but not built — no SDK deps, just
+`domain`-only Go structs). `event_type`/`event_subtype` round-trip through the
 gateway's own metadata (e.g. a Stripe Checkout Session's metadata) so that
 `ingestion-api` never has to read the `events` database to route a webhook.
 
@@ -103,7 +107,7 @@ domain port interfaces.
 | Gin router, order/webhook handlers, DTOs, middleware | `internal/adapter/http/` |
 | GORM DB models + repository implementations + UnitOfWork | `internal/adapter/persistence/` |
 | RabbitMQ publisher + one generalized consumer (`MessageProcessor` interface, shared by both consumer workers) | `internal/adapter/messaging/` |
-| `PaymentGateway` adapters (`stripe` real, `fake` sandbox, `abacatepay`/`lemonsqueezy` stubs) | `internal/adapter/paymentgateway/` |
+| `PaymentGateway` adapters (`stripe` real, `fake` sandbox, `abacatepay`/`lemonsqueezy`/`pagarme`/`mercadopago`/`pagseguro`/`sumup` stubs) | `internal/adapter/paymentgateway/` |
 | Ticket QR PNG + HMAC signing/verification | `internal/adapter/ticketqr/` |
 | `Config` struct (envconfig) | `internal/infrastructure/config/` |
 | DB connection bootstrap | `internal/infrastructure/database/` |
