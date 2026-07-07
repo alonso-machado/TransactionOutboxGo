@@ -1,4 +1,4 @@
-name: CI - consumer-worker
+name: CI - fulfillment-consumer-worker
 
 # Independent of the other microservices' workflows on purpose — see
 # .github/workflows/README.md for why each service gets its own workflow file
@@ -11,19 +11,19 @@ on:
     branches: [main]
     paths:
       - "internal/**"
-      - "cmd/consumer-worker/**"
+      - "cmd/fulfillment-consumer-worker/**"
       - "go.mod"
       - "go.sum"
       - "Dockerfile"
-      - ".github/workflows/consumer-worker.yml"
+      - ".github/workflows/fulfillment-consumer-worker.yml"
   pull_request:
     paths:
       - "internal/**"
-      - "cmd/consumer-worker/**"
+      - "cmd/fulfillment-consumer-worker/**"
       - "go.mod"
       - "go.sum"
       - "Dockerfile"
-      - ".github/workflows/consumer-worker.yml"
+      - ".github/workflows/fulfillment-consumer-worker.yml"
   workflow_dispatch:
     inputs:
       run_integration:
@@ -33,7 +33,7 @@ on:
 
 env:
   GO_VERSION: "1.26"
-  SERVICE: consumer-worker
+  SERVICE: fulfillment-consumer-worker
 
 jobs:
   build:
@@ -63,9 +63,9 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           fail_level: error
-      # Lints the Helm chart this service's deploy job (Track 4) installs —
-      # catches a broken K8s manifest/values schema the same way
-      # golangci-lint/actionlint catch broken Go/YAML.
+      # Lints the Helm chart this service belongs to — catches a broken K8s
+      # manifest/values schema the same way golangci-lint/actionlint catch
+      # broken Go/YAML.
       - uses: azure/setup-helm@v4
       - run: helm lint helmcharts/transaction-outbox
       # Also lint the canary.enabled=true path (Phase 4 Track 4 — Argo
@@ -86,8 +86,8 @@ jobs:
 
   # Optional, flag-gated safety measure — needs unit-tests to reuse the gate
   # result, but nothing downstream needs this job, so it can be skipped or
-  # fail without blocking upload/deploy. Off by default: only runs when
-  # explicitly requested via workflow_dispatch or a PR label.
+  # fail without blocking upload. Off by default: only runs when explicitly
+  # requested via workflow_dispatch or a PR label.
   integration-tests:
     name: integration-tests (optional, non-blocking)
     needs: unit-tests

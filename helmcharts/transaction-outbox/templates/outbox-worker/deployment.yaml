@@ -1,11 +1,11 @@
 # The Transactional Outbox relay (DispatchOutbox), split out of ingestion-api
 # into its own Deployment so it scales on outbox backlog (its KEDA
 # ScaledObject, scaledobject.yaml) independently of the fixed-size HTTP front
-# door. Single Deployment (not per-method like consumer-worker) — it drains
-# every method's NEW/RETRYING rows from the one outbox table and fans them out
-# to the per-method queues it publishes to.
+# door. Single Deployment (not per-shard like the consumer workers) — it
+# drains every shard's NEW/RETRYING rows from both outbox tables and fans
+# them out to the per-shard queues it publishes to.
 #
-# Unlike ingestion-api/consumer-worker, this has no canary (Rollout) variant —
+# Unlike ingestion-api/the consumer workers, this has no canary (Rollout) variant —
 # it's an internal relay with no request traffic to weight, so it renders the
 # same plain Deployment regardless of .Values.canary.enabled.
 apiVersion: apps/v1
@@ -63,7 +63,7 @@ spec:
               value: outbox-worker
           resources:
             {{- toYaml .Values.outboxWorker.resources | nindent 12 }}
-          # Like consumer-worker, the relay has no main HTTP server — only the
+          # Like the consumer workers, the relay has no main HTTP server — only the
           # Prometheus /metrics endpoint (internal/infrastructure/telemetry).
           # startupProbe covers the initial DB + RabbitMQ connect; while it's
           # failing, liveness/readiness aren't evaluated.

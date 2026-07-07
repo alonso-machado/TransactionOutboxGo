@@ -1,20 +1,24 @@
 {{- if not .Values.canary.enabled }}
-{{- range .Values.paymentMethods }}
+{{- range .Values.eventShards }}
 ---
-# One Deployment per payment method (Phase 3 Track 1), rendered from this
-# single template via the paymentMethods list in values.yaml — adding a new
-# method needs no new template, just a new list entry. Used when
+# One Deployment per (event_type, event_subtype) shard, rendered from this
+# single template via the eventShards list in values.yaml — adding a new
+# shard needs no new template, just a new list entry. Used when
 # canary.enabled is false; see rollout.yaml for the canary.enabled=true path.
+#
+# order-consumer-worker consumes this shard's order_outbox queue, reserves
+# tickets, and opens a checkout with the configured PaymentGateway — see
+# internal/usecase/checkout.ProcessOrder.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: consumer-{{ .name }}
+  name: order-consumer-worker-{{ .name }}
   namespace: {{ $.Values.namespace }}
   labels:
-    app: consumer-{{ .name }}
+    app: order-consumer-worker-{{ .name }}
     {{- include "transaction-outbox.labels" $ | nindent 4 }}
 spec:
-  # No replicas field — this method's KEDA ScaledObject (scaledobject.yaml)
+  # No replicas field — this shard's KEDA ScaledObject (scaledobject.yaml)
   # owns it exclusively via the keda-hpa-* HPA it generates. Templating 0
   # here makes every `helm upgrade` fight that HPA for ownership of
   # .spec.replicas via server-side apply ("conflict ... using apps/v1:
@@ -23,24 +27,24 @@ spec:
   # ScaledObject exists to reconcile it down to minReplicaCount (0).
   selector:
     matchLabels:
-      app: consumer-{{ .name }}
+      app: order-consumer-worker-{{ .name }}
   template:
     metadata:
       labels:
-        app: consumer-{{ .name }}
+        app: order-consumer-worker-{{ .name }}
     spec:
-      {{- with $.Values.consumerWorker.nodeSelector }}
+      {{- with $.Values.orderConsumerWorker.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
-        - name: consumer-worker
-          # CI tags images by git SHA (see Dockerfile ARG SERVICE=consumer-worker);
+        - name: order-consumer-worker
+          # CI tags images by git SHA (see Dockerfile ARG SERVICE=order-consumer-worker);
           # the values.yaml default is a placeholder for local/manual use.
-          image: {{ $.Values.image.consumerWorker }}
+          image: {{ $.Values.image.orderConsumerWorker }}
           ports:
             - name: metrics
-              containerPort: {{ .metricsPort }}
+              containerPort: {{ .orderMetricsPort }}
           envFrom:
             - configMapRef:
                 name: transaction-outbox-config
@@ -49,23 +53,34 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: transaction-outbox-secrets
-                  # payments DB — consumer-worker is the only writer of payments_*.
-                  key: PAYMENTS_DATABASE_URL
+                  # events DB — order-consumer-worker is a writer of
+                  # locations/events/orders/tickets/charges.
+                  key: EVENTS_DATABASE_URL
             - name: RABBITMQ_URL
               valueFrom:
                 secretKeyRef:
                   name: transaction-outbox-secrets
                   key: RABBITMQ_URL
-            - name: PAYMENT_QUEUE
-              value: {{ .queue }}
+            - name: STRIPE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: STRIPE_SECRET_KEY
+            - name: STRIPE_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: STRIPE_WEBHOOK_SECRET
+            - name: CONSUMER_QUEUE
+              value: {{ .orderQueue }}
             - name: METRICS_PORT
-              value: {{ .metricsPort | quote }}
+              value: {{ .orderMetricsPort | quote }}
             - name: OTEL_SERVICE_NAME
-              value: consumer-worker-{{ .name }}
+              value: order-consumer-worker-{{ .name }}
           resources:
-            {{- toYaml $.Values.consumerWorker.resources | nindent 12 }}
-          # consumer-worker has no main HTTP server, but it does expose a
-          # Prometheus /metrics endpoint (internal/infrastructure/telemetry).
+            {{- toYaml $.Values.orderConsumerWorker.resources | nindent 12 }}
+          # order-consumer-worker has no main HTTP server, but it does expose
+          # a Prometheus /metrics endpoint (internal/infrastructure/telemetry).
           # startupProbe gives a generous grace period for the initial DB +
           # RabbitMQ connection before liveness starts enforcing its tighter
           # threshold — every one of these Deployments scales from 0 via

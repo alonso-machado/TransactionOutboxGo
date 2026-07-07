@@ -16,7 +16,7 @@ metadata:
 spec:
   # ClusterIP by default (local/dev). A cloud values override sets this to
   # LoadBalancer so ingestion-api is the ONLY service reachable from outside
-  # the cluster — consumer-worker, RabbitMQ/Amazon MQ, and Postgres/RDS stay
+  # the cluster — the consumer workers, RabbitMQ/Amazon MQ, and Postgres/RDS stay
   # private (enforced at the cloud network layer, outside this chart).
   # kindLocal.enabled forces NodePort regardless of ingestionApi.service.type
   # — k6 on the Windows host (loadtest/README.md) needs a fixed, scriptable

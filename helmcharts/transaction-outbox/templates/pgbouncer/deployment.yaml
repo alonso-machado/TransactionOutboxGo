@@ -1,9 +1,9 @@
 {{- if .Values.pgbouncer.enabled }}
 # Phase 5 Track 3.B — PgBouncer (transaction-pooling mode) in front of RDS,
 # same role as the compose pgbouncer service: collapses the KEDA fan-out's
-# many short-lived consumer-worker connections (0..N pods x 5 methods) plus
-# ingestion-api's HPA replicas onto a small, bounded pool of real Postgres
-# connections. config.databaseUrl (the upstream Postgres/RDS DSN) is rendered
+# many short-lived order/fulfillment-consumer-worker connections (0..N pods
+# per shard) plus ingestion-api's HPA replicas onto a small, bounded pool of
+# real Postgres connections. config.databaseUrl (the upstream Postgres/RDS DSN) is rendered
 # into a ConfigMap-mounted pgbouncer.ini; app/consumer DATABASE_URL
 # (secret.databaseUrl) should be pointed at this Deployment's Service
 # instead of RDS directly — see values.yaml's pgbouncer section for the

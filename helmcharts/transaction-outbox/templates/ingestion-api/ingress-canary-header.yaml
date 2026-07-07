@@ -32,7 +32,14 @@ spec:
   rules:
     - http:
         paths:
-          - path: /api/v1/payments
+          - path: /api/v1/orders
+            pathType: Prefix
+            backend:
+              service:
+                name: ingestion-api-canary
+                port:
+                  number: 8080
+          - path: /api/v1/webhooks/payments
             pathType: Prefix
             backend:
               service:

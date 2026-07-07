@@ -1,10 +1,11 @@
 # CI pipelines
 
-Three **independent** workflows, one per microservice — `ingestion-api.yml`,
-`outbox-worker.yml`, and `consumer-worker.yml`. They're the same shape, but
-kept as separate files rather than one matrixed workflow so a change to one
-service never triggers, gates, or redeploys the others: each has its own
-`paths:` trigger filter (scoped to its own `cmd/<service>/**` plus the shared
+Four **independent** workflows, one per microservice — `ingestion-api.yml`,
+`outbox-worker.yml`, `order-consumer-worker.yml`, and
+`fulfillment-consumer-worker.yml`. They're the same shape, but kept as
+separate files rather than one matrixed workflow so a change to one service
+never triggers or gates the others: each has its own `paths:` trigger filter
+(scoped to its own `cmd/<service>/**` plus the shared
 `internal/**`/`go.mod`/`go.sum`/`Dockerfile`), its own run history/status
 badge, and its own required-check configuration in branch protection.
 
@@ -55,10 +56,10 @@ be added back to each workflow independently once that's wired up.
 ## Why separate files instead of one matrixed workflow
 
 A single workflow with `strategy.matrix.service: [ingestion-api,
-outbox-worker, consumer-worker]` is still **one workflow run** — a failure in
-one matrix leg shows up in the same run as the others, and a single trigger
-(e.g. a path filter) would have to cover every service's paths, so an
-`internal/`-only change would always run all legs even when only one binary
-actually changed behavior-relevant code. Separate files give true
-independence at the cost of duplicating ~80 lines of near-identical YAML per
-service — an acceptable trade-off at this count.
+outbox-worker, order-consumer-worker, fulfillment-consumer-worker]` is still
+**one workflow run** — a failure in one matrix leg shows up in the same run
+as the others, and a single trigger (e.g. a path filter) would have to cover
+every service's paths, so an `internal/`-only change would always run all
+legs even when only one binary actually changed behavior-relevant code.
+Separate files give true independence at the cost of duplicating ~80 lines
+of near-identical YAML per service — an acceptable trade-off at this count.

@@ -449,3 +449,107 @@ manual-ack consumer pattern.
   `-consumer-worker` (company convention) — `order-consumer-worker` and
   `fulfillment-consumer-worker`, not `order-worker`/`fulfillment-worker`.
   `outbox-worker` is exempt (it only publishes, never consumes).
+
+## Part F — CI: Go vulnerability scanning
+
+Add a `govulncheck` step to `lint` (or its own gate, `vulncheck`, right after
+`lint`) in all four CI workflows (`ingestion-api.yml`, `outbox-worker.yml`,
+`order-consumer-worker.yml`, `fulfillment-consumer-worker.yml`) — checks
+`go.sum`'s dependency tree against the official Go vulnerability database
+(https://vuln.go.dev) for known CVEs **actually reachable from this code's
+call graph**, not just "a vulnerable version is present in go.sum" (which is
+what a naive `go list -m all` diff would flag, with far more noise). Runs via
+`golang.org/x/vuln/cmd/govulncheck` — `go run golang.org/x/vuln/cmd/govulncheck@latest ./...`,
+no separate binary to pin/install, matching the `go run pkg@version` pattern
+`cmd/outbox-admin`'s Makefile targets and `coverage-all`'s gocovmerge already
+use. Fails the gate (non-zero exit) on any reachable vulnerability — same
+blocking severity as `golangci-lint`/`actionlint`/`helm lint`, since a real
+open-source-based CVE feed with new advisories landing regularly is exactly
+the kind of check that must run on every PR, not just periodically. Add a
+`- uses: actions/setup-go@v5` (already present) followed by
+`- run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...` inside the
+existing `lint` job (cheapest — reuses that job's checkout/setup-go, one more
+sequential step) rather than a new job, since it's a fast static analysis
+with no test/build dependency of its own.
+
+## Part G — Integration test coverage: every `internal/usecase/*` subpackage ≥ 75%
+
+**Rule (added 2026-07-07):** each subpackage of `internal/usecase` —
+`order`, `webhook`, `outbox`, `checkout`, `fulfillment` — must individually
+clear **75%** statement coverage from `tests/integration`'s TestContainers
+suite alone, not just an overall band across a wider set of packages. This
+tightens the original goal below (a 65–70% band measured across a mixed
+group of `usecase`/`adapter` packages) into a per-usecase-subfolder floor,
+since the use-case layer is exactly the application-rule code this suite
+exists to exercise end-to-end against a real Postgres + RabbitMQ.
+
+Measure with `make test-integration` (already produces `integration.cov` via
+`-coverpkg=./internal/... -coverprofile=integration.cov`) and a weighted
+per-package rollup over the raw profile (statement-count weighted, not a
+naive average of `go tool cover -func`'s per-function percentages — see the
+one-off `awk` script used to produce the numbers below).
+
+**Measured 2026-07-07 (`go test -tags=integration -race` against real
+Postgres 18 + RabbitMQ 4.3 testcontainers, all 35 tests passing, overall
+`internal/...` coverage 70.5%):**
+
+| Package | Covered/total statements | Coverage |
+|---|---|---|
+| `usecase/outbox` | 58/67 | **86.6%** |
+| `usecase/checkout` | 53/63 | **84.1%** |
+| `usecase/order` | 36/44 | **81.8%** |
+| `usecase/fulfillment` | 51/64 | **79.7%** |
+| `usecase/webhook` | 26/34 | **76.5%** |
+
+**All five `usecase` subpackages now clear 75%.** Closed via targeted tests
+added specifically to reach the floor, not blanket padding:
+  - `usecase/order`, `usecase/webhook`: added
+    `TestPlaceOrder_UowExecuteError_ReturnsWrappedError` /
+    `TestReceivePaymentEvent_UowExecuteError_ReturnsWrappedError`
+    (`order_test.go`/`webhook_test.go`) — call the use-case directly with an
+    already-canceled `context.Context` so the `UnitOfWork.Execute` transaction
+    fails to even begin, exercising the real-DB-error wrapping branch that no
+    HTTP-level test could reach (a duplicate/dedup hit is a *successful*
+    `ON CONFLICT DO NOTHING`, not an error, so it never took this path).
+  - `usecase/fulfillment`: added three poison-message tests to
+    `fulfillment_test.go` mirroring `checkout_test.go`'s pattern —
+    malformed JSON (`TestFulfillment_PoisonMessage_RoutesToDeadLetterQueue`),
+    an unrecognized `schemaVersion`
+    (`TestFulfillment_UnknownSchemaVersion_RejectsToDLQOnFirstAttempt`), and
+    a well-formed message whose `providerRef` matches no `Charge` at all
+    (`TestFulfillment_UnknownProviderRef_RoutesToDeadLetterQueue` — distinct
+    from the existing `TestFulfillment_RedeliveredConfirmation_IsNoOp`, which
+    covers an already-terminal Charge, not a missing one). Together these
+    fully cover `recordRedactedError` (was 0%, no fulfillment test had ever
+    driven a genuine processing error).
+  - `usecase/outbox`: added two tests to `dispatch_outbox_test.go` —
+    `TestDispatchOrderOutbox_NotifyTrigger_DispatchesFasterThanPollInterval`
+    wires a real `database.Listener` as `Run`'s trigger channel (exactly how
+    `cmd/outbox-worker/main.go` wires it) with a 10-minute poll interval, so
+    a `PUBLISHED` row within 5s can only be explained by the NOTIFY/debounce
+    path, not the ticker — exercising `Run`'s `trigger`/`debounceC` select
+    cases for the first time. `TestDispatchOutbox_MetricsTicker_RecordsBacklogWithoutError`
+    keeps one `DEAD_LETTER` and one `NEW` row alive across a 6-second `Run`,
+    long enough for the (previously never-fired-in-any-test) 5-second metrics
+    ticker to invoke `recordBacklogMetrics` — was 0%, real production code
+    (`CountPending`/`CountDeadLetter`) that just never had a test patient
+    enough to wait it out.
+
+Two intentional, documented gaps remain (defensive branches, not missed
+scenarios):
+  - `uuid.NewV7()`/`json.Marshal` error branches in `usecase/order` and
+    `usecase/webhook` — both fail only on conditions that don't occur in
+    practice (crypto/rand exhaustion; marshaling a struct with no floats/
+    channels/funcs), so they stay uncovered by design rather than via
+    fault-injection contortions.
+  - `usecase/fulfillment`'s `confirmAndIssue`/`failAndVoid` still have a few
+    uncovered lines — the repository-call error branches inside them
+    (`ticketRepo.MarkIssued`/`MarkVoid` failing mid-transaction) would need
+    breaking the real DB mid-flight to trigger, which isn't worth the
+    complexity for what's already comfortably over the 75% floor.
+
+The broader `adapter`/`infrastructure` gaps noted in the original 65–70%-band
+measurement (`AMQPPublisher.Publish`/`invalidate`, `GORMOutboxRepository`
+untouched by the metrics-ticker fixes above) are unaffected by this rule —
+it only binds `internal/usecase/*` — and remain fair game for a future pass
+if broader `adapter` coverage becomes its own goal.

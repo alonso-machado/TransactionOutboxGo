@@ -3,10 +3,11 @@ namespace: transaction-outbox
 image:
   ingestionApi: transaction-outbox-go/ingestion-api:latest
   outboxWorker: transaction-outbox-go/outbox-worker:latest
-  consumerWorker: transaction-outbox-go/consumer-worker:latest
+  orderConsumerWorker: transaction-outbox-go/order-consumer-worker:latest
+  fulfillmentConsumerWorker: transaction-outbox-go/fulfillment-consumer-worker:latest
 
-# Non-sensitive configuration shared by ingestion-api and consumer-worker,
-# rendered verbatim into the transaction-outbox-config ConfigMap.
+# Non-sensitive configuration shared across services, rendered verbatim into
+# the transaction-outbox-config ConfigMap.
 configMap:
   data:
     # ── ingestion-api ──────────────────────────────────────────────────────
@@ -16,17 +17,22 @@ configMap:
     OUTBOX_MAX_RETRIES: "5"
     OUTBOX_PRUNE_AFTER_HOURS: "48"
 
-    # ── consumer-worker ─────────────────────────────────────────────────────
+    # ── order-consumer-worker / fulfillment-consumer-worker ────────────────
     PREFETCH_COUNT: "10"
     MAX_DELIVERIES: "5"
 
+    # ── Payment gateway (ingestion-api's webhook verify + order-consumer-
+    # worker's checkout) ────────────────────────────────────────────────────
+    PAYMENT_PROVIDER: "fake"
+    CHECKOUT_SUCCESS_URL: "http://localhost:8080/orders/success"
+
     # ── Observability (Phase 2 Track 1 — OpenTelemetry) ─────────────────────
-    OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+    OTEL_EXPORTER_OTLP_ENDPOINT: "http://tempo:4318"
     OTEL_SERVICE_NAME: "transaction-outbox"
-    # Default for ingestion-api. Each per-method consumer-worker Deployment
-    # (templates/consumer-worker/deployment.yaml) overrides this via its own
-    # env: entry — explicit env: takes precedence over envFrom: on a key
-    # collision, so this default never reaches those pods.
+    # Default for ingestion-api. Each shard's order/fulfillment-consumer-worker
+    # Deployment overrides this via its own env: entry — explicit env: takes
+    # precedence over envFrom: on a key collision, so this default never
+    # reaches those pods.
     METRICS_PORT: "9090"
 
     # ── API docs (Phase 2 Track 2 — Swagger) ────────────────────────────────
@@ -46,40 +52,54 @@ configMap:
 # PLACEHOLDER — do NOT use these values in any real environment. Real
 # connection strings are injected by CI/CD (GitHub Actions secrets, HashiCorp
 # Vault, Sealed Secrets, etc.) at deploy time via
-# `--set secret.databaseUrl=... --set secret.paymentsDatabaseUrl=... --set secret.rabbitmqUrl=...`
+# `--set secret.databaseUrl=... --set secret.eventsDatabaseUrl=... --set secret.rabbitmqUrl=...`
 # or a values override file — never commit real connection strings here.
 # Plaintext here; templates/secret.yaml base64-encodes them.
 #
-# Two-DB split: databaseUrl is the `outbox` database (outbox_messages), used by
-# ingestion-api and outbox-worker; paymentsDatabaseUrl is the `payments`
-# database (payments_* hypertables), used by consumer-worker. Same Postgres/RDS
-# instance, two logical databases. (databaseUrl keeps its original name — the
-# outbox side is the pre-split default — so only the payments URL is additive.)
+# Two-DB split: databaseUrl is the `outbox` database (order_outbox +
+# payment_event_outbox), used by ingestion-api and outbox-worker;
+# eventsDatabaseUrl is the `events` database (locations/events/orders/
+# tickets/charges), used by order-consumer-worker and
+# fulfillment-consumer-worker. Same Postgres/RDS instance, two logical
+# databases. (databaseUrl keeps its original name — the outbox side is the
+# pre-split default — so only the events URL is additive.)
 #
 # Phase 5 Track 3.B convention: when pgbouncer.enabled is true, both URLs
 # should point at the in-cluster PgBouncer Service
 # (postgres://<user>:<pass>@pgbouncer.{{ .Values.namespace }}.svc.cluster.local:6432/<db>,
-# with <db> being `outbox` or `payments`) instead of RDS directly —
+# with <db> being `outbox` or `events`) instead of RDS directly —
 # pgbouncer.upstreamHost/.upstreamPort below is where the *real* Postgres/RDS
 # endpoint goes, kept separate from the apps' own DATABASE_URL so PgBouncer is
 # genuinely in front of, not bypassed by, every connection.
 secret:
   databaseUrl: "CHANGE_ME"
-  paymentsDatabaseUrl: "CHANGE_ME"
+  eventsDatabaseUrl: "CHANGE_ME"
   rabbitmqUrl: "CHANGE_ME"
+  # Stripe adapter secrets (internal/adapter/paymentgateway/stripe) — only
+  # meaningful when configMap.data.PAYMENT_PROVIDER is "stripe". Harmless
+  # placeholders otherwise (the fake/abacatepay/lemonsqueezy adapters never
+  # read them).
+  stripeSecretKey: "CHANGE_ME"
+  stripeWebhookSecret: "CHANGE_ME"
+  # HMAC key internal/adapter/ticketqr signs every issued ticket's validation
+  # code with — fulfillment-consumer-worker only.
+  ticketSigningSecret: "CHANGE_ME"
 
 # External Secrets Operator (Phase 5 Track 5.A). False by default — local/
 # compose and any bare cluster without ESO installed keep using the static
 # Secret above (templates/secret.yaml). A cloud values override sets this
 # true (after installing ESO + its IRSA role separately) and supplies
-# region/the two Secrets Manager entry names ESO's ExternalSecret CR
+# region/the Secrets Manager entry names ESO's ExternalSecret CR
 # (templates/externalsecret.yaml) syncs from.
 externalSecrets:
   enabled: false
   region: "us-east-1"
   databaseSecretName: "transaction-outbox/dev/database-url"
-  paymentsDatabaseSecretName: "transaction-outbox/dev/payments-database-url"
+  eventsDatabaseSecretName: "transaction-outbox/dev/events-database-url"
   rabbitmqSecretName: "transaction-outbox/dev/rabbitmq-url"
+  stripeSecretKeySecretName: "transaction-outbox/dev/stripe-secret-key"
+  stripeWebhookSecretSecretName: "transaction-outbox/dev/stripe-webhook-secret"
+  ticketSigningSecretSecretName: "transaction-outbox/dev/ticket-signing-secret"
 
 # Phase 5 Track 3.B/3.C — PgBouncer (transaction-pooling mode) + its
 # pgbouncer-exporter sidecar, in front of RDS. Mirrors docker-compose.yml's
@@ -145,16 +165,18 @@ canary:
       prometheusAddress: "http://prometheus.transaction-outbox.svc.cluster.local:9090"
       errorRateThreshold: "0.05"
       interval: 1m
-  consumerWorker:
+  orderConsumerWorker:
     # After 1h sitting at 5% with no manual action, skip straight to 100% —
     # no 20/50 intermediate steps (see plan doc for why).
+    soakDuration: 1h
+  fulfillmentConsumerWorker:
     soakDuration: 1h
 
 ingestionApi:
   replicas: 1
   # Empty by default (schedules on any node) — a cloud values override can
   # pin ingestion-api pods to its own dedicated node group, separate from
-  # consumer-worker's.
+  # the consumer workers'.
   nodeSelector: {}
   service:
     type: ClusterIP
@@ -176,9 +198,10 @@ ingestionApi:
     # Off by default — ingestion-api now runs at a fixed replica count
     # (ingestionApi.replicas, default 1). It's a thin, broker-independent
     # write path in front of the outbox; the autoscaling workload is
-    # outbox-worker (KEDA, on outbox backlog) and consumer-worker (KEDA, on
-    # queue depth), not this. Flip to true to restore CPU/memory HPA using the
-    # thresholds below — when false, the Deployment owns .spec.replicas and the
+    # outbox-worker (KEDA, on outbox backlog) and each shard's order/
+    # fulfillment-consumer-worker (KEDA, on queue depth), not this. Flip to
+    # true to restore CPU/memory HPA using the thresholds below — when
+    # false, the Deployment owns .spec.replicas and the
     # HorizontalPodAutoscaler isn't rendered (templates/ingestion-api/hpa.yaml).
     enabled: false
     minReplicas: 1
@@ -198,13 +221,14 @@ ingestionApi:
     scaleDownStabilizationSeconds: 30
 
 # The Transactional Outbox relay, split out of ingestion-api into its own
-# Deployment + KEDA ScaledObject (templates/outbox-worker/). Scales on outbox
-# backlog (NEW/RETRYING row count) via KEDA's postgresql scaler, with a floor
-# of 1 so the LISTEN/NOTIFY fast path stays warm and the hourly prune / backlog
-# metrics always have a live pod.
+# Deployment + KEDA ScaledObject (templates/outbox-worker/). Runs two
+# dispatch loops (order_outbox + payment_event_outbox); the ScaledObject
+# scales on the SUM of both backlogs via KEDA's postgresql scaler, with a
+# floor of 1 so the order_outbox LISTEN/NOTIFY fast path stays warm and the
+# hourly prune / backlog metrics always have a live pod.
 outboxWorker:
   # Empty by default — the cloud target can pin these pods to the same
-  # ingestion-side node group as ingestion-api (both touch the outbox DB only).
+  # ingestion-side node group as ingestion-api (both touch only the outbox DB).
   nodeSelector: {}
   metricsPort: 9090
   resources:
@@ -215,23 +239,27 @@ outboxWorker:
       cpu: "500m"
       memory: "256Mi"
   keda:
-    # 1, not 0 (unlike consumer-worker): keeps the LISTEN/NOTIFY connection
-    # live so an enqueue publishes in single-digit ms instead of waiting for
-    # KEDA to spin a pod, and keeps the prune/metrics tickers running.
+    # 1, not 0 (unlike the consumer workers): keeps the order_outbox
+    # LISTEN/NOTIFY connection live so an order publishes in single-digit ms
+    # instead of waiting for KEDA to spin a pod, and keeps the
+    # prune/metrics tickers running.
     minReplicaCount: 1
     maxReplicaCount: 10
     pollingInterval: 15 # seconds between outbox-backlog checks
     cooldownPeriod: 60
-    # 1 replica per this many NEW/RETRYING rows. Multiple replicas are safe:
-    # OutboxRepository.FetchPending uses FOR UPDATE SKIP LOCKED, so they never
-    # double-publish a row.
+    # 1 replica per this many NEW/RETRYING rows, summed across both outbox
+    # tables. Multiple replicas are safe: OutboxRepository.FetchPending uses
+    # FOR UPDATE SKIP LOCKED, so they never double-publish a row.
     targetQueryValue: "100"
     scaleUpStabilizationSeconds: 0
     scaleDownStabilizationSeconds: 30
 
-consumerWorker:
-  # Empty by default — a cloud values override can pin consumer-worker pods
-  # to its own dedicated node group, separate from ingestion-api's.
+# order-consumer-worker: reserves tickets + opens a gateway checkout for one
+# order_outbox shard's queue. Same resource/KEDA shape reused by every shard
+# in eventShards below.
+orderConsumerWorker:
+  # Empty by default — a cloud values override can pin these pods to their
+  # own dedicated node group, separate from ingestion-api's.
   nodeSelector: {}
   resources:
     requests:
@@ -246,31 +274,52 @@ consumerWorker:
     pollingInterval: 15 # seconds between queue checks
     cooldownPeriod: 60 # seconds to wait before scaling to zero (idle path only)
     queueLengthValue: "1000" # 1 replica per 1000 messages
-    # Same intent as ingestionApi.hpa's pair above, applied to the HPA KEDA
-    # generates — see scaledobject.yaml's comment on why cooldownPeriod
-    # alone doesn't cover every scale-down step.
     scaleUpStabilizationSeconds: 0
     scaleDownStabilizationSeconds: 30
 
-# One Deployment + one KEDA ScaledObject is rendered per entry (see
-# templates/consumer-worker/). Adding a 6th payment method is a one-line
-# change here — no new template files needed.
-paymentMethods:
-  - name: pix
-    queue: payments.pix.queue
-    metricsPort: 9091
-  - name: boleto
-    queue: payments.boleto.queue
-    metricsPort: 9092
-  - name: transfer
-    queue: payments.transfer.queue
-    metricsPort: 9093
-  - name: cartao-credito
-    queue: payments.cartao_credito.queue
-    metricsPort: 9094
-  - name: cartao-debito
-    queue: payments.cartao_debito.queue
-    metricsPort: 9095
+# fulfillment-consumer-worker: issues tickets (QR + HMAC) for one
+# payment_event_outbox shard's queue, once the gateway confirms payment.
+fulfillmentConsumerWorker:
+  nodeSelector: {}
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  keda:
+    minReplicaCount: 0
+    maxReplicaCount: 10
+    pollingInterval: 15
+    cooldownPeriod: 60
+    queueLengthValue: "1000"
+    scaleUpStabilizationSeconds: 0
+    scaleDownStabilizationSeconds: 30
+
+# One order-consumer-worker Deployment/Rollout + ScaledObject and one
+# fulfillment-consumer-worker Deployment/Rollout + ScaledObject are rendered
+# per entry (templates/order-consumer-worker/, templates/
+# fulfillment-consumer-worker/) — matches the registry in
+# internal/infrastructure/rabbitmq.EventTypes. Only a representative subset
+# is deployed here (mirrors docker-compose.yml's local default); add an
+# entry (+ a metrics-port pair not already in use) to exercise another
+# registry pair — no new template files needed.
+eventShards:
+  - eventType: CONCERT
+    eventSubtype: ROCK
+    name: concert-rock
+    orderQueue: events.concert.rock.queue
+    paymentQueue: payments.concert.rock.queue
+    orderMetricsPort: 9091
+    fulfillmentMetricsPort: 9093
+  - eventType: SPORTS
+    eventSubtype: FOOTBALL
+    name: sports-football
+    orderQueue: events.sports.football.queue
+    paymentQueue: payments.sports.football.queue
+    orderMetricsPort: 9092
+    fulfillmentMetricsPort: 9094
 
 # KIND-local convenience only — off everywhere else (compose has its own
 # host-published 15672, the cloud target has no equivalent at all). RabbitMQ

@@ -1,10 +1,22 @@
-// Body builders for every payment method, matching the wire format
-// internal/adapter/http/dto.go expects. Each call produces a body with a
-// fresh eventId/Idempotency-Key — without that, dedup would collapse every
-// iteration into a single outbox row and the load test would measure
-// nothing.
+// Body builders for ticket orders, matching the wire format
+// internal/adapter/http/order_dto.go expects. Each call produces a body with
+// a fresh sourceOrderId/eventId/ticket id and an Idempotency-Key — without
+// that, dedup would collapse every iteration into a single order_outbox row
+// and the load test would measure nothing.
+//
+// customer.name is always "LOADTEST" — the marker cmd/outbox-admin's
+// purge-loadtest-dlq matches on for the order stream (see its
+// isLoadtestMessage), so a DLQ full of a mix of real and loadtest orders can
+// be cleaned safely.
 
-export const METHODS = ["PIX", "BOLETO", "TRANSFER", "CARTAO_CREDITO", "CARTAO_DEBITO"];
+// SHARDS mirrors the two (event_type, event_subtype) pairs docker-compose.yml
+// runs order-consumer-worker/fulfillment-consumer-worker instances for by
+// default — see internal/infrastructure/rabbitmq.EventTypes for the full
+// registry.
+export const SHARDS = [
+  { eventType: "CONCERT", eventSubtype: "ROCK" },
+  { eventType: "SPORTS", eventSubtype: "FOOTBALL" },
+];
 
 let counter = 0;
 
@@ -13,76 +25,28 @@ function uniqueSuffix() {
   return `${Date.now()}-${__VU}-${__ITER}-${counter}`;
 }
 
-function envelope(method, suffix, extra) {
-  const body = Object.assign(
-    {
-      eventId: `evt-${suffix}`,
-      provider: { name: "LOADTEST", providerPaymentId: `prov-${suffix}` },
-      payment: {
-        paymentId: `pay-${suffix}`,
-        amount: 100.5,
-        currency: "BRL",
-        method,
-      },
-      occurredAt: new Date().toISOString(),
-    },
-    extra
-  );
+function order(shard, suffix) {
+  const body = {
+    sourceOrderId: `order-loadtest-${suffix}`,
+    eventType: shard.eventType,
+    eventSubtype: shard.eventSubtype,
+    eventId: `evt-loadtest-${suffix}`,
+    eventName: "LOADTEST",
+    venue: { id: "venue-loadtest", name: "LOADTEST Arena", city: "LOADTEST City" },
+    tickets: [
+      { id: `TKT-loadtest-${suffix}`, section: "A", row: "1", seat: "1", price: 100.5, currency: "BRL" },
+    ],
+    customer: { name: "LOADTEST", email: "loadtest@example.com", document: "00000000000" },
+  };
   body.__idempotencyKey = `loadtest-${suffix}`;
   return body;
 }
 
-function pix(suffix) {
-  return envelope("PIX", suffix, {
-    pix: { endToEndId: "E00000000000000000000000000", txid: `ORDER-${suffix}` },
-  });
-}
-
-function boleto(suffix) {
-  return envelope("BOLETO", suffix, {
-    boleto: {
-      barcode: "00000000000000000000000000000000000000000000",
-      dueDate: "2026-12-31",
-      payerDocument: "00000000000",
-    },
-  });
-}
-
-function transfer(suffix) {
-  const body = envelope("TRANSFER", suffix, {});
-  body.payment.payerId = "018f7f9e-6e8b-7c3a-8f2a-000000000001";
-  body.payment.recipientId = "018f7f9e-6e8b-7c3a-8f2a-000000000002";
-  return body;
-}
-
-function cartaoCredito(suffix) {
-  return envelope("CARTAO_CREDITO", suffix, {
-    cartao_credito: { cardNumber: "4111111111111111", cardType: "CREDIT", cardIssuer: "VISA" },
-  });
-}
-
-function cartaoDebito(suffix) {
-  return envelope("CARTAO_DEBITO", suffix, {
-    cartao_debito: { cardNumber: "4111111111111111", cardType: "DEBIT", cardIssuer: "MASTERCARD" },
-  });
-}
-
-const builders = {
-  PIX: pix,
-  BOLETO: boleto,
-  TRANSFER: transfer,
-  CARTAO_CREDITO: cartaoCredito,
-  CARTAO_DEBITO: cartaoDebito,
-};
-
-// buildBody returns a fresh, valid body for method, tagged with a unique
-// eventId/Idempotency-Key (body.__idempotencyKey — strip before sending if
-// the target doesn't tolerate unknown fields; the ingestion-api DTO ignores
-// unrecognized top-level keys so this is safe to send as-is).
-export function buildBody(method) {
-  const builder = builders[method];
-  if (!builder) {
-    throw new Error(`unknown method ${method}`);
-  }
-  return builder(uniqueSuffix());
+// buildBody returns a fresh, valid order body for shard (an entry from
+// SHARDS), tagged with a unique sourceOrderId/Idempotency-Key
+// (body.__idempotencyKey — strip before sending if the target doesn't
+// tolerate unknown fields; the ingestion-api DTO ignores unrecognized
+// top-level keys so this is safe to send as-is).
+export function buildBody(shard) {
+  return order(shard, uniqueSuffix());
 }

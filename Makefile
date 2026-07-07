@@ -237,11 +237,12 @@ loadtest-report:
 	podman run --rm -i -e TARGET_URL=$(TARGET_URL) -e VUS=$(VUS) -v "$(CURDIR)/loadtest:/lt" -w /lt \
 		grafana/k6 run --summary-export=summary-baseline.json k6-baseline.js
 
-# 6.2 — floods one method's queue (METHOD=PIX default) to trigger KEDA
-# scale-up, then stops so it scales back to 0. Do NOT pin consumers for this
-# one — needs the real KEDA config (min 0 / max 10). Kubernetes-only.
+# 6.2 — floods one shard's order queue (EVENT_TYPE=CONCERT/EVENT_SUBTYPE=ROCK
+# default) to trigger KEDA scale-up, then stops so it scales back to 0. Do
+# NOT pin consumers for this one — needs the real KEDA config (min 0 / max
+# 10). Kubernetes-only.
 loadtest-autoscale:
-	podman run --rm -i -e TARGET_URL=$(TARGET_URL) -e METHOD=$(METHOD) \
+	podman run --rm -i -e TARGET_URL=$(TARGET_URL) -e EVENT_TYPE=$(EVENT_TYPE) -e EVENT_SUBTYPE=$(EVENT_SUBTYPE) \
 		-v "$(CURDIR)/loadtest:/lt" -w /lt grafana/k6 run k6-autoscale.js
 
 # Builds the custom k6 binary (xk6-amqp only) that 6.3 needs — xk6-sql is
@@ -252,19 +253,19 @@ k6-ext-build:
 	podman build -t k6-ext -f build/k6/Dockerfile .
 
 # 6.3 — publishes N messages at a fixed 100 VUs straight onto one or more
-# per-method queues (bypassing ingestion-api), mixed with
+# shards' order queues (bypassing ingestion-api), mixed with
 # DUP_FRACTION/SCHEMA_FRACTION duplicate/bad-schema-version messages by
-# default so one run exercises the consumer's whole outcome taxonomy.
-# METHODS (comma-separated, e.g. PIX,TRANSFER) splits N evenly via
-# round-robin — useful with `podman compose up -d consumer-pix-extra` to
-# compare 2 consumers on one method against 1 on another (see loadtest/README.md's
-# "Multiple methods at once" section). METHOD (singular) still works as a
-# one-method shorthand. Reports k6's own publish throughput;
-# consumer-worker's behavior (ack/duplicate/unknown_schema_version/...) is
-# read from its own /metrics, not from this command — see
-# loadtest/README.md's "Checking consumer behavior". --network host so the
-# default RABBITMQ_URL (localhost:5672) reaches the compose-published port.
+# default so one run exercises order-consumer-worker's whole outcome
+# taxonomy. SHARDS (comma-separated "eventType:eventSubtype" pairs, e.g.
+# CONCERT:ROCK,SPORTS:FOOTBALL) splits N evenly via round-robin — useful for
+# comparing two shards' consumer/DB throughput side by side (see
+# loadtest/README.md's "Multiple shards at once" section). Reports k6's own
+# publish throughput; order-consumer-worker's behavior
+# (ack/duplicate/unknown_schema_version/...) is read from its own /metrics,
+# not from this command — see loadtest/README.md's "Checking consumer
+# behavior". --network host so the default RABBITMQ_URL (localhost:5672)
+# reaches the compose-published port.
 loadtest-consumer:
 	podman run --rm -i --network host -e RABBITMQ_URL=$(RABBITMQ_URL) \
-		-e METHODS=$(METHODS) -e METHOD=$(METHOD) -e N=$(N) -e DUP_FRACTION=$(DUP_FRACTION) -e SCHEMA_FRACTION=$(SCHEMA_FRACTION) \
+		-e SHARDS=$(SHARDS) -e N=$(N) -e DUP_FRACTION=$(DUP_FRACTION) -e SCHEMA_FRACTION=$(SCHEMA_FRACTION) \
 		-v "$(CURDIR)/loadtest:/lt" -w /lt k6-ext run --summary-export=summary-consumer.json k6-consumer.js

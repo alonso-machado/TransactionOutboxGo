@@ -1,5 +1,5 @@
 # Values override for local KIND load testing only — not part of the chart's
-# normal AWS/compose targets. Postgres/RabbitMQ are plain in-cluster
+# normal compose target. Postgres/RabbitMQ are plain in-cluster
 # Deployments (infra/kind/postgres-rabbitmq.yaml), not RDS/Amazon MQ, so
 # every endpoint below is qualified to their Service in the "default"
 # namespace (the app's own namespace is "transaction-outbox" — unqualified
@@ -7,17 +7,18 @@
 image:
   ingestionApi: localhost/transaction-outbox-go/ingestion-api:kindtest
   outboxWorker: localhost/transaction-outbox-go/outbox-worker:kindtest
-  consumerWorker: localhost/transaction-outbox-go/consumer-worker:kindtest
+  orderConsumerWorker: localhost/transaction-outbox-go/order-consumer-worker:kindtest
+  fulfillmentConsumerWorker: localhost/transaction-outbox-go/fulfillment-consumer-worker:kindtest
 
 configMap:
   data:
-    # KEDA's RabbitMQ scaler (templates/consumer-worker/scaledobject.yaml)
-    # reads this via hostFromEnv to query the management API for queue
-    # depth — RabbitMQ's management API always requires auth, and the
-    # chart's own default ("http://rabbitmq:15672") has no credentials
-    # embedded, so the scaler would get a 401 with it as-is. guest/guest is
-    # RabbitMQ's own default account, fine to embed for a throwaway local
-    # in-cluster broker.
+    # KEDA's RabbitMQ scaler (templates/order-consumer-worker/scaledobject.yaml,
+    # templates/fulfillment-consumer-worker/scaledobject.yaml) reads this via
+    # hostFromEnv to query the management API for queue depth — RabbitMQ's
+    # management API always requires auth, and the chart's own default
+    # ("http://rabbitmq:15672") has no credentials embedded, so the scaler
+    # would get a 401 with it as-is. guest/guest is RabbitMQ's own default
+    # account, fine to embed for a throwaway local in-cluster broker.
     RABBITMQ_MANAGEMENT_URL: "http://guest:guest@rabbitmq.default.svc.cluster.local:15672"
     # This chart's own values.yaml has no RATE_LIMIT_ENABLED key at all, so
     # the app falls back to its Go code's hardcoded default — which is
@@ -29,19 +30,24 @@ configMap:
     # Phase 5's outbox-dispatcher-is-the-real-bottleneck finding
     # (loadtest/README.md's 6.1 results): the default batch/interval caps
     # outbox->RabbitMQ publish well below what a 100-VU unrestricted hammer
-    # sustains (measured this session). 100ms here (chart/code default is
-    # now 250ms) pushes the dispatch ceiling higher still for this test,
-    # on top of the idx_outbox_messages_pending_created_at index
-    # (migrations/outbox/000001_init) that removed FetchPending's disk-sort cost.
+    # sustains. 100ms here (chart/code default is now 250ms) pushes the
+    # dispatch ceiling higher still for this test, on top of the
+    # idx_order_outbox_pending_created_at index (migrations/outbox/000001_init)
+    # that removed FetchPending's disk-sort cost.
     OUTBOX_DISPATCH_BATCH_SIZE: "200"
     OUTBOX_DISPATCH_INTERVAL_MS: "100"
+    # No real gateway reachable from a KIND cluster — the fake sandbox
+    # adapter is the only sane default here.
+    PAYMENT_PROVIDER: "fake"
 
 secret:
-  # Two-DB split: outbox DB for ingestion-api/outbox-worker, payments DB for
-  # consumer-worker — both on the same in-cluster Postgres, different dbname.
+  # Two-DB split: outbox DB for ingestion-api/outbox-worker, events DB for
+  # order-consumer-worker/fulfillment-consumer-worker — both on the same
+  # in-cluster Postgres, different dbname.
   databaseUrl: "postgres://outbox:outbox@postgres.default.svc.cluster.local:5432/outbox?sslmode=disable"
-  paymentsDatabaseUrl: "postgres://outbox:outbox@postgres.default.svc.cluster.local:5432/payments?sslmode=disable"
+  eventsDatabaseUrl: "postgres://outbox:outbox@postgres.default.svc.cluster.local:5432/events?sslmode=disable"
   rabbitmqUrl: "amqp://guest:guest@rabbitmq.default.svc.cluster.local:5672/"
+  ticketSigningSecret: "kind-test-ticket-signing-secret"
 
 ingestionApi:
   # The load test exists to drive ingestion-api's autoscaling, so re-enable
@@ -62,7 +68,6 @@ ingestionApi:
 # Exposes RabbitMQ's management UI/API on the host via
 # kind-cluster-config.yaml's hostPort 15673 -> this NodePort mapping — see
 # templates/kind-local/rabbitmq-nodeport.yaml. Off in every other values
-# file (compose already publishes its own on host 15672; the cloud target
-# has no equivalent).
+# file (compose already publishes its own on host 15672).
 kindLocal:
   enabled: true

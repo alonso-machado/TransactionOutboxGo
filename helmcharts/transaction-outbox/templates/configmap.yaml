@@ -1,4 +1,5 @@
-# Non-sensitive configuration shared by ingestion-api and consumer-worker.
+# Non-sensitive configuration shared by ingestion-api, order-consumer-worker,
+# and fulfillment-consumer-worker.
 # Passwords / connection strings with credentials live in secret.yaml instead.
 apiVersion: v1
 kind: ConfigMap

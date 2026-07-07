@@ -1,0 +1,94 @@
+{{- if not .Values.canary.enabled }}
+{{- range .Values.eventShards }}
+---
+# One Deployment per (event_type, event_subtype) shard, rendered from this
+# single template via the eventShards list in values.yaml. Used when
+# canary.enabled is false; see rollout.yaml for the canary.enabled=true path.
+#
+# fulfillment-consumer-worker consumes this shard's payment_event_outbox
+# queue: on a CONFIRMED payment it issues every RESERVED ticket for the
+# order (QR PNG + HMAC signature) — see
+# internal/usecase/fulfillment.IssueTickets.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fulfillment-consumer-worker-{{ .name }}
+  namespace: {{ $.Values.namespace }}
+  labels:
+    app: fulfillment-consumer-worker-{{ .name }}
+    {{- include "transaction-outbox.labels" $ | nindent 4 }}
+spec:
+  # No replicas field — see order-consumer-worker/deployment.yaml's comment;
+  # same KEDA-ownership reasoning applies here.
+  selector:
+    matchLabels:
+      app: fulfillment-consumer-worker-{{ .name }}
+  template:
+    metadata:
+      labels:
+        app: fulfillment-consumer-worker-{{ .name }}
+    spec:
+      {{- with $.Values.fulfillmentConsumerWorker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: fulfillment-consumer-worker
+          # CI tags images by git SHA (see Dockerfile ARG SERVICE=fulfillment-consumer-worker);
+          # the values.yaml default is a placeholder for local/manual use.
+          image: {{ $.Values.image.fulfillmentConsumerWorker }}
+          ports:
+            - name: metrics
+              containerPort: {{ .fulfillmentMetricsPort }}
+          envFrom:
+            - configMapRef:
+                name: transaction-outbox-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  # events DB — fulfillment-consumer-worker is a writer of
+                  # tickets/charges/orders.
+                  key: EVENTS_DATABASE_URL
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: RABBITMQ_URL
+            - name: TICKET_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: TICKET_SIGNING_SECRET
+            - name: CONSUMER_QUEUE
+              value: {{ .paymentQueue }}
+            - name: METRICS_PORT
+              value: {{ .fulfillmentMetricsPort | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: fulfillment-consumer-worker-{{ .name }}
+          resources:
+            {{- toYaml $.Values.fulfillmentConsumerWorker.resources | nindent 12 }}
+          # fulfillment-consumer-worker has no main HTTP server, but it does
+          # expose a Prometheus /metrics endpoint. Every Deployment scales
+          # from 0 via KEDA, so every pod start is a cold start — see
+          # order-consumer-worker/deployment.yaml's comment on the probe
+          # shape.
+          startupProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            failureThreshold: 30
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 10
+{{- end }}
+{{- end }}

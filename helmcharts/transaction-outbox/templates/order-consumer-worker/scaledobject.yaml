@@ -1,15 +1,15 @@
-{{- range .Values.paymentMethods }}
+{{- range .Values.eventShards }}
 ---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
-  name: consumer-{{ .name }}
+  name: order-consumer-worker-{{ .name }}
   namespace: {{ $.Values.namespace }}
   labels:
     {{- include "transaction-outbox.labels" $ | nindent 4 }}
 spec:
   scaleTargetRef:
-    name: consumer-{{ .name }}
+    name: order-consumer-worker-{{ .name }}
     {{- if $.Values.canary.enabled }}
     # Re-pointed from Deployment to Rollout (Phase 4 Track 4) — missing this
     # is the one non-obvious wiring detail that silently breaks autoscaling
@@ -17,15 +17,15 @@ spec:
     apiVersion: argoproj.io/v1alpha1
     kind: Rollout
     {{- end }}
-  minReplicaCount: {{ $.Values.consumerWorker.keda.minReplicaCount }} # scale to zero when idle
-  maxReplicaCount: {{ $.Values.consumerWorker.keda.maxReplicaCount }}
-  pollingInterval: {{ $.Values.consumerWorker.keda.pollingInterval }} # seconds between queue checks
-  cooldownPeriod: {{ $.Values.consumerWorker.keda.cooldownPeriod }} # seconds to wait before scaling to zero
+  minReplicaCount: {{ $.Values.orderConsumerWorker.keda.minReplicaCount }} # scale to zero when idle
+  maxReplicaCount: {{ $.Values.orderConsumerWorker.keda.maxReplicaCount }}
+  pollingInterval: {{ $.Values.orderConsumerWorker.keda.pollingInterval }} # seconds between queue checks
+  cooldownPeriod: {{ $.Values.orderConsumerWorker.keda.cooldownPeriod }} # seconds to wait before scaling to zero
   advanced:
     horizontalPodAutoscalerConfig:
       behavior:
         scaleUp:
-          stabilizationWindowSeconds: {{ $.Values.consumerWorker.keda.scaleUpStabilizationSeconds }}
+          stabilizationWindowSeconds: {{ $.Values.orderConsumerWorker.keda.scaleUpStabilizationSeconds }}
           # Without this, the HPA default policy (max of "+4 pods" or
           # "double") needs two 15s pollingInterval cycles to go from 1
           # replica to maxReplicaCount=10 (1->5->10) — a 40k-message queue
@@ -36,16 +36,16 @@ spec:
           # making the policy's own window shorter wouldn't help.
           policies:
             - type: Pods
-              value: {{ $.Values.consumerWorker.keda.maxReplicaCount }}
-              periodSeconds: {{ $.Values.consumerWorker.keda.pollingInterval }}
+              value: {{ $.Values.orderConsumerWorker.keda.maxReplicaCount }}
+              periodSeconds: {{ $.Values.orderConsumerWorker.keda.pollingInterval }}
         scaleDown:
-          stabilizationWindowSeconds: {{ $.Values.consumerWorker.keda.scaleDownStabilizationSeconds }}
+          stabilizationWindowSeconds: {{ $.Values.orderConsumerWorker.keda.scaleDownStabilizationSeconds }}
   triggers:
     - type: rabbitmq
       metadata:
         protocol: http
-        queueName: {{ .queue }}
+        queueName: {{ .orderQueue }}
         mode: QueueLength
-        value: {{ $.Values.consumerWorker.keda.queueLengthValue | quote }}
+        value: {{ $.Values.orderConsumerWorker.keda.queueLengthValue | quote }}
         hostFromEnv: RABBITMQ_MANAGEMENT_URL
 {{- end }}

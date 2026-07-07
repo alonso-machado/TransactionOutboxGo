@@ -1,12 +1,13 @@
-// Test 6.2 — autoscaling: floods ONE method's queue past KEDA's
+// Test 6.2 — autoscaling: floods ONE shard's order queue past KEDA's
 // queueLengthValue trigger (1000, see helmcharts/transaction-outbox
-// values.yaml consumerWorker.keda) to force scale-up, then stops producing
-// so the queue drains and KEDA scales the consumer back to 0.
+// values.yaml orderConsumerWorker.keda) to force scale-up, then stops
+// producing so the queue drains and KEDA scales order-consumer-worker back
+// to 0.
 //
-// Consumers must NOT be pinned for this test (the opposite of 6.1) — run
-// against the real KEDA config: minReplicaCount 0, maxReplicaCount 10. The
-// scaling itself is observed out-of-band via `kubectl get pods/scaledobject`
-// — k6 only produces the load.
+// order-consumer-worker instances must NOT be pinned for this test (the
+// opposite of 6.1) — run against the real KEDA config: minReplicaCount 0,
+// maxReplicaCount 10. The scaling itself is observed out-of-band via
+// `kubectl get pods/scaledobject` — k6 only produces the load.
 //
 // Closed-loop hammer (constant-vus), not a capped open-loop rate: a fixed
 // target rate (the original design) self-limits at whatever 1 consumer can
@@ -18,9 +19,14 @@
 // Kubernetes-only (KEDA needs K8s) — not run against local compose.
 import http from "k6/http";
 import { check } from "k6";
-import { buildBody } from "./payloads.js";
+import { buildBody, SHARDS } from "./payloads.js";
 
-const METHOD = __ENV.METHOD || "PIX";
+// EVENT_TYPE/EVENT_SUBTYPE default to CONCERT/ROCK — the first entry in
+// SHARDS, matching payloads.js and the shard docker-compose.yml/values.yaml
+// both run by default.
+const EVENT_TYPE = __ENV.EVENT_TYPE || SHARDS[0].eventType;
+const EVENT_SUBTYPE = __ENV.EVENT_SUBTYPE || SHARDS[0].eventSubtype;
+const SHARD = { eventType: EVENT_TYPE, eventSubtype: EVENT_SUBTYPE };
 const BASE = __ENV.TARGET_URL || "http://localhost:8080";
 const VUS = Number(__ENV.VUS || 200);
 const DURATION = __ENV.DURATION || "8m";
@@ -36,13 +42,13 @@ export const options = {
 };
 
 export default function () {
-  const body = buildBody(METHOD);
-  const res = http.post(`${BASE}/api/v1/payments`, JSON.stringify(body), {
+  const body = buildBody(SHARD);
+  const res = http.post(`${BASE}/api/v1/orders`, JSON.stringify(body), {
     headers: {
       "Content-Type": "application/json",
       "Idempotency-Key": body.__idempotencyKey,
     },
-    tags: { method: METHOD },
+    tags: { eventType: EVENT_TYPE, eventSubtype: EVENT_SUBTYPE },
   });
   check(res, { "is 201": (r) => r.status === 201 });
 }

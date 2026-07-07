@@ -1,0 +1,47 @@
+{{- range .Values.eventShards }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: fulfillment-consumer-worker-{{ .name }}
+  namespace: {{ $.Values.namespace }}
+  labels:
+    {{- include "transaction-outbox.labels" $ | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: fulfillment-consumer-worker-{{ .name }}
+    {{- if $.Values.canary.enabled }}
+    # Re-pointed from Deployment to Rollout (Phase 4 Track 4) — missing this
+    # is the one non-obvious wiring detail that silently breaks autoscaling
+    # when converting to canary.
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    {{- end }}
+  minReplicaCount: {{ $.Values.fulfillmentConsumerWorker.keda.minReplicaCount }} # scale to zero when idle
+  maxReplicaCount: {{ $.Values.fulfillmentConsumerWorker.keda.maxReplicaCount }}
+  pollingInterval: {{ $.Values.fulfillmentConsumerWorker.keda.pollingInterval }} # seconds between queue checks
+  cooldownPeriod: {{ $.Values.fulfillmentConsumerWorker.keda.cooldownPeriod }} # seconds to wait before scaling to zero
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: {{ $.Values.fulfillmentConsumerWorker.keda.scaleUpStabilizationSeconds }}
+          # Same reasoning as order-consumer-worker's ScaledObject — a single
+          # Pods policy sized to maxReplicaCount lets one reconcile jump
+          # straight to max under a sudden backlog spike instead of ramping
+          # over several pollingInterval cycles.
+          policies:
+            - type: Pods
+              value: {{ $.Values.fulfillmentConsumerWorker.keda.maxReplicaCount }}
+              periodSeconds: {{ $.Values.fulfillmentConsumerWorker.keda.pollingInterval }}
+        scaleDown:
+          stabilizationWindowSeconds: {{ $.Values.fulfillmentConsumerWorker.keda.scaleDownStabilizationSeconds }}
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: http
+        queueName: {{ .paymentQueue }}
+        mode: QueueLength
+        value: {{ $.Values.fulfillmentConsumerWorker.keda.queueLengthValue | quote }}
+        hostFromEnv: RABBITMQ_MANAGEMENT_URL
+{{- end }}

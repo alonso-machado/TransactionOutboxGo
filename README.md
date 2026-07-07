@@ -1,9 +1,10 @@
-# Transaction Outbox (Go Monorepo)
+# Transaction Outbox (Go Monorepo) — Event Ticket System
 
-A reliable payments ingestion pipeline that accepts REST writes (`POST` / `PUT` /
-`PATCH`), guarantees **no message loss**, and persists each payment **exactly
-once** — implemented with the **Transactional Outbox** pattern over RabbitMQ and
-Postgres.
+A reliable ticket-ordering pipeline that accepts REST writes (`POST /api/v1/orders`),
+guarantees **no order loss**, charges each order **exactly once** through a
+pluggable payment gateway, and issues signed, QR-coded tickets once payment is
+confirmed — implemented with the **Transactional Outbox** pattern over
+RabbitMQ and Postgres.
 
 ---
 
@@ -17,10 +18,10 @@ acknowledges the client, and a separate relay reliably forwards it to the broker
 
 | Concern | How it's solved |
 |---|---|
-| **No message loss** | Request is durably written to a Postgres `outbox_messages` table before the client gets `201`. `DispatchOutbox` publishes to RabbitMQ with **publisher confirms**. |
-| **Idempotency / no duplicates** | Deterministic dedup key (`sha256(method + provider.name:eventId + optional Idempotency-Key)`) is the outbox `UNIQUE` constraint **and** the RabbitMQ `MessageId` — a webhook redelivery carries the same `eventId`, the natural dedup boundary. The consumer also dedupes on `payments.source_message_id` (UNIQUE) — a redelivered message is a safe no-op insert. |
-| **Poison messages** | Dead-letter exchange/queue (`payments.dlx` → `payments.dlq`) after N redeliveries. |
-| **Horizontal scaling** | `DispatchOutbox` polls with `FOR UPDATE SKIP LOCKED`; consumer uses prefetch + manual ack. |
+| **No message loss** | The order is durably written to a Postgres `order_outbox` table before the client gets `201`. `DispatchOutbox` publishes to RabbitMQ with **publisher confirms**. The gateway's own payment confirmation gets the identical treatment via a second table, `payment_event_outbox`. |
+| **Idempotency / no duplicates** | Deterministic dedup key (`sha256("order:" + sourceOrderId + optional Idempotency-Key)` for orders, `sha256(provider + rawEventId)` for gateway webhooks) is the outbox `UNIQUE` constraint **and** the RabbitMQ `MessageId`. `order-consumer-worker` also dedupes on `orders.source_order_id` (UNIQUE) — a redelivered message is a safe no-op insert. |
+| **Poison messages** | Dead-letter exchange/queue (`tickets.dlx` → `<stream>.<type>.<subtype>.dlq`) after N redeliveries. |
+| **Horizontal scaling** | `DispatchOutbox` polls with `FOR UPDATE SKIP LOCKED`; each consumer worker uses prefetch + manual ack, one instance per `(event_type, event_subtype)` shard. |
 
 ---
 
@@ -32,7 +33,9 @@ acknowledges the client, and a separate relay reliably forwards it to the broker
 | HTTP framework | Gin (`github.com/gin-gonic/gin`) | latest |
 | ORM | GORM (`gorm.io/gorm` + `gorm.io/driver/postgres`) | latest |
 | Message broker | RabbitMQ (`rabbitmq:4.3-management`, **quorum queues**) | **4.3.2** |
-| Database | PostgreSQL (`timescale/timescaledb:latest-pg18` — TimescaleDB, Phase 4 Track 2) | **18** |
+| Database | PostgreSQL | **18** |
+| Payment gateway | Stripe (`github.com/stripe/stripe-go/v82`) — real; `fake` sandbox is the local/test default | — |
+| QR codes | `github.com/skip2/go-qrcode` | latest |
 | AMQP client | `github.com/rabbitmq/amqp091-go` | latest |
 | Config | `github.com/kelseyhightower/envconfig` | latest |
 | Local orchestration | Podman Compose | — |
@@ -44,86 +47,87 @@ acknowledges the client, and a separate relay reliably forwards it to the broker
 
 ## Architecture
 
-Three service binaries: **`ingestion-api`** (fixed 1 replica, HTTP write path),
-**`outbox-worker`** (the Transactional Outbox relay — its own process, KEDA-
-scaled on outbox backlog, min 1), and **`consumer-worker`** with **N instances**
-— one per payment method (Phase 3), each bound to exactly one RabbitMQ queue via
-`PAYMENT_QUEUE` so KEDA can scale a method's consumers independently. The
-**`DispatchOutbox`** use case runs in `outbox-worker` (it used to be a goroutine
-inside `ingestion-api`); splitting it out lets the relay scale on backlog
-independently of the HTTP front door, and lets `ingestion-api` accept writes
-even when RabbitMQ is down — it never connects to the broker at all now.
+Four service binaries: **`ingestion-api`** (fixed 1 replica, HTTP write path —
+orders + payment-gateway webhooks), **`outbox-worker`** (the Transactional
+Outbox relay — its own process, running two independent dispatch loops, one
+per outbox table, KEDA-scaled on their summed backlog, min 1),
+**`order-consumer-worker`**, and **`fulfillment-consumer-worker`** — the
+latter two run **N instances each**, one per `(event_type, event_subtype)`
+shard (e.g. `CONCERT`/`ROCK`), bound to exactly one RabbitMQ queue via
+`CONSUMER_QUEUE` so KEDA can scale a shard's consumers independently.
 
-Two logical databases share one Postgres instance: ingestion-api and
-outbox-worker use the **`outbox`** database (`outbox_messages`); consumer-worker
-uses the **`payments`** database (`payments_*` hypertables). The API **never
-writes to the `payments` tables** — only `consumer-worker` does.
+Two logical databases share one Postgres instance: `ingestion-api` and
+`outbox-worker` use the **`outbox`** database (`order_outbox` +
+`payment_event_outbox`); `order-consumer-worker` and
+`fulfillment-consumer-worker` use the **`events`** database
+(`locations`/`events`/`producers`/`event_areas`/`orders`/`tickets`/`charges`).
+The API **never writes to the `events` database** — only the two consumer
+workers do.
 
 ```mermaid
 flowchart LR
     Client([Client])
+    Gateway([Payment gateway<br/>Stripe / fake])
 
     subgraph API["ingestion-api (fixed 1 replica)"]
-        H[Gin HTTP handler]
+        H[Gin HTTP handler<br/>orders + webhooks]
     end
 
     subgraph OW["outbox-worker (KEDA, min 1)"]
-        R[DispatchOutbox<br/>poll · LISTEN/NOTIFY · publish · mark]
+        R1[DispatchOutbox: orders<br/>poll · LISTEN/NOTIFY · publish · mark]
+        R2[DispatchOutbox: payment events<br/>poll · publish · mark]
     end
 
-    subgraph DB[(PostgreSQL 18 / TimescaleDB — one instance)]
+    subgraph DB[(PostgreSQL 18 — one instance)]
         subgraph DBO["outbox database"]
-            OBX[[outbox_messages]]
+            OBX[[order_outbox]]
+            PEO[[payment_event_outbox]]
         end
-        subgraph DBP["payments database"]
-            PAY[[payments]]
+        subgraph DBE["events database"]
+            ORD[[orders / tickets / charges]]
         end
     end
 
-    subgraph MQ["RabbitMQ 4.3 (quorum, one queue + DLQ per method)"]
-        EX{{payments.exchange<br/>topic, routing key = payment.&lt;method&gt;}}
-        QPIX[[payments.pix.queue]]
-        QBOL[[payments.boleto.queue]]
-        QTRF[[payments.transfer.queue]]
-        QCC[[payments.cartao_credito.queue]]
-        QCD[[payments.cartao_debito.queue]]
-        DLX{{payments.dlx}}
-        EX --> QPIX & QBOL & QTRF & QCC & QCD
-        QPIX -. "max deliveries" .-> DLX
-        QBOL -. "max deliveries" .-> DLX
-        QTRF -. "max deliveries" .-> DLX
-        QCC -. "max deliveries" .-> DLX
-        QCD -. "max deliveries" .-> DLX
+    subgraph MQ["RabbitMQ 4.3 (quorum, one queue + DLQ per shard, per stream)"]
+        EX{{tickets.exchange<br/>topic}}
+        QO[["events.&lt;type&gt;.&lt;subtype&gt;.queue"]]
+        QP[["payments.&lt;type&gt;.&lt;subtype&gt;.queue"]]
+        DLX{{tickets.dlx}}
+        EX --> QO & QP
+        QO -. "max deliveries" .-> DLX
+        QP -. "max deliveries" .-> DLX
     end
 
-    subgraph WORK["consumer-worker — one instance per method (PAYMENT_QUEUE)"]
-        CPIX[Consumer: pix]
-        CBOL[Consumer: boleto]
-        CTRF[Consumer: transfer]
-        CCC[Consumer: cartao_credito]
-        CCD[Consumer: cartao_debito]
+    subgraph OCW["order-consumer-worker — one per shard"]
+        PO[ProcessOrder:<br/>reserve tickets, open checkout]
+    end
+    subgraph FCW["fulfillment-consumer-worker — one per shard"]
+        IT[IssueTickets:<br/>QR + HMAC on CONFIRMED]
     end
 
-    Client -- "POST/PUT/PATCH /api/v1/payments" --> H
-    H -- "tx: INSERT (idempotency_key UNIQUE, status=NEW, payment_method)" --> OBX
+    Client -- "POST /api/v1/orders" --> H
+    H -- "tx: INSERT (idempotency_key UNIQUE, status=NEW, event_type/subtype)" --> OBX
     H -- "201 Created" --> Client
-    OBX -. "NOTIFY outbox_new (cross-process wake)" .-> R
-    R -- "SELECT status IN (NEW, RETRYING) FOR UPDATE SKIP LOCKED" --> OBX
-    R -- "publish (confirm, persistent, routing key = payment.&lt;method&gt;)" --> EX
-    R -- "mark PUBLISHED" --> OBX
-    QPIX --> CPIX
-    QBOL --> CBOL
-    QTRF --> CTRF
-    QCC --> CCC
-    QCD --> CCD
-    CPIX & CBOL & CTRF & CCC & CCD -- "INSERT ... ON CONFLICT (source_message_id) DO NOTHING" --> PAY
+    OBX -. "NOTIFY order_outbox_new" .-> R1
+    R1 -- "SELECT ... FOR UPDATE SKIP LOCKED" --> OBX
+    R1 -- "publish (confirm, routing key = order.&lt;type&gt;.&lt;subtype&gt;)" --> EX
+    R1 -- "mark PUBLISHED" --> OBX
+    QO --> PO
+    PO -- "reserve RESERVED tickets + PENDING charge" --> ORD
+    PO -- "CreateCheckout" --> Gateway
+    Gateway -- "webhook: POST /api/v1/webhooks/payments/{provider}" --> H
+    H -- "tx: INSERT" --> PEO
+    PEO -. "poll" .-> R2
+    R2 -- "publish (routing key = payment.&lt;type&gt;.&lt;subtype&gt;)" --> EX
+    QP --> IT
+    IT -- "mark PAID + issue VALID tickets (QR/HMAC)" --> ORD
 ```
 
-> This diagram is the core Phase 1–3 dataflow. In cloud, `Client` actually
-> hits an ALB + AWS WAF in front of `ingestion-api` (not shown — see
-> [Edge protection](#edge-protection-rate-limiting--waf)), both services
-> deploy via Argo Rollouts canary steps (see [Canary deploys](#canary-deploys)),
-> and Prometheus/Grafana observe every box above (see
+> This diagram is the core dataflow. In cloud, `Client` actually hits an ALB +
+> AWS WAF in front of `ingestion-api` (not shown — see
+> [Edge protection](#edge-protection-rate-limiting--waf)), all services deploy
+> via Argo Rollouts canary steps (see [Canary deploys](#canary-deploys)), and
+> Prometheus/Grafana observe every box above (see
 > [Observability](#observability-prometheus--grafana)).
 
 ### End-to-end flow
@@ -134,24 +138,41 @@ sequenceDiagram
     participant Cl as Client
     participant API as ingestion-api (HTTP)
     participant PG as Postgres
-    participant RL as DispatchOutbox goroutine
+    participant OW as outbox-worker
     participant MQ as RabbitMQ
-    participant CW as consumer-worker
+    participant OCW as order-consumer-worker
+    participant GW as Payment gateway
+    participant FCW as fulfillment-consumer-worker
 
-    Cl->>API: POST /api/v1/payments (+ optional Idempotency-Key)
-    API->>API: paymentId = uuid.NewV7()
-    API->>API: key = sha256(method + provider.name:eventId + key?)
-    API->>PG: BEGIN; INSERT outbox (status=NEW) ON CONFLICT DO NOTHING; COMMIT
-    API-->>Cl: 201 Created { paymentId, idempotencyKey, status }
-    loop DispatchOutbox poll (Transactional Outbox)
-        RL->>PG: SELECT status IN (NEW, RETRYING) FOR UPDATE SKIP LOCKED
-        RL->>MQ: publish (persistent, MessageId=key, confirms)
-        MQ-->>RL: confirm ACK
-        RL->>PG: UPDATE status = PUBLISHED
+    Cl->>API: POST /api/v1/orders (+ optional Idempotency-Key)
+    API->>API: orderId = uuid.NewV7()
+    API->>API: key = sha256("order:" + sourceOrderId + key?)
+    API->>PG: BEGIN; INSERT order_outbox (status=NEW) ON CONFLICT DO NOTHING; COMMIT
+    API-->>Cl: 201 Created { orderId, idempotencyKey, status }
+    loop DispatchOutbox poll (order_outbox)
+        OW->>PG: SELECT status IN (NEW, RETRYING) FOR UPDATE SKIP LOCKED
+        OW->>MQ: publish (persistent, MessageId=key, confirms)
+        MQ-->>OW: confirm ACK
+        OW->>PG: UPDATE status = PUBLISHED
     end
-    MQ->>CW: deliver (manual ack)
-    CW->>PG: INSERT payments ON CONFLICT (source_message_id) DO NOTHING
-    CW->>MQ: ack
+    MQ->>OCW: deliver (manual ack)
+    OCW->>PG: upsert Location/Event, reserve Tickets, INSERT Charge (PENDING)
+    OCW->>GW: CreateCheckout(orderId, amount, ...)
+    GW-->>OCW: { providerRef, checkoutUrl }
+    OCW->>MQ: ack
+    Note over Cl,GW: customer pays at the gateway's hosted checkout page
+    GW->>API: POST /api/v1/webhooks/payments/{provider}
+    API->>API: VerifyWebhook (signature check)
+    API->>PG: BEGIN; INSERT payment_event_outbox; COMMIT
+    API-->>GW: 200 OK
+    loop DispatchOutbox poll (payment_event_outbox)
+        OW->>PG: SELECT status IN (NEW, RETRYING) FOR UPDATE SKIP LOCKED
+        OW->>MQ: publish (persistent, confirms)
+        OW->>PG: UPDATE status = PUBLISHED
+    end
+    MQ->>FCW: deliver (manual ack)
+    FCW->>PG: mark Charge/Order PAID, issue Tickets (QR PNG + HMAC signature)
+    FCW->>MQ: ack
 ```
 
 ### Outbox status state machine
@@ -167,7 +188,9 @@ stateDiagram-v2
 
 `RETRYING` increments `retry_count` on every failed publish attempt; once
 `retry_count` reaches `MAX_RETRIES` the row moves to `DEAD_LETTER` and
-`DispatchOutbox` stops retrying it.
+`DispatchOutbox` stops retrying it. Both `order_outbox` and
+`payment_event_outbox` share this identical state machine and are relayed by
+the same generalized `DispatchOutbox` implementation.
 
 ---
 
@@ -175,8 +198,9 @@ stateDiagram-v2
 
 The codebase follows Clean Architecture. The **dependency rule** points inward:
 outer layers depend on inner layers, never the reverse. The `domain` layer is pure
-Go — it has **no imports** of Gin, GORM, or RabbitMQ. Those frameworks live in the
-outer layers and are injected at the composition root (`cmd/*/main.go`).
+Go — it has **no imports** of Gin, GORM, RabbitMQ, or the Stripe SDK. Those
+frameworks live in the outer layers and are injected at the composition root
+(`cmd/*/main.go`).
 
 ```mermaid
 flowchart TB
@@ -184,16 +208,20 @@ flowchart TB
         subgraph ADAPT["adapter — interface adapters"]
             subgraph UC["usecase — application rules"]
                 subgraph DOM["domain — entities + ports"]
-                    E["Entities: OutboxMessage, Payment"]
-                    P["Ports: OutboxRepository,<br/>PaymentRepository, Publisher, UnitOfWork"]
+                    E["Entities: Order, Ticket, Charge,<br/>Event, Location, OutboxMessage"]
+                    P["Ports: OrderRepository, TicketRepository,<br/>ChargeRepository, PaymentGateway,<br/>TicketQR, OutboxRepository, Publisher, UnitOfWork"]
                 end
-                U1[IngestPayment]
-                U2["DispatchOutbox (Transactional Outbox core)"]
-                U3[ProcessMessage]
+                U1[PlaceOrder]
+                U2[ReceivePaymentEvent]
+                U3["DispatchOutbox (Transactional Outbox core)"]
+                U4[ProcessOrder]
+                U5[IssueTickets]
             end
             A1["http: Gin handlers + DTOs"]
             A2["persistence: GORM repos + UoW"]
             A3["messaging: RabbitMQ pub/consumer"]
+            A4["paymentgateway: Stripe/fake/stub adapters"]
+            A5["ticketqr: QR PNG + HMAC signing"]
         end
         I1[config]
         I2[database bootstrap]
@@ -208,8 +236,8 @@ flowchart TB
 | Layer | Responsibility | May import |
 |---|---|---|
 | `domain` | Entities + port interfaces | nothing external |
-| `usecase` | Application flows (`IngestPayment`, `DispatchOutbox`, `ProcessMessage`) | `domain` only |
-| `adapter` | Gin handlers, GORM repositories, RabbitMQ pub/consumer | `domain`, `usecase` |
+| `usecase` | Application flows (`PlaceOrder`, `ReceivePaymentEvent`, `DispatchOutbox`, `ProcessOrder`, `IssueTickets`) | `domain` only |
+| `adapter` | Gin handlers, GORM repositories, RabbitMQ pub/consumer, payment gateway adapters, QR generation | `domain`, `usecase` |
 | `infrastructure` | Config, DB/MQ bootstrap, `main` wiring (DI) | all of the above |
 
 > GORM-tagged structs live **only** in `adapter/persistence`. Domain entities are
@@ -218,47 +246,58 @@ flowchart TB
 `internal/observability` is a small dependency-free leaf (same idea as
 `internal/domain/pii`): two helpers — `Int64Counter`/`Int64Gauge` — that wrap
 OTel metric-instrument construction and log the (spec-guaranteed-non-fatal)
-creation error once, so `usecase/outbox`, `usecase/consume`,
-`adapter/messaging`, and `adapter/http/ratelimit` don't each repeat the same
-"log the error, then nil-check every call site" boilerplate. Any layer may
-import it, the same way any layer may import `domain/pii`.
+creation error once, so `usecase/outbox`, `usecase/checkout`,
+`usecase/fulfillment`, `adapter/messaging`, and `adapter/http/ratelimit` don't
+each repeat the same "log the error, then nil-check every call site"
+boilerplate. Any layer may import it, the same way any layer may import
+`domain/pii`.
 
 ---
 
 ## Components
 
-- **`ingestion-api`** — Gin HTTP server exposing `POST/PUT/PATCH /api/v1/payments`
-  and `/healthz`. Pre-generates the Payment UUID, computes the idempotency key from
-  the business fields, writes **only** to the outbox table (in the `outbox`
-  database) inside a transaction (status `NEW`), returns `201 Created`. Runs at a
-  fixed 1 replica and does **not** connect to RabbitMQ. Also serves
-  **`POST /api/v1/ticket`**, landing a ticket-order event in a separate
-  `ticket_outbox` table (idempotent on the order's `event_id`) for a future
-  ticket-processing microservice to consume — no relay exists yet.
-- **`outbox-worker`** — the Transactional Outbox core, its own process: polls
-  `NEW`/`RETRYING` rows (deduped via `FOR UPDATE SKIP LOCKED`, plus a
-  LISTEN/NOTIFY fast path), publishes to RabbitMQ with publisher confirms, marks
-  rows `PUBLISHED` (or `RETRYING`/`DEAD_LETTER` on failure with exponential
-  backoff), prunes old published rows, and declares the shared RabbitMQ topology.
-  KEDA scales it on outbox backlog (postgresql scaler), min 1.
-- **`consumer-worker`** — RabbitMQ consumer with prefetch + manual ack. The
-  **only writer** of the `payments` tables (in the `payments` database) —
-  dedupes via the `payments.source_message_id` `UNIQUE` constraint
-  (`ON CONFLICT DO NOTHING`), so a redelivered message is a safe no-op. No
-  separate inbox table.
+- **`ingestion-api`** — Gin HTTP server exposing `POST /api/v1/orders`,
+  `POST /api/v1/webhooks/payments/{provider}`, and `/healthz`. Pre-generates
+  the Order UUID, computes the idempotency key from the order's own
+  identity, writes **only** to `order_outbox` (in the `outbox` database)
+  inside a transaction (status `NEW`), returns `201 Created`. The webhook
+  route verifies the gateway's signature via the configured
+  `PaymentGateway.VerifyWebhook` and writes `payment_event_outbox`. Runs at a
+  fixed 1 replica and does **not** connect to RabbitMQ or the `events`
+  database.
+- **`outbox-worker`** — the Transactional Outbox core, its own process,
+  running two independent `DispatchOutbox` loops (one per outbox table):
+  polls `NEW`/`RETRYING` rows (deduped via `FOR UPDATE SKIP LOCKED`,
+  `order_outbox` also gets a LISTEN/NOTIFY fast path), publishes to RabbitMQ
+  with publisher confirms, marks rows `PUBLISHED` (or `RETRYING`/
+  `DEAD_LETTER` on failure with exponential backoff), prunes old published
+  rows, and declares the shared RabbitMQ topology. KEDA scales it on the
+  **summed** backlog of both outboxes (postgresql scaler), min 1.
+- **`order-consumer-worker`** — RabbitMQ consumer with prefetch + manual ack,
+  one instance per `(event_type, event_subtype)` shard. Upserts the
+  `Location`/`Event` an order belongs to, reserves `Ticket` rows
+  (`RESERVED`), opens a checkout with the configured `PaymentGateway`, and
+  persists a `Charge` (`PENDING`). Dedupes via the `orders.source_order_id`
+  `UNIQUE` constraint.
+- **`fulfillment-consumer-worker`** — RabbitMQ consumer, same per-shard
+  shape. On a `CONFIRMED` payment-gateway webhook it marks the `Charge`/
+  `Order` `PAID` and issues every `RESERVED` ticket (QR PNG + HMAC
+  signature); on `FAILED` it marks them `FAILED`/`VOID`.
 - **PostgreSQL** — one instance, two logical databases: `outbox`
-  (`outbox_messages` + `ticket_outbox`) and `payments` (`payments_*`
-  hypertables + the `payments` view).
-- **RabbitMQ** — durable topic exchange (`payments.exchange`) + quorum queue
-  (`payments.queue`) + dead-letter queue (`payments.dlq`).
+  (`order_outbox` + `payment_event_outbox`) and `events`
+  (`locations`/`events`/`producers`/`event_areas`/`orders`/`tickets`/`charges`).
+- **RabbitMQ** — durable topic exchange (`tickets.exchange`) + one quorum
+  queue + dead-letter queue per `(stream, event_type, event_subtype)` shard.
 - **`outbox-admin`** — a one-shot maintenance CLI, **not** a long-running
   service. Three subcommands, all driven by `make`:
-  `replay-dead --method PIX --limit 100` resets `DEAD_LETTER` outbox rows
-  back to `NEW` so the existing dispatch loop republishes them;
-  `drain-dlq --method PIX` moves messages sitting in `payments.pix.dlq` back
-  onto `payments.pix.queue`; `purge-loadtest-dlq --method PIX` scans a DLQ
-  and permanently removes only messages with `providerName="LOADTEST"`
-  (set by every `loadtest/*.js` script), leaving any other message
+  `replay-dead --outbox order --event-type CONCERT --limit 100` resets
+  `DEAD_LETTER` rows in `order_outbox` (or `payment_event_outbox` with
+  `--outbox payment`) back to `NEW` so the existing dispatch loop republishes
+  them; `drain-dlq --stream order --event-type CONCERT --event-subtype ROCK`
+  moves messages sitting in a shard's DLQ back onto its queue;
+  `purge-loadtest-dlq --stream order --event-type CONCERT --event-subtype ROCK`
+  scans a DLQ and permanently removes only messages a loadtest run marked
+  (`customerName`/`provider` = `"LOADTEST"`), leaving any other message
   untouched — safe to run against a DLQ with a mix of real and loadtest
   messages, e.g. after load-testing in a UAT environment. Operates on the
   `outbox` database (`DATABASE_URL` points at it, same as ingestion-api/
@@ -268,186 +307,183 @@ import it, the same way any layer may import `domain/pii`.
 
 ---
 
-## Payment wire format
-
-The request body mirrors a payment-provider webhook (e.g. **Mercado Pago PIX**):
-a generic envelope plus a method-specific sibling object named after
-`payment.method` lowercased:
+## Order wire format
 
 ```json
 {
-  "eventId": "evt_123456",
-  "provider": {
-    "name": "MERCADO_PAGO",
-    "providerPaymentId": "987654321"
-  },
-  "payment": {
-    "paymentId": "pay_123",
-    "amount": 100.50,
-    "currency": "BRL",
-    "method": "PIX",
-    "payerId": "018f7f9e-6e8b-7c3a-8f2a-000000000001",
-    "recipientId": "018f7f9e-6e8b-7c3a-8f2a-000000000002"
-  },
-  "pix": {
-    "endToEndId": "E123456789ABCDEF",
-    "txid": "ORDER123"
-  },
-  "occurredAt": "2026-06-19T18:30:00Z"
+  "sourceOrderId": "order-abc123",
+  "eventType": "CONCERT",
+  "eventSubtype": "ROCK",
+  "eventId": "evt_rock_in_rio_2026",
+  "eventName": "Rock in Rio",
+  "venue": { "id": "venue-1", "name": "Estadio Nacional", "city": "Sao Paulo" },
+  "tickets": [
+    { "id": "TKT-1", "section": "A", "row": "10", "seat": "5", "price": 150.00, "currency": "BRL" }
+  ],
+  "customer": { "name": "Jane Doe", "email": "jane@example.com", "document": "12345678900" }
 }
 ```
 
-- `payerId`/`recipientId` are **optional** — a provider webhook describes a
-  payment the provider already tracked, not necessarily two parties known to
-  our own ledger.
-- `amount` is a decimal float in currency units on the wire; the handler
-  converts it to `int64` minor units (cents) immediately — domain and
-  persistence code never see a float.
-- The method-specific object (here `"pix"`) is extracted generically by
-  lowercasing `payment.method` and looking up that key in the raw JSON body,
-  then stored opaquely as `MethodDetails` (JSONB). Adding a new method
-  (`CARD`, `BOLETO`, ...) needs no DTO change.
-- `paymentId` (the provider's own reference, e.g. `"pay_123"`) is stored as
-  `ExternalPaymentID`, distinct from our server-generated `Payment.ID` (UUID
-  v7) and from `provider.providerPaymentId`.
+- `eventType`/`eventSubtype` must be a registered pair
+  (`internal/infrastructure/rabbitmq.EventTypes`) — an unregistered pair has
+  no bound RabbitMQ queue and is rejected `400` rather than silently
+  vanishing into a topic-exchange black hole.
+- `tickets[].price` is a decimal float in currency units on the wire; the
+  handler converts it to `int64` minor units (cents) immediately — domain and
+  persistence code never see a float. All tickets in one order must share one
+  `currency` — mixed-currency orders aren't supported.
+- `venue`/`eventName` are upserted into the `events` database's
+  `locations`/`events` tables, keyed by `venue.id`/`eventId` respectively —
+  a redelivered order for a venue/event already seen is a safe no-op update,
+  not a duplicate row.
 
-### Supported payment methods
+### Event type / subtype registry
 
-| Method | Sibling object | Required fields |
-|---|---|---|
-| `PIX` | `pix` | `endToEndId`, `txid` |
-| `BOLETO` | `boleto` | `barcode`, `dueDate`, `payerDocument` |
-| `TRANSFER` | *(none — internal)* | `payment.payerId` and `payment.recipientId` |
-| `CARTAO_CREDITO` | `cartao_credito` | `cardNumber`, `cardType` (`CREDIT`), `cardIssuer` |
-| `CARTAO_DEBITO` | `cartao_debito` | `cardNumber`, `cardType` (`DEBIT`), `cardIssuer` |
+| Event type | Subtypes |
+|---|---|
+| `CONCERT` | `ROCK`, `POP`, `ELECTRONIC`, `SAMBA` |
+| `SPORTS` | `FOOTBALL`, `BASKETBALL`, `UFC` |
+| `THEATER` | `PLAY`, `STANDUP`, `MUSICAL` |
+| `CONFERENCE` | `TECH`, `BUSINESS` |
 
-`TRANSFER` is the one method **we** originate rather than a provider — there's
-no external webhook driving it, so instead of a sibling details object it
-requires both parties (`payerId`, `recipientId`) to be present.
-
-The two card methods carry a PAN (`cardNumber`) — **PII that's masked to its
-last 4 digits at the HTTP boundary** (`internal/adapter/http/card.go`,
-`maskPAN`) before the request ever reaches the outbox, RabbitMQ, or
-Postgres. `cardType` must match the method (`CARTAO_CREDITO` ⇒ `CREDIT`,
-`CARTAO_DEBITO` ⇒ `DEBIT`) and `cardIssuer` must be one of `VISA` /
-`MASTERCARD` / `AMERICAN`; a mismatch is a `400`.
-
-**A `method` outside this table is rejected with `400`** — Phase 3 routes
-each method to its own dedicated RabbitMQ queue (see the diagram above), so
-an unrecognized method has no bound queue and would be silently dropped by
-the broker if accepted. See `ValidateMethod` in
-[`internal/adapter/http/dto.go`](internal/adapter/http/dto.go) and `Methods`
-in [`internal/infrastructure/rabbitmq/rabbitmq.go`](internal/infrastructure/rabbitmq/rabbitmq.go)
-to add a 6th method.
+**A pair outside this table is rejected with `400`** — each pair routes to
+its own dedicated RabbitMQ queue (see the diagram above), so an unrecognized
+pair has no bound queue and would be silently dropped by the broker if
+accepted. See `ValidateEventType` in
+[`internal/adapter/http/order_dto.go`](internal/adapter/http/order_dto.go) and
+`EventTypes` in
+[`internal/infrastructure/rabbitmq/rabbitmq.go`](internal/infrastructure/rabbitmq/rabbitmq.go)
+to add a new pair — registry-only, no other code path needs to change.
 
 ```bash
-make seed-pix       # PIX sample
-make seed-boleto    # BOLETO sample
-make seed-transfer  # TRANSFER sample (payerId -> recipientId)
-make seed-card      # CARTAO_CREDITO sample (cardNumber masked to last-4 by the handler)
+make seed              # CONCERT/ROCK sample
+make seed-order-sports  # SPORTS/FOOTBALL sample
 ```
 
-## Idempotency / dedup key
+## Payment gateway
+
+`internal/domain.PaymentGateway` is the only place this system touches
+payment — `order-consumer-worker` calls `CreateCheckout` to open a
+gateway-hosted checkout for an order, and the gateway's own webhook (verified
+via `VerifyWebhook`, called from ingestion-api's webhook handler) confirms or
+fails it, which `fulfillment-consumer-worker` acts on.
+
+| Provider | Adapter | Status |
+|---|---|---|
+| Stripe | `internal/adapter/paymentgateway/stripe` | Real — Checkout Sessions + signature-verified webhooks |
+| `fake` | `internal/adapter/paymentgateway/fake` | Sandbox — no network calls; the default locally/in tests/k6 |
+| AbacatePay | `internal/adapter/paymentgateway/abacatepay` | Stub — scaffolded, returns `ErrNotImplemented` |
+| LemonSqueezy | `internal/adapter/paymentgateway/lemonsqueezy` | Stub — scaffolded, returns `ErrNotImplemented` |
+
+Selected via `PAYMENT_PROVIDER` (`fake` default). No card data (PAN, CVV)
+ever reaches this system — payment happens on the gateway's own hosted
+checkout page, which is also why there's no PCI-DSS card-data scope anymore
+(see [`SECURITY.md`](SECURITY.md)).
+
+`event_type`/`event_subtype` round-trip through the gateway's own metadata
+(e.g. a Stripe Checkout Session's `metadata`) so `ingestion-api` can route the
+webhook onto the right shard's queue **without ever reading the `events`
+database** — it only ever writes outbox rows, by design.
+
+## Ticket issuance
+
+Once `fulfillment-consumer-worker` sees a `CONFIRMED` payment event, it
+issues every `RESERVED` ticket for the order:
+
+- a random `validationCode`,
+- an HMAC-SHA256 `signature` over `ticketID + ":" + validationCode` (key:
+  `TICKET_SIGNING_SECRET`),
+- a compact `qrContent` token embedding both, rendered as a **PNG**
+  (`internal/adapter/ticketqr`, via `github.com/skip2/go-qrcode`).
+
+Nothing is persisted or shown to the customer until the `Charge` is
+confirmed `PAID` — a `FAILED` payment marks the reservation `VOID` instead.
+
+## Idempotency / dedup keys
+
+Two independent formulas, both `sha256`-derived from the caller's own event
+identity, never a server-generated UUID:
 
 ```
-key = sha256( http_method + sha256(provider.name:eventId) + Idempotency-Key? )
+order key   = sha256( "order:" + sourceOrderId + Idempotency-Key? )
+webhook key = sha256( provider + ":" + rawEventId )
 ```
 
-- The hash is computed from the **provider's own event identity**
-  (`provider.name` + `eventId`) — never from the server-generated Payment
-  UUID, or every request would be unique and dedup would never trigger. A
-  webhook redelivery carries the same `eventId`, making it the natural dedup
-  boundary.
-- **No `Idempotency-Key` header** → redeliveries of the same `eventId`
-  collapse into a single outbox row.
-- **With `Idempotency-Key` header** → the header is folded into the hash, so
-  two genuinely distinct requests carrying different keys are never wrongly
-  merged.
+- **Orders**: a redelivered order carries the same `sourceOrderId`. No
+  `Idempotency-Key` header → redeliveries collapse into a single outbox row.
+  With the header → it's folded into the hash, so two genuinely distinct
+  requests are never wrongly merged.
+- **Payment-gateway webhooks**: the gateway's own event id is the dedup
+  boundary — never `ProviderRef` (one charge can, in principle, emit more
+  than one event over its lifetime).
 
-The same key is the outbox `UNIQUE` constraint and the RabbitMQ `MessageId`. The
-consumer's dedup is independent — as of Phase 4 Track 2, it's a **two-column**
-`UNIQUE(source_message_id, occurred_at)` constraint on each per-method
-hypertable (was a single-column `UNIQUE(source_message_id)` on the old plain
-`payments` table). See [TimescaleDB](#timescaledb-per-method-hypertables)
-below for why the dedup key gained a column and why redelivery safety still
-holds.
-
-A dedup hit on the ingest side is exported as `ingestion.duplicate_total`
-(by `payment.method`) — visible on the ingestion-api dashboard's "Ingest
-duplicate (idempotency dedup) rate" panel — in addition to the `dedup_hit`
-span attribute on `ingest.payment`. The consumer-side equivalent is the
-`outcome="duplicate"` taxonomy covered next.
+Both keys are the outbox `UNIQUE` constraint and the RabbitMQ `MessageId`. A
+dedup hit on the ingest side is exported as `order_ingestion.duplicate_total`/
+`webhook_ingestion.duplicate_total` (by `event_type`/`event_subtype` or
+`provider`), in addition to the `dedup_hit` span attribute.
 
 ### Consumer outcome taxonomy
 
-A duplicate delivery hitting that `UNIQUE` constraint is **not an error** —
-`PaymentRepository.Save` ([`payment_repo.go`](internal/adapter/persistence/payment_repo.go))
-reports it via a `created bool` return (mirroring how `OutboxRepository.Enqueue`
-already tells `IngestPayment` an `"accepted"` apart from a `"duplicate"`), so
-`ProcessMessage.Execute` ([`process.go`](internal/usecase/consume/process.go))
-and `AMQPConsumer.handle` ([`consumer.go`](internal/adapter/messaging/consumer.go))
-can tell it apart from both a fresh save and a genuine processing error,
-instead of lumping all three under one generic `ack`/error split. Every code
-path tags the **same `outcome` attribute name** — on the span, on the
-`consumer.messages_processed_total` metric, and (for the non-`ack`/`saved`
-cases) on a structured `slog` field — so all three OTel signals (traces,
-metrics, logs) agree on one vocabulary you can filter/group by in Jaeger,
-Grafana, or Loki alike:
+A duplicate delivery hitting a `UNIQUE` constraint is **not an error** —
+`OrderRepository.Save`/`ChargeRepository`'s terminal-status check report it
+via a `created`/no-op return (mirroring how `OutboxRepository.Enqueue`
+already tells the ingestion use-cases an `"accepted"` apart from a
+`"duplicate"`), so `ProcessOrder`/`IssueTickets` and `AMQPConsumer.handle`
+can tell it apart from both a fresh save and a genuine processing error.
+Every code path tags the **same `outcome` attribute name** — on the span, on
+the `consumer.messages_processed_total` metric, and (for the non-`ack`/
+`saved` cases) on a structured `slog` field — so all three OTel signals
+agree on one vocabulary you can filter/group by in Grafana/Loki alike:
 
 | `outcome` | Meaning | Retried? | Reaches DLQ? |
 |---|---|---|---|
-| `saved` / `ack` | Fresh row persisted | — | — |
-| `duplicate` | `(source_message_id, occurred_at)` already existed — a safe redelivery no-op | No — Ack'd immediately | No |
-| `retry_scheduled` | Transient processing error, requeued via the per-method `*.retry` queue with backoff | Yes, up to `MAX_DELIVERIES` | Eventually, if retries exhaust |
+| `saved` / `ack` | Fresh row(s) persisted | — | — |
+| `duplicate` | Already processed — a safe redelivery no-op | No — Ack'd immediately | No |
+| `retry_scheduled` | Transient processing error, requeued via the shard's `*.retry` queue with backoff | Yes, up to `MAX_DELIVERIES` | Eventually, if retries exhaust |
 | `poison_dlq` | `MAX_DELIVERIES` exhausted | No — terminal | Yes |
 | `unknown_schema_version` | `schemaVersion` newer/unrecognized — structurally can never succeed | No — DLQ'd on the **first** attempt | Yes |
 
 `duplicate` and `unknown_schema_version` never loop: both are decided by a
-condition that's independent of delivery count (a `DO NOTHING` conflict, or a
-version string that will never change on redelivery), so neither one ever
-enters the retry machinery in the first place — a duplicate is structurally
-incapable of reaching the DLQ.
+condition that's independent of delivery count, so neither one ever enters
+the retry machinery in the first place.
 
 ---
 
 ## Message ordering
 
 **This system does not preserve message order, and deliberately doesn't need
-to.** Payments here are **absolute-state records** keyed by
-`(source_message_id, occurred_at)` — each message carries the full payment,
-not a delta like `balance += amount`, so persisting them in any order lands
-the same rows. That's *why* it's safe to scale consumers horizontally (KEDA
-runs 0–N `consumer-<method>` pods on one queue — the competing-consumers
-pattern, which has no ordering guarantee) and why the consumer processes one
-delivery at a time per pod rather than reordering its own input.
+to.** Orders and tickets here are **absolute-state records** keyed by their
+own source identity (`source_order_id`, `source_ticket_id`), not a delta
+like `balance += amount`, so persisting them in any order lands the same
+rows. That's *why* it's safe to scale consumers horizontally (KEDA runs
+0–N pods per shard queue — the competing-consumers pattern, which has no
+ordering guarantee) and why each consumer processes one delivery at a time
+per pod rather than reordering its own input.
 
 The transactional-outbox pattern itself only guarantees **at-least-once
 delivery to the broker** with producer-side atomicity; it never promised
 ordered or exactly-once *consumption*. Consumer correctness rests on the
-idempotent-consumer dedup above (the `(source_message_id, occurred_at)`
-`UNIQUE` constraint), which is order-independent. Reordering across pods/
-retries is therefore a non-issue for this domain.
+idempotent-consumer dedup above, which is order-independent.
 
 ### If a future requirement *does* need ordering
 
-Say a payment lifecycle is introduced (`AUTHORIZED → CAPTURED → REFUNDED`)
-where applying events out of order corrupts state. The goal is then
-**per-entity ordering** (all events for one payment/payer in sequence) while
+Say a ticket lifecycle needs strict ordering (e.g. `RESERVED → PAID →
+CHECKED_IN` applied out of order corrupts state). The goal is then
+**per-entity ordering** (all events for one order/ticket in sequence) while
 still processing *different* entities in parallel — never global ordering,
 which would mean single-threading everything and forfeiting throughput.
 
 The RabbitMQ-native way to get that, without migrating to Kafka:
 
 1. **Consistent-hash exchange** (the `rabbitmq-consistent-hash-exchange`
-   plugin) keyed on the ordering identity (e.g. `payerId` or `paymentId`)
-   instead of the current topic exchange. The hash routes **all of one
-   entity's messages to the same queue**, while different entities spread
-   across queues — so order is preserved per entity but parallelism is kept
-   across entities.
+   plugin) keyed on the ordering identity (e.g. `orderId`) instead of the
+   current topic exchange. The hash routes **all of one entity's messages to
+   the same queue**, while different entities spread across queues — so
+   order is preserved per entity but parallelism is kept across entities.
 2. **Exactly one consumer per queue** — either run a single replica per
-   method queue, or declare the queue with `x-single-active-consumer: true`
-   so only one consumer is ever active (the rest stand by for failover).
-   This keeps each queue's single-threaded, in-order processing (which
+   shard queue, or declare the queue with `x-single-active-consumer: true` so
+   only one consumer is ever active (the rest stand by for failover). This
+   keeps each queue's single-threaded, in-order processing (which
    `AMQPConsumer.Run` already does per pod) as the *only* consumer of that
    queue, so the broker can't hand message 2 to a second consumer before
    message 1 is done.
@@ -460,54 +496,8 @@ claimed by one dispatcher.
 
 A lighter-weight alternative that keeps full parallelism is to make ordering
 **idempotent at the data layer** instead of the transport: guard writes with
-`... WHERE occurred_at < :incoming` (or a monotonic `version`), so a stale
-event physically can't overwrite a newer one and out-of-order delivery
-self-corrects. For absolute-state payments this is already effectively the
-case, which is the deeper reason ordering isn't wired up today.
-
----
-
-## TimescaleDB: per-method hypertables
-
-`payments` is now **five TimescaleDB hypertables** — `payments_pix`,
-`payments_boleto`, `payments_transfer`, `payments_cartao_credito`,
-`payments_cartao_debito` — each chunked at a **1-day interval** on
-`occurred_at`, plus a `payments` **`VIEW` = `UNION ALL`** of all five so
-ad-hoc "all payments" queries (and the Grafana infra dashboard's SQL) keep
-working against one name. Writes always target the concrete per-method
-table ([`internal/adapter/persistence/payment_repo.go`](internal/adapter/persistence/payment_repo.go));
-the migration itself is raw, idempotent SQL run at `ingestion-api` startup
-([`MigrateTimescale`](internal/adapter/persistence/migrate.go)) — GORM's
-`AutoMigrate` can't create extensions, hypertables, or partition-aware
-indexes.
-
-**Why `occurred_at`, not `created_at`, is the partition column — the
-load-bearing decision here:** TimescaleDB requires every `UNIQUE` index on a
-hypertable to include the partitioning column. Partitioning by `created_at`
-(insert time) would force the dedup key to be
-`(source_message_id, created_at)` — but a RabbitMQ redelivery of the same
-message gets a *new* `created_at` on each insert attempt, so that tuple would
-differ between the original and the redelivery, `ON CONFLICT DO NOTHING`
-would never fire, and the consumer would silently double-insert. `occurred_at`
-comes from the wire payload and is identical across redeliveries, so
-`(source_message_id, occurred_at)` is stable and dedup still holds — verified
-by [`TestTimescale_RedeliveryDedupsOnSourceMessageIDAndOccurredAt`](tests/integration/timescale_test.go).
-
-Per-method tables over a single multi-dimensional hypertable: TimescaleDB's
-hash-space partitioning doesn't map cleanly to 5 named methods, and a
-hypertable can't be a partition of a native `LIST`-partitioned parent — see
-`.claude/plan-phase4.md` Track 2 for the full comparison.
-
-```sql
-\d+ payments_pix              -- confirms it's a hypertable, 1-day chunks
-SELECT * FROM payments;       -- the UNION ALL view, reads across all 5
-SELECT show_chunks('payments_pix');
-```
-
-**Cloud:** RDS's TimescaleDB extension support is the one open question
-captured in `.claude/plan-phase4.md` — if the target RDS engine version
-doesn't offer it, the fallback is self-managed TimescaleDB on EKS or
-Timescale Cloud. Local dev is unaffected either way.
+a monotonic status/version check, so a stale event physically can't overwrite
+a newer one and out-of-order delivery self-corrects.
 
 ---
 
@@ -515,22 +505,23 @@ Timescale Cloud. Local dev is unaffected either way.
 
 ```
 TransactionOutboxGo/
-├── .claude/plan.md            # full implementation plan
+├── .claude/plan-phase7-tickets-pivot.md   # the current architecture (Event Ticket System pivot)
 ├── CLAUDE.md                  # guidance for Claude Code in this repo
 ├── cmd/
-│   ├── ingestion-api/         # HTTP write path → outbox DB (composition root)
-│   ├── outbox-worker/         # DispatchOutbox relay → RabbitMQ, KEDA-scaled (composition root)
-│   ├── consumer-worker/       # RabbitMQ consumer → payments DB (composition root)
-│   └── outbox-admin/          # one-shot maintenance CLI: replay-dead / drain-dlq / purge-loadtest-dlq
+│   ├── ingestion-api/               # HTTP write path → both outbox tables (composition root)
+│   ├── outbox-worker/               # two DispatchOutbox loops → RabbitMQ, KEDA-scaled (composition root)
+│   ├── order-consumer-worker/       # order_outbox consumer → events DB (composition root)
+│   ├── fulfillment-consumer-worker/ # payment_event_outbox consumer → events DB (composition root)
+│   └── outbox-admin/                # one-shot maintenance CLI: replay-dead / drain-dlq / purge-loadtest-dlq
 ├── internal/
-│   ├── domain/                # entities (OutboxMessage, Payment) + ports + SchemaVersion/ParseOptionalUUID/Backoff (no framework imports)
+│   ├── domain/                # entities (Order, Ticket, Charge, Event, Location, OutboxMessage) + ports (no framework imports)
 │   ├── observability/         # tiny OTel metric-instrument helpers shared by usecase + adapter (no framework imports beyond the otel API)
-│   ├── usecase/                # ingest (IngestPayment) / outbox (DispatchOutbox) / consume (ProcessMessage)
-│   ├── adapter/                # http · persistence · messaging
-│   └── infrastructure/         # config · database · rabbitmq · telemetry · logging
+│   ├── usecase/                # order (PlaceOrder) / webhook (ReceivePaymentEvent) / outbox (DispatchOutbox) / checkout (ProcessOrder) / fulfillment (IssueTickets)
+│   ├── adapter/                # http · persistence · messaging · paymentgateway · ticketqr
+│   └── infrastructure/         # config · database · rabbitmq (EventTypes registry) · telemetry · logging
 ├── migrations/
 │   ├── outbox/                 # golang-migrate set for the `outbox` database
-│   └── payments/               # golang-migrate set for the `payments` database
+│   └── events/                 # golang-migrate set for the `events` database
 ├── tests/integration/          # TestContainers suite (Postgres + RabbitMQ) — see Testing below
 ├── docker-compose.yml
 ├── Dockerfile
@@ -541,25 +532,25 @@ TransactionOutboxGo/
 
 ## Environment variables
 
-All three service binaries read config via [`internal/infrastructure/config`](internal/infrastructure/config/config.go)
+All four service binaries read config via [`internal/infrastructure/config`](internal/infrastructure/config/config.go)
 (`envconfig`). `DATABASE_URL` and `RABBITMQ_URL` are the only two marked
 `required` — everything else has a default. (ingestion-api still requires
 `RABBITMQ_URL` to be set because the `Config` struct is shared, but it never
 opens a connection.) Each service points `DATABASE_URL` at its own logical
-database: `outbox` for ingestion-api/outbox-worker, `payments` for
-consumer-worker. See [`.env.example`](.env.example) for local-dev values and
+database: `outbox` for ingestion-api/outbox-worker, `events` for the two
+consumer workers. See [`.env.example`](.env.example) for local-dev values and
 [`docker-compose.yml`](docker-compose.yml) for how each service's env block is
 wired.
 
-### Shared (all three services)
+### Shared (all four services)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DATABASE_URL` | *(required)* | Postgres DSN — `outbox` DB for ingestion-api/outbox-worker, `payments` DB for consumer-worker |
+| `DATABASE_URL` | *(required)* | Postgres DSN — `outbox` DB for ingestion-api/outbox-worker, `events` DB for the consumer workers |
 | `RABBITMQ_URL` | *(required)* | AMQP connection string (unused by ingestion-api) |
-| `OTEL_SERVICE_NAME` | `transaction-outbox-go` | OTel resource service name — each service/per-method consumer overrides this to its own name (e.g. `consumer-worker-pix`) |
+| `OTEL_SERVICE_NAME` | `transaction-outbox-go` | OTel resource service name — each service/shard overrides this to its own name (e.g. `order-consumer-worker-concert-rock`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `localhost:4318` | OTLP/HTTP collector endpoint (Tempo in local dev) |
-| `METRICS_PORT` | `9090` | Prometheus `/metrics` port — outbox-worker uses `9098`; each per-method consumer-worker overrides this to its own fixed port (9091–9095, see `docker-compose.yml`) |
+| `METRICS_PORT` | `9090` | Prometheus `/metrics` port — outbox-worker uses `9098`; each shard's consumer worker overrides this to its own fixed port (see `docker-compose.yml`) |
 
 ### `ingestion-api` only
 
@@ -571,24 +562,28 @@ wired.
 | `RATE_LIMIT_RATE` | `50`                                         | Leak rate, requests/second per client IP |
 | `RATE_LIMIT_BURST` | `100`                                        | Bucket capacity (requests admitted immediately before throttling kicks in) |
 | `TRUSTED_PROXIES` | *(empty)*                                    | Comma-separated CIDRs Gin trusts for `X-Forwarded-For` when resolving `c.ClientIP()`. Empty locally (no proxy in front, uses `RemoteAddr` directly); set to the VPC/private-subnet CIDRs in cloud, where the ALB sits in front and injects XFF |
+| `PAYMENT_PROVIDER` | `fake` | `PaymentGateway` adapter to build (`fake`/`stripe`/`abacatepay`/`lemonsqueezy`) — also read by `order-consumer-worker` |
+| `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` | *(empty)* | Only meaningful when `PAYMENT_PROVIDER=stripe` |
 
 ### `outbox-worker` only
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OUTBOX_DISPATCH_INTERVAL_MS` | `250` | Poll interval for the dispatch loop (the LISTEN/NOTIFY fast path wakes it sooner on enqueue) |
+| `OUTBOX_DISPATCH_INTERVAL_MS` | `250` | Poll interval for both dispatch loops (the LISTEN/NOTIFY fast path wakes the order one sooner on enqueue) |
 | `OUTBOX_DISPATCH_BATCH_SIZE` | `50` | Rows fetched per dispatch poll |
 | `OUTBOX_MAX_RETRIES` | `5` | Publish attempts before an outbox row is marked `DEAD_LETTER` |
 | `OUTBOX_PRUNE_AFTER_HOURS` | `48` | Hours after which a `PUBLISHED` row is eligible for pruning |
-| `RETRY_BACKOFF_BASE` / `RETRY_BACKOFF_CAP` | `1s` / `5m` | Exponential-backoff bounds for `next_retry_at` scheduling (shared with consumer-worker's retry-queue TTL) |
+| `RETRY_BACKOFF_BASE` / `RETRY_BACKOFF_CAP` | `1s` / `5m` | Exponential-backoff bounds for `next_retry_at` scheduling (shared with the consumer workers' retry-queue TTL) |
 
-### `consumer-worker` only
+### `order-consumer-worker` / `fulfillment-consumer-worker` only
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PAYMENT_QUEUE` | *(required — no default)* | The single RabbitMQ queue this instance binds to and drains, e.g. `payments.pix.queue`. Must be one of `rmq.Methods`' queue names ([`internal/infrastructure/rabbitmq`](internal/infrastructure/rabbitmq/rabbitmq.go)) — every other env var here is shared with `ingestion-api`'s `Config` struct, but this one is consumer-worker-only and the binary fails fast at startup if it's empty or unrecognized (no implicit "consume everything" mode) |
+| `CONSUMER_QUEUE` | *(required — no default)* | The single RabbitMQ queue this instance binds to and drains, e.g. `events.concert.rock.queue` (order) or `payments.concert.rock.queue` (fulfillment). Must resolve via `rmq.ParseQueueName` — the binary fails fast at startup if it's empty, unrecognized, or on the wrong stream for that binary |
 | `PREFETCH_COUNT` | `10` | AMQP consumer prefetch count |
-| `MAX_DELIVERIES` | `5` | Redelivery attempts before a message is routed to its method's DLQ |
+| `MAX_DELIVERIES` | `5` | Redelivery attempts before a message is routed to its shard's DLQ |
+| `CHECKOUT_SUCCESS_URL` | `http://localhost:8080/orders/success` | `order-consumer-worker` only — where the gateway redirects the customer after a successful checkout |
+| `TICKET_SIGNING_SECRET` | `dev-ticket-signing-secret` | `fulfillment-consumer-worker` only — HMAC key for ticket validation signatures |
 
 ---
 
@@ -604,11 +599,12 @@ make test     # go test -race ./...
 make tidy     # go mod tidy
 make lint     # golangci-lint run ./...
 
-# Podman Compose — starts Postgres + RabbitMQ + both services
+# Podman Compose — starts Postgres + RabbitMQ + all four app services
+# (two shards run by default: CONCERT/ROCK, SPORTS/FOOTBALL)
 make up       # podman compose -f docker-compose.yml up --build -d
 make logs     # tail logs from all services
 make down     # podman compose -f docker-compose.yml down -v
-make seed     # curl a sample POST to the ingestion-api
+make seed     # curl a sample order POST to the ingestion-api
 ```
 
 ### Endpoints once `make up` is healthy
@@ -623,27 +619,32 @@ make seed     # curl a sample POST to the ingestion-api
 ### Send a request
 
 ```bash
-curl -i -X POST http://localhost:8080/api/v1/payments \
+curl -i -X POST http://localhost:8080/api/v1/orders \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: order-123" \
-  -d '{"eventId":"evt_123456","provider":{"name":"MERCADO_PAGO","providerPaymentId":"987654321"},"payment":{"paymentId":"pay_123","amount":100.50,"currency":"BRL","method":"PIX"},"pix":{"endToEndId":"E123456789ABCDEF","txid":"ORDER123"},"occurredAt":"2026-06-19T18:30:00Z"}'
+  -d '{"sourceOrderId":"order-123","eventType":"CONCERT","eventSubtype":"ROCK","eventId":"evt_rock_in_rio","eventName":"Rock in Rio","venue":{"id":"venue-1","name":"Estadio Nacional","city":"Sao Paulo"},"tickets":[{"id":"TKT-1","section":"A","row":"10","seat":"5","price":150.00,"currency":"BRL"}],"customer":{"name":"Jane Doe","email":"jane@example.com","document":"12345678900"}}'
 ```
 
-Expect `201 Created` with a `paymentId`, `idempotencyKey`, and `status: "accepted"`.
+Expect `201 Created` with an `orderId`, `idempotencyKey`, and `status: "accepted"`.
 
 ### Verifying it works
 
 - **Persistence:** the outbox row moves `NEW → PUBLISHED`, flows through that
-  method's own queue (e.g. `payments.pix.queue`, visible in the RabbitMQ UI),
-  and lands as one row in `payments`.
-- **Idempotency:** repeat the same `curl` → outbox response comes back
-  `status: "duplicate"`; still a single `payments` row.
+  shard's own queue (e.g. `events.concert.rock.queue`, visible in the
+  RabbitMQ UI), and lands as `Order`/`Ticket`(`RESERVED`)/`Charge`(`PENDING`)
+  rows in the `events` database.
+- **Idempotency:** repeat the same `curl` → response comes back
+  `status: "duplicate"`; still a single set of rows.
 - **Loss resistance:** `podman compose -f docker-compose.yml stop rabbitmq`,
   send a request (still `201`, outbox row stays `NEW`), then restart RabbitMQ →
-  `DispatchOutbox` drains the backlog and the consumer persists it.
-- **Per-method isolation:** `make seed-card` then check the RabbitMQ UI —
-  the message lands only in `payments.cartao_credito.queue`; every other
-  method's queue stays at 0.
+  `DispatchOutbox` drains the backlog and `order-consumer-worker` processes it.
+- **Fulfillment:** confirm the fake gateway's checkout by POSTing to
+  `/api/v1/webhooks/payments/fake` with the `Charge`'s `provider_ref` (see
+  `make seed-webhook-confirm` and its comment for the exact command) — the
+  ticket moves `RESERVED → VALID` with a non-empty `qr_png`.
+- **Per-shard isolation:** `make seed-order-sports` then check the RabbitMQ
+  UI — the message lands only in `events.sports.football.queue`; the
+  CONCERT/ROCK queue stays untouched.
 
 ---
 
@@ -654,7 +655,7 @@ Two suites, deliberately split by what they need to run:
 | Suite | Command | Needs | What it covers |
 |---|---|---|---|
 | Unit | `make test-unit` | nothing — pure Go | `usecase`/`adapter`/`domain` logic against hand-written fakes/mocks of the `domain` ports (`OutboxRepository`, `Publisher`, `UnitOfWork`, ...) |
-| Integration | `make test-integration` | Podman socket reachable from inside the test container (TestContainers) | The same code wired to **real** Postgres 17/TimescaleDB and RabbitMQ 4.3 containers — migrations, GORM repos, the AMQP publisher/consumer, `LISTEN`/`NOTIFY`, retry backoff, DLQ replay |
+| Integration | `make test-integration` | Podman socket reachable from inside the test container (TestContainers) | The same code wired to **real** Postgres 18 and RabbitMQ 4.3 containers — migrations, GORM repos, the AMQP publisher/consumer, `LISTEN`/`NOTIFY`, retry backoff, DLQ replay, the full order → checkout → webhook → fulfillment pipeline |
 
 Both are plain `go test`, gated behind the `integration` build tag for the
 second suite (`tests/integration/*_test.go` all start with
@@ -666,23 +667,26 @@ them.
 [`tests/integration/suite_test.go`](tests/integration/suite_test.go) spins up
 **one Postgres + one RabbitMQ container pair for the whole package**
 (`TestMain`), applies the real `migrations/` directory via `golang-migrate`
-(no `AutoMigrate`), and wires the actual `IngestPayment` / `DispatchOutbox` /
-`ProcessMessage` use-cases against them — `truncateAll` resets tables and
-purges every queue between tests instead of restarting containers, so the
-suite stays fast. It needs the Podman socket mounted into the test
-container (`make test-integration` does this for you — see the Makefile
-comment on why Ryuk is disabled for Podman) and runs in CI only when
-explicitly requested (`workflow_dispatch` or a `ci:integration` PR label —
-see [CI/CD](#cicd) below), since it's a safety net, not a release gate.
+(no `AutoMigrate`), and wires the actual `PlaceOrder` / `ReceivePaymentEvent`
+/ `DispatchOutbox` / `ProcessOrder` / `IssueTickets` use-cases against them —
+`truncateAll` resets tables and purges every registered shard's queues
+between tests instead of restarting containers, so the suite stays fast. It
+needs the Podman socket mounted into the test container (`make
+test-integration` does this for you) and runs in CI only when explicitly
+requested (`workflow_dispatch` or a `ci:integration` PR label — see
+[CI/CD](#cicd) below), since it's a safety net, not a release gate.
 
 It exercises things a pure-mock unit test structurally can't: the
 `FOR UPDATE SKIP LOCKED` dispatch query against concurrent dispatchers, the
-`payments.source_message_id` `UNIQUE` constraint actually rejecting a
-redelivered message, a poison message really landing in its method's DLQ
-after `MAX_DELIVERIES`, `ReplayDeadLetters` resetting real rows, the
+`orders.source_order_id` `UNIQUE` constraint actually rejecting a redelivered
+order, a poison message really landing in its shard's DLQ after
+`MAX_DELIVERIES`, `ReplayDeadLetters` resetting real rows, the
 `LISTEN`/`NOTIFY` wakeup path (`internal/infrastructure/database.Listener`),
-and the TimescaleDB per-method hypertable dedup key from
-[TimescaleDB](#timescaledb-per-method-hypertables) above.
+a second shard routing to its own queue (not the first shard's), and a full
+end-to-end run — HTTP order placement → relay → `order-consumer-worker`
+reserves tickets + opens a fake checkout → HTTP webhook confirms → relay →
+`fulfillment-consumer-worker` issues tickets with a signature independently
+re-verified via `ticketqr.Verify`.
 
 ### Coverage
 
@@ -693,33 +697,43 @@ make coverage-all   # runs test-unit + test-integration, merges the two
                      # merged-coverage.html
 ```
 
-A unit-only number understates real coverage here on purpose: `adapter/persistence`,
-`infrastructure/database`, and `infrastructure/rabbitmq` are thin wrappers
-over GORM/pgx/amqp091 that are exercised against the **real** dependency in
-the integration suite rather than mocked in a unit test, so `make coverage-all`
-— not `make test-unit` alone — is the number that reflects this project's
-actual line coverage. Merged, `internal/` is at **~84%**, comfortably past
-the project's 80% target for `usecase`/`adapter`; the remaining gaps are
-intentionally-thin infrastructure wiring (`cmd/*/main.go`'s composition
-roots aren't covered by either suite — they're DI glue, asserted indirectly
-by every other test exercising the objects they wire together) and the OTLP
-trace-exporter path in `internal/infrastructure/telemetry` (network-bound,
-not worth a live collector dependency just for this).
+Measured 2026-07-07 against real Postgres 18 + RabbitMQ 4.3 testcontainers
+(`go test -tags=integration -race`, all tests passing, weighted by
+statement count, not a naive average of per-function percentages):
+
+| Package | Coverage |
+|---|---|
+| `usecase/checkout` | 84.1% |
+| `adapter/persistence` | 80.0% |
+| `usecase/fulfillment` | 67.2% |
+| `usecase/outbox` | 67.2% |
+| `adapter/messaging` | 66.0% |
+
+A unit-only number understates real coverage here on purpose:
+`adapter/persistence`, `infrastructure/database`, and `infrastructure/rabbitmq`
+are thin wrappers over GORM/pgx/amqp091 that are exercised against the
+**real** dependency in the integration suite rather than mocked in a unit
+test, so `make coverage-all` — not `make test-unit` alone — is the number
+that reflects this project's actual line coverage.
 
 ---
 
 ## CI/CD
 
-Two independent GitHub Actions workflows, one per microservice —
-[`ingestion-api.yml`](.github/workflows/ingestion-api.yml) and
-[`consumer-worker.yml`](.github/workflows/consumer-worker.yml) — so a change
-scoped to one service never triggers or gates the other. Both follow:
+Four independent GitHub Actions workflows, one per microservice —
+[`ingestion-api.yml`](.github/workflows/ingestion-api.yml),
+[`outbox-worker.yml`](.github/workflows/outbox-worker.yml),
+[`order-consumer-worker.yml`](.github/workflows/order-consumer-worker.yml),
+and [`fulfillment-consumer-worker.yml`](.github/workflows/fulfillment-consumer-worker.yml)
+— so a change scoped to one service never triggers or gates the others. All follow:
 **Build → lint (golangci-lint + actionlint + helm lint) → Unit Tests → Upload
 (ECR, OIDC-authenticated)**, with an optional flag-gated Integration Tests
 (TestContainers) job that's a safety measure only — it never blocks Upload.
-There is no automated deploy job. See
+There is no automated deploy job. A Go vulnerability-scanning gate
+(`govulncheck`) is planned but not yet added — see
+`.claude/plan-phase7-tickets-pivot.md`'s Part F. See
 [`.github/workflows/README.md`](.github/workflows/README.md) for the full
-gate breakdown and why two files instead of one matrixed workflow.
+gate breakdown and why four files instead of one matrixed workflow.
 
 ## Deploying
 
@@ -746,10 +760,13 @@ layers of per-IP throttling — defense in depth, not redundancy:
    an in-process, per-pod meter keyed on `c.ClientIP()`. Each client IP leaks
    at `RATE_LIMIT_RATE` req/s with a burst capacity of `RATE_LIMIT_BURST`;
    once exhausted, requests get `429 Too Many Requests` with a `Retry-After`
-   header. `/healthz`, `/metrics`, and `/swagger` are exempt — only
-   `/api/v1/payments` is limited. This is the **only** layer present locally
-   (no ALB/WAF in `docker-compose.yml`), and is **off by default** there (see
-   the env var table above) so k6/seed scripts don't throttle themselves.
+   header. `/healthz`, `/metrics`, `/swagger`, and the payment-gateway webhook
+   route are exempt — only `/api/v1/orders` is limited (a gateway calls back
+   from its own infrastructure, not a single abusive client IP, so throttling
+   it would just drop legitimate payment confirmations). This is the
+   **only** layer present locally (no ALB/WAF in `docker-compose.yml`), and
+   is **off by default** there (see the env var table above) so k6/seed
+   scripts don't throttle themselves.
    - **Caveat:** with `ingestionApi.hpa` scaling `1→10` replicas and no shared
      store, the effective global limit per IP is `N × RATE_LIMIT_RATE` across
      N pods — each meters independently. A Redis-backed shared bucket would
@@ -778,7 +795,7 @@ ignored.
 brings up **Prometheus** (scraping every service's existing OTel
 `/metrics` endpoint plus RabbitMQ's built-in `rabbitmq_prometheus` plugin and
 a `postgres_exporter` sidecar) and **Grafana** at `http://localhost:3000`
-(`admin`/`admin` by default — see `GRAFANA_ADMIN_USER`/`PASSWORD`), with three
+(`admin`/`admin` by default — see `GRAFANA_ADMIN_USER`/`PASSWORD`), with
 dashboards auto-provisioned from committed JSON
 ([`observability/grafana/dashboards/`](observability/grafana/dashboards/)) —
 the same files serve local Grafana and cloud Grafana, so they never drift:
@@ -786,13 +803,13 @@ the same files serve local Grafana and cloud Grafana, so they never drift:
 - **ingestion-api** — request rate, P50/P95/P99 latency, 2xx/4xx/5xx
   breakdown, rate-limiter rejections, outbox publish rate/backlog, Go runtime
   metrics.
-- **consumer-worker** — per-method throughput/outcome (`ack`/`duplicate`/
-  `retry_scheduled`/`poison_dlq`/`unknown_schema_version` — see
-  [Consumer outcome taxonomy](#consumer-outcome-taxonomy) below), retry
-  depth, queue backlog, a `$method` template variable to isolate one payment
-  method.
+- **order/fulfillment-consumer-worker** — per-shard throughput/outcome
+  (`ack`/`duplicate`/`retry_scheduled`/`poison_dlq`/`unknown_schema_version` —
+  see [Consumer outcome taxonomy](#consumer-outcome-taxonomy) above), retry
+  depth, queue backlog, an `$event_type`/`$event_subtype` template variable
+  pair to isolate one shard.
 - **infra** — RabbitMQ per-queue depth (queues *and* DLQs, so a poison spike
-  on one method is visible without touching the others), Postgres connections/
+  on one shard is visible without touching the others), Postgres connections/
   TPS/cache-hit-ratio/deadlocks.
 
 In cloud, Grafana is internal-only (no public Ingress) — reach it via
@@ -800,11 +817,11 @@ In cloud, Grafana is internal-only (no public Ingress) — reach it via
 
 ## Canary deploys
 
-Both services roll out progressively via **Argo Rollouts**
+All services roll out progressively via **Argo Rollouts**
 (`helmcharts/transaction-outbox`'s `canary.enabled` — `true` once Argo
 Rollouts is installed cluster-wide, `false` locally where the controller
-isn't installed, falling back to a plain `Deployment`+HPA). The two services use different step
-shapes — see `.claude/plan-phase4.md` Track 4 for the full rationale:
+isn't installed, falling back to a plain `Deployment`+HPA). `ingestion-api`
+and the two consumer workers use different step shapes:
 
 - **ingestion-api:** lands at **0%** → a human promotes → **5%** → a human
   promotes → from there it advances **automatically every 20 minutes**
@@ -816,11 +833,12 @@ shapes — see `.claude/plan-phase4.md` Track 4 for the full rationale:
     the header `canary: true` is always routed to the canary pods,
     independent of the current weight — a second, static ALB listener rule
     (`ingress-canary-header.yaml`) that Argo Rollouts doesn't manage.
-- **consumer-worker:** lands at **0%** → a human promotes → **5%** → after
-  **1 hour** with no manual action, it jumps straight to **100%** (no 20/50
-  steps — a queue consumer's blast radius is already bounded by the 1-hour
-  soak). It has no Service, so "weight" here means the canary/stable **pod
-  proportion**, i.e. the fraction of messages the new version processes.
+- **order-consumer-worker / fulfillment-consumer-worker:** land at **0%** →
+  a human promotes → **5%** → after **1 hour** with no manual action, jumps
+  straight to **100%** (no 20/50 steps — a queue consumer's blast radius is
+  already bounded by the 1-hour soak). Neither has a Service, so "weight"
+  here means the canary/stable **pod proportion**, i.e. the fraction of
+  messages the new version processes.
 
 Promote/abort via the `kubectl-argo-rollouts` plugin:
 

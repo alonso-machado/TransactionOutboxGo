@@ -14,14 +14,17 @@ import (
 
 	handler "github.com/alonsomachado/transaction-outbox-go/internal/adapter/http"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/messaging"
+	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/paymentgateway/fake"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/persistence"
+	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/ticketqr"
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/database"
 	rmq "github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/rabbitmq"
-	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/consume"
-	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ingest"
-	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/outbox"
-	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ticket"
+	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/checkout"
+	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/fulfillment"
+	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/order"
+	outboxuc "github.com/alonsomachado/transaction-outbox-go/internal/usecase/outbox"
+	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/webhook"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
@@ -32,30 +35,48 @@ import (
 	"gorm.io/gorm"
 )
 
+// testEventType/testEventSubtype is the single shard most tests in this
+// package exercise (CONCERT/ROCK — the same shard docker-compose.yml runs
+// locally by default); routing_test.go exercises a second shard
+// (SPORTS/FOOTBALL) to prove the routing itself, not just one queue.
+const (
+	testEventType    = "CONCERT"
+	testEventSubtype = "ROCK"
+
+	// ticketSigningSecret is the HMAC key every fulfillment-side test signs
+	// and verifies tickets with.
+	ticketSigningSecret = "integration-test-ticket-signing-secret"
+	// testProvider is the PaymentGateway provider name every test's
+	// WebhookHandler/gateway is configured with — the fake sandbox adapter,
+	// no network calls.
+	testProvider = "fake"
+)
+
 // suite holds everything shared across the integration test package: one
-// Postgres 17 + RabbitMQ 4.3 container pair, started once in TestMain, plus
-// the wired GORM DB and AMQP connection used by every test file in this
+// Postgres + RabbitMQ 4.3 container pair, started once in TestMain, plus the
+// wired GORM DBs and AMQP connection used by every test file in this
 // package. Tables are truncated between tests, not containers restarted.
-// Two-DB split: the outbox use-cases (ingest/dispatch) talk to the `outbox`
-// database (db / pgURI); the consumer writes the `payments` database
-// (paymentsDB / paymentsURI). Both live in the SAME testcontainer Postgres —
-// the split is logical, exactly as in production (one instance, two
-// databases), so no second container is needed.
+// Two-DB split: the ingestion/relay use-cases (order/webhook/outbox) talk to
+// the `outbox` database (db / pgURI); order-consumer-worker and
+// fulfillment-consumer-worker write the `events` database (eventsDB /
+// eventsURI). Both live in the SAME testcontainer Postgres — the split is
+// logical, exactly as in production (one instance, two databases), so no
+// second container is needed.
 var suite struct {
-	db          *gorm.DB
-	paymentsDB  *gorm.DB
-	amqpConn    *amqp.Connection
-	pgURI       string
-	paymentsURI string
-	amqpURI     string
-	pgC         *tcpostgres.PostgresContainer
-	rmqC        *tcrabbitmq.RabbitMQContainer
+	db        *gorm.DB
+	eventsDB  *gorm.DB
+	amqpConn  *amqp.Connection
+	pgURI     string
+	eventsURI string
+	amqpURI   string
+	pgC       *tcpostgres.PostgresContainer
+	rmqC      *tcrabbitmq.RabbitMQContainer
 }
 
 // migrationsDir resolves the repo's migrations/<set> directory relative to
 // this source file (not the test binary's working directory), so the suite
 // finds it regardless of where `go test` is invoked from. set is "outbox" or
-// "payments" — the two per-database migration sets.
+// "events" — the two per-database migration sets.
 func migrationsDir(set string) (string, error) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -66,9 +87,9 @@ func migrationsDir(set string) (string, error) {
 
 // applyMigrations runs every up migration in migrations/<set> against dsn via
 // golang-migrate's Go library — the in-process equivalent of `make migrate`
-// /the compose migrate-outbox/migrate-payments services, used here so the
-// ephemeral testcontainer databases end up with exactly the schema production
-// gets, with no AutoMigrate anywhere in the suite.
+// /the compose migrate-outbox/migrate-events services, used here so the
+// ephemeral testcontainer databases end up with exactly the schema
+// production gets, with no AutoMigrate anywhere in the suite.
 func applyMigrations(dsn, set string) error {
 	dir, err := migrationsDir(set)
 	if err != nil {
@@ -89,11 +110,10 @@ func TestMain(m *testing.M) {
 	gin.SetMode(gin.TestMode)
 	ctx := context.Background()
 
+	// Plain postgres is enough now — TimescaleDB was only needed for the old
+	// payments_* hypertables, which are gone with the payments domain.
 	pgC, err := tcpostgres.Run(ctx,
-		// Phase 4 Track 2: the suite needs the timescaledb extension for the
-		// hypertables created by migrations/000002_timescale.up.sql (applied
-		// below via applyMigrations) — plain postgres can't run it.
-		"timescale/timescaledb:latest-pg18",
+		"postgres:18-alpine",
 		tcpostgres.WithDatabase("outbox_test"),
 		tcpostgres.WithUsername("outbox"),
 		tcpostgres.WithPassword("outbox"),
@@ -133,35 +153,35 @@ func TestMain(m *testing.M) {
 	suite.db = db
 
 	// Two-DB split: the container auto-creates only the outbox_test database
-	// (WithDatabase above). Create the payments_test database in the same
-	// instance — the cloud analogue of observability/postgres/init-payments.sql
+	// (WithDatabase above). Create the events_test database in the same
+	// instance — the cloud analogue of observability/postgres/init-events.sql
 	// — and derive its DSN from the outbox one (same host/creds, different
 	// dbname).
-	if err := db.Exec("CREATE DATABASE payments_test").Error; err != nil {
-		log.Printf("create payments database: %v", err)
+	if err := db.Exec("CREATE DATABASE events_test").Error; err != nil {
+		log.Printf("create events database: %v", err)
 		os.Exit(1)
 	}
-	paymentsDSN := strings.Replace(dsn, "/outbox_test?", "/payments_test?", 1)
-	suite.paymentsURI = paymentsDSN
+	eventsDSN := strings.Replace(dsn, "/outbox_test?", "/events_test?", 1)
+	suite.eventsURI = eventsDSN
 
-	paymentsDB, err := database.Connect(paymentsDSN, "")
+	eventsDB, err := database.Connect(eventsDSN, "")
 	if err != nil {
-		log.Printf("connect payments db: %v", err)
+		log.Printf("connect events db: %v", err)
 		os.Exit(1)
 	}
-	suite.paymentsDB = paymentsDB
+	suite.eventsDB = eventsDB
 
-	// Phase 5 Track 1: apply the same versioned migrations the real services
-	// rely on (via golang-migrate) against the ephemeral testcontainer
-	// databases, instead of AutoMigrate/MigrateTimescale — so the integration
-	// suite is also a regression test that the migration sets alone produce a
-	// working schema. Two sets now (the outbox/payments split), one per DB.
+	// Apply the same versioned migrations the real services rely on (via
+	// golang-migrate) against the ephemeral testcontainer databases, instead
+	// of AutoMigrate — so the integration suite is also a regression test
+	// that the migration sets alone produce a working schema. Two sets, one
+	// per DB (the outbox/events split).
 	if err := applyMigrations(dsn, "outbox"); err != nil {
 		log.Printf("apply outbox migrations: %v", err)
 		os.Exit(1)
 	}
-	if err := applyMigrations(paymentsDSN, "payments"); err != nil {
-		log.Printf("apply payments migrations: %v", err)
+	if err := applyMigrations(eventsDSN, "events"); err != nil {
+		log.Printf("apply events migrations: %v", err)
 		os.Exit(1)
 	}
 
@@ -192,29 +212,25 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// truncateAll resets outbox_messages and every per-method payments_<method>
-// hypertable (payments itself is a UNION ALL view as of Phase 4 Track 2 —
-// TRUNCATE can't target a view), and purges every method's queue + DLQ
-// between tests, preserving the shared container pair and RabbitMQ topology
-// for speed.
+// truncateAll resets both outbox tables and every events-domain table, and
+// purges every registered (event_type, event_subtype) shard's queues + DLQs
+// on both streams between tests, preserving the shared container pair and
+// RabbitMQ topology for speed.
 func truncateAll(t *testing.T) {
 	t.Helper()
-	// outbox_messages lives in the outbox DB; the payments_<method>
-	// hypertables in the payments DB (the two-DB split) — truncate each in its
-	// own database.
-	if err := suite.db.Exec("TRUNCATE TABLE outbox_messages, ticket_outbox").Error; err != nil {
+	if err := suite.db.Exec("TRUNCATE TABLE order_outbox, payment_event_outbox").Error; err != nil {
 		t.Fatalf("truncate outbox tables: %v", err)
 	}
-	paymentsTables := make([]string, 0, len(rmq.Methods))
-	for _, method := range rmq.Methods {
-		paymentsTables = append(paymentsTables, "payments_"+strings.ToLower(method))
+	if err := suite.eventsDB.Exec("TRUNCATE TABLE charges, tickets, orders, event_areas, events, producers, locations").Error; err != nil {
+		t.Fatalf("truncate events tables: %v", err)
 	}
-	if err := suite.paymentsDB.Exec("TRUNCATE TABLE " + strings.Join(paymentsTables, ", ")).Error; err != nil {
-		t.Fatalf("truncate payments tables: %v", err)
-	}
-	for _, method := range rmq.Methods {
-		purgeQueue(t, rmq.QueueFor(method))
-		purgeQueue(t, rmq.DLQFor(method))
+	for eventType, subtypes := range rmq.EventTypes {
+		for _, eventSubtype := range subtypes {
+			for _, stream := range []rmq.Stream{rmq.OrderStream, rmq.PaymentEventStream} {
+				purgeQueue(t, rmq.QueueFor(stream, eventType, eventSubtype))
+				purgeQueue(t, rmq.DLQFor(stream, eventType, eventSubtype))
+			}
+		}
 	}
 }
 
@@ -230,43 +246,72 @@ func purgeQueue(t *testing.T, name string) {
 	}
 }
 
-// newIngest wires a fresh IngestPayment use case against the shared DB.
-func newIngest() *ingest.IngestPayment {
-	outboxRepo := persistence.NewOutboxRepository(suite.db, 0, 0)
-	uow := persistence.NewUnitOfWork(suite.db)
-	return ingest.New(outboxRepo, uow)
+// outboxRowFixture mirrors persistence's unexported outboxRow shape so tests
+// can inspect a raw order_outbox/payment_event_outbox row via GORM's
+// .Table(name) — the production type is deliberately unexported (repository
+// internal), so this is the test-side equivalent, matched by column name.
+type outboxRowFixture struct {
+	IdempotencyKey string `gorm:"column:idempotency_key"`
+	AggregateType  string `gorm:"column:aggregate_type"`
+	HTTPMethod     string `gorm:"column:http_method"`
+	Route          string
+	Payload        []byte `gorm:"type:jsonb"`
+	Status         string
+	RetryCount     int        `gorm:"column:retry_count"`
+	LastError      string     `gorm:"column:last_error"`
+	EventType      string     `gorm:"column:event_type"`
+	EventSubtype   string     `gorm:"column:event_subtype"`
+	PublishedAt    *time.Time `gorm:"column:published_at"`
+	NextRetryAt    *time.Time `gorm:"column:next_retry_at"`
 }
 
-// newRouter wires the full HTTP stack (router + handler + ingest use case)
-// against the shared DB, mirroring cmd/ingestion-api/main.go's DI.
+func testGateway() *fake.Gateway { return fake.New("") }
+
+func newOrderOutboxRepo() *persistence.GORMOutboxRepository {
+	return persistence.NewOutboxRepository(suite.db, "order_outbox", 0, 0)
+}
+
+func newPaymentEventOutboxRepo() *persistence.GORMOutboxRepository {
+	return persistence.NewOutboxRepository(suite.db, "payment_event_outbox", 0, 0)
+}
+
+func newPlaceOrder() *order.PlaceOrder {
+	return order.New(newOrderOutboxRepo(), persistence.NewUnitOfWork(suite.db))
+}
+
+func newReceivePaymentEvent() *webhook.ReceivePaymentEvent {
+	return webhook.New(newPaymentEventOutboxRepo(), persistence.NewUnitOfWork(suite.db))
+}
+
+// newRouter wires the full HTTP stack (router + order/webhook handlers)
+// against the shared outbox DB, mirroring cmd/ingestion-api/main.go's DI.
 func newRouter() *gin.Engine {
-	h := handler.NewPaymentHandler(newIngest())
-	th := handler.NewTicketHandler(newTicketIngest())
-	return handler.NewRouter(h, th, "ingestion-api-test", false, handler.RouterConfig{})
+	orderHandler := handler.NewOrderHandler(newPlaceOrder())
+	webhookHandler := handler.NewWebhookHandler(testGateway(), newReceivePaymentEvent(), testProvider)
+	return handler.NewRouter(orderHandler, webhookHandler, "ingestion-api-test", false, handler.RouterConfig{})
 }
 
-// newTicketIngest wires an IngestTicket use case against the shared outbox DB
-// (ticket_outbox lives in the same database as outbox_messages).
-func newTicketIngest() *ticket.IngestTicket {
-	ticketRepo := persistence.NewTicketOutboxRepository(suite.db)
-	uow := persistence.NewUnitOfWork(suite.db)
-	return ticket.New(ticketRepo, uow)
+// newOrderDispatch wires a DispatchOutbox use case for order_outbox against
+// the shared DB and a real AMQP publisher over the shared connection.
+func newOrderDispatch(batchSize, maxRetries int, interval, pruneAfter time.Duration) (*outboxuc.DispatchOutbox, *persistence.GORMOutboxRepository) {
+	return newOrderDispatchWithConn(suite.amqpConn, batchSize, maxRetries, interval, pruneAfter)
 }
 
-// newDispatch wires a DispatchOutbox use case against the shared DB and a
-// real AMQP publisher over the shared connection.
-func newDispatch(batchSize, maxRetries int, interval, pruneAfter time.Duration) (*outbox.DispatchOutbox, *persistence.GORMOutboxRepository) {
-	return newDispatchWithConn(suite.amqpConn, batchSize, maxRetries, interval, pruneAfter)
-}
-
-// newDispatchWithConn wires a DispatchOutbox against an arbitrary AMQP
+// newOrderDispatchWithConn wires a DispatchOutbox against an arbitrary AMQP
 // connection (e.g. a deliberately closed one) so tests can simulate broker
 // unavailability and max-retry/dead-letter scenarios without touching the
 // shared connection other tests depend on.
-func newDispatchWithConn(conn *amqp.Connection, batchSize, maxRetries int, interval, pruneAfter time.Duration) (*outbox.DispatchOutbox, *persistence.GORMOutboxRepository) {
-	outboxRepo := persistence.NewOutboxRepository(suite.db, 0, 0)
+func newOrderDispatchWithConn(conn *amqp.Connection, batchSize, maxRetries int, interval, pruneAfter time.Duration) (*outboxuc.DispatchOutbox, *persistence.GORMOutboxRepository) {
+	repo := newOrderOutboxRepo()
 	publisher := messaging.NewPublisher(conn)
-	return outbox.New(outboxRepo, publisher, batchSize, maxRetries, interval, pruneAfter), outboxRepo
+	return outboxuc.New(repo, publisher, batchSize, maxRetries, interval, pruneAfter), repo
+}
+
+// newPaymentEventDispatch mirrors newOrderDispatch for payment_event_outbox.
+func newPaymentEventDispatch(batchSize, maxRetries int, interval, pruneAfter time.Duration) (*outboxuc.DispatchOutbox, *persistence.GORMOutboxRepository) {
+	repo := newPaymentEventOutboxRepo()
+	publisher := messaging.NewPublisher(suite.amqpConn)
+	return outboxuc.New(repo, publisher, batchSize, maxRetries, interval, pruneAfter), repo
 }
 
 // amqpDial opens a brand-new AMQP connection to the shared RabbitMQ
@@ -277,14 +322,31 @@ func amqpDial(t *testing.T) (*amqp.Connection, error) {
 	return rmq.Connect(suite.amqpURI, false)
 }
 
-// newConsumer wires a real AMQPConsumer + ProcessMessage against the shared
-// DB and AMQP connection, bound to method's queue.
-func newConsumer(method string, prefetch, maxDeliveries int) *messaging.AMQPConsumer {
-	// consumer-worker writes the payments DB (the two-DB split).
-	paymentRepo := persistence.NewPaymentRepository(suite.paymentsDB)
-	uow := persistence.NewUnitOfWork(suite.paymentsDB)
-	processMsg := consume.New(paymentRepo, uow)
-	return messaging.NewConsumer(suite.amqpConn, processMsg, method, prefetch, maxDeliveries, 0, 0)
+// newCheckoutConsumer wires a real AMQPConsumer + ProcessOrder against the
+// shared events DB and the fake gateway, bound to (eventType, eventSubtype)'s
+// order_outbox shard queue.
+func newCheckoutConsumer(eventType, eventSubtype string, prefetch, maxDeliveries int) *messaging.AMQPConsumer {
+	locationRepo := persistence.NewLocationRepository(suite.eventsDB)
+	eventRepo := persistence.NewEventRepository(suite.eventsDB)
+	orderRepo := persistence.NewOrderRepository(suite.eventsDB)
+	ticketRepo := persistence.NewTicketRepository(suite.eventsDB)
+	chargeRepo := persistence.NewChargeRepository(suite.eventsDB)
+	uow := persistence.NewUnitOfWork(suite.eventsDB)
+	processOrder := checkout.New(locationRepo, eventRepo, orderRepo, ticketRepo, chargeRepo, testGateway(), uow, testProvider, "http://localhost:8080/orders/success")
+	return messaging.NewConsumer(suite.amqpConn, processOrder, rmq.OrderStream, eventType, eventSubtype, prefetch, maxDeliveries, 0, 0)
+}
+
+// newFulfillmentConsumer wires a real AMQPConsumer + IssueTickets against the
+// shared events DB, bound to (eventType, eventSubtype)'s payment_event_outbox
+// shard queue.
+func newFulfillmentConsumer(eventType, eventSubtype string, prefetch, maxDeliveries int) *messaging.AMQPConsumer {
+	chargeRepo := persistence.NewChargeRepository(suite.eventsDB)
+	ticketRepo := persistence.NewTicketRepository(suite.eventsDB)
+	orderRepo := persistence.NewOrderRepository(suite.eventsDB)
+	uow := persistence.NewUnitOfWork(suite.eventsDB)
+	qr := ticketqr.New(ticketSigningSecret)
+	issueTickets := fulfillment.New(chargeRepo, ticketRepo, orderRepo, qr, uow)
+	return messaging.NewConsumer(suite.amqpConn, issueTickets, rmq.PaymentEventStream, eventType, eventSubtype, prefetch, maxDeliveries, 0, 0)
 }
 
 // waitFor polls cond until it returns true or timeout elapses, returning the
@@ -302,20 +364,38 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) bool {
 	return cond()
 }
 
-func countOutboxByStatus(status domain.OutboxStatus) int64 {
+func countOrderOutboxByStatus(status domain.OutboxStatus) int64 {
 	var n int64
-	suite.db.Model(&persistence.OutboxMessageModel{}).Where("status = ?", string(status)).Count(&n)
+	suite.db.Table("order_outbox").Where("status = ?", string(status)).Count(&n)
 	return n
 }
 
-func countPayments() int64 {
+func countPaymentEventOutboxByStatus(status domain.OutboxStatus) int64 {
 	var n int64
-	suite.paymentsDB.Model(&persistence.PaymentModel{}).Count(&n)
+	suite.db.Table("payment_event_outbox").Where("status = ?", string(status)).Count(&n)
 	return n
 }
 
-func countTicketOutbox() int64 {
+func countOrders() int64 {
 	var n int64
-	suite.db.Model(&persistence.TicketOutboxModel{}).Count(&n)
+	suite.eventsDB.Table("orders").Count(&n)
+	return n
+}
+
+func countTickets() int64 {
+	var n int64
+	suite.eventsDB.Table("tickets").Count(&n)
+	return n
+}
+
+func countTicketsByStatus(status string) int64 {
+	var n int64
+	suite.eventsDB.Table("tickets").Where("status = ?", status).Count(&n)
+	return n
+}
+
+func countCharges() int64 {
+	var n int64
+	suite.eventsDB.Table("charges").Count(&n)
 	return n
 }

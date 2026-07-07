@@ -1,38 +1,56 @@
 # transaction-outbox Helm chart
 
-Deploys the Transactional Outbox payments system:
+Deploys the Transactional Outbox Event Ticket System:
 
 - one `ingestion-api` Deployment + Service (fixed replica count by default;
   `ingestionApi.hpa.enabled: true` opts back into a CPU/memory HPA);
 - one `outbox-worker` Deployment + KEDA `ScaledObject` (the Transactional
-  Outbox relay — scales on outbox backlog via the postgresql scaler,
+  Outbox relay — runs two dispatch loops, one per outbox table, and scales
+  on the SUMMED backlog of both via the postgresql scaler,
   `outboxWorker.keda.minReplicaCount` defaults to 1 — see
   `templates/outbox-worker/`);
-- one `consumer-worker` Deployment + KEDA `ScaledObject` pair per payment
-  method (driven by `values.yaml`'s `paymentMethods` list — see
-  `templates/consumer-worker/`).
+- one `order-consumer-worker` Deployment + KEDA `ScaledObject` pair and one
+  `fulfillment-consumer-worker` Deployment + KEDA `ScaledObject` pair per
+  `(event_type, event_subtype)` shard (driven by `values.yaml`'s
+  `eventShards` list — see `templates/order-consumer-worker/`,
+  `templates/fulfillment-consumer-worker/`).
 
 Two logical databases (one Postgres/RDS instance): ingestion-api and
-outbox-worker use `secret.databaseUrl` (the `outbox` DB); consumer-worker uses
-`secret.paymentsDatabaseUrl` (the `payments` DB).
+outbox-worker use `secret.databaseUrl` (the `outbox` DB — `order_outbox` +
+`payment_event_outbox`); order-consumer-worker and fulfillment-consumer-worker
+use `secret.eventsDatabaseUrl` (the `events` DB — locations/events/orders/
+tickets/charges).
 
 ## Install
+
+This chart is the deploy/test path for the project — apply it to a
+[KIND](https://kind.sigs.k8s.io/) cluster locally (`infra/kind/`, `make
+k8s-apply`) or to any conformant Kubernetes cluster. There is no cloud
+provisioning tool wired up in this repo right now (Pulumi was removed); point
+`--set`/a values override file at your own cluster's ingress class, secrets
+backend, and DB/broker endpoints.
 
 ```bash
 helm upgrade --install transaction-outbox helmcharts/transaction-outbox \
   --namespace transaction-outbox --create-namespace
 ```
 
-Override `secret.databaseUrl` / `secret.paymentsDatabaseUrl` /
-`secret.rabbitmqUrl` (and any other value) via `--set` or a
-`-f custom-values.yaml` file — never commit real connection strings into
-`values.yaml`.
+Override `secret.databaseUrl` / `secret.eventsDatabaseUrl` /
+`secret.rabbitmqUrl` / `secret.stripeSecretKey` / `secret.stripeWebhookSecret`
+/ `secret.ticketSigningSecret` (and any other value) via `--set` or a
+`-f custom-values.yaml` file — never commit real connection strings or
+secrets into `values.yaml`.
 
-## Adding a payment method
+## Adding an event-type shard
 
-Append an entry to `paymentMethods` in `values.yaml` (`name`, `queue`,
-`metricsPort`). No new template files are needed — the Deployment and
-ScaledObject templates render one pair per list entry.
+Append an entry to `eventShards` in `values.yaml` (`eventType`,
+`eventSubtype`, `name`, `orderQueue`, `paymentQueue`, `orderMetricsPort`,
+`fulfillmentMetricsPort` — the metrics ports must not collide with an
+existing entry). No new template files are needed — the Deployment/Rollout
+and ScaledObject templates render one set per list entry. The
+`(event_type, event_subtype)` pair must also exist in the application-side
+registry (`internal/infrastructure/rabbitmq.EventTypes`) or the RabbitMQ
+queue this shard's `orderQueue`/`paymentQueue` names won't exist to bind to.
 
 ## RabbitMQ in production
 
@@ -42,7 +60,9 @@ to manage a highly-available, properly-monitored cluster (quorum queues,
 TLS, upgrades, backups) instead of a hand-rolled Deployment/StatefulSet here.
 
 Local/dev only uses the `rabbitmq:4.3-management` image via
-`docker-compose.yml`. Each KEDA `ScaledObject` rendered by
-`templates/consumer-worker/scaledobject.yaml` talks to whatever RabbitMQ
-endpoint is configured via `RABBITMQ_MANAGEMENT_URL` (in `values.yaml`'s
-`configMap.data`), regardless of how that RabbitMQ instance is deployed.
+`docker-compose.yml` (or, for KIND, `infra/kind/postgres-rabbitmq.yaml`).
+Each KEDA `ScaledObject` rendered by `templates/order-consumer-worker/
+scaledobject.yaml`/`templates/fulfillment-consumer-worker/scaledobject.yaml`
+talks to whatever RabbitMQ endpoint is configured via
+`RABBITMQ_MANAGEMENT_URL` (in `values.yaml`'s `configMap.data`), regardless
+of how that RabbitMQ instance is deployed.

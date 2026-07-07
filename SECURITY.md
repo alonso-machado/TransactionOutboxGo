@@ -1,55 +1,47 @@
-# Security & PCI-DSS Posture
+# Security Posture
 
-This document records the current security posture of the Transaction
-Outbox system, with a focus on cardholder data (PAN) handling for PCI-DSS
-relevance, and the single highest-priority gap to close before any real
-productionization. See [`docs/runbook.md`](docs/runbook.md) for the
-disaster-recovery procedures this posture's encryption/backup choices
-support.
+This document records the current security posture of the Event Ticket
+System, with a focus on payment data handling and the single
+highest-priority gap to close before any real productionization. See
+[`docs/runbook.md`](docs/runbook.md) for the disaster-recovery procedures
+this posture's encryption/backup choices support.
 
 ---
 
-## 1. Cardholder data handling (PAN / CVV)
+## 1. Payment data handling: no cardholder data ever reaches this system
 
-### PAN (card number) is masked at the earliest possible boundary
+Unlike a system that accepts card numbers directly, this project's
+`PaymentGateway` port (`internal/domain/payment_gateway.go`) delegates the
+entire charge to the provider's own **hosted checkout page**
+(`CreateCheckout` returns a `checkoutUrl` the customer is redirected to).
+Card number, CVV, and any other cardholder data are typed directly into the
+provider's page — Stripe's, for a real deployment — and never transit this
+system's HTTP handlers, database, or message broker in any form.
 
-`internal/adapter/http/card.go`'s `maskPAN` rewrites the `cardNumber` field
-inside the card sibling object (`cartao_credito`/`cartao_debito`) to its
-last 4 digits **before the request ever reaches `ingest.Execute`**. This
-means the full PAN:
+Concretely:
 
-- is **never persisted** to the `outbox_messages.payload` column,
-- is **never published** to RabbitMQ,
-- is **never written** to the `payments` table's `method_details` column,
-- and is **never logged**, because every downstream component only ever
-  sees the already-masked value.
+- The order wire format (`POST /api/v1/orders`) has no card fields at all —
+  only `customer.name`/`email`/`document` and per-ticket price/section
+  data. There is no code path anywhere in the system that could read,
+  store, publish, or log a PAN or CVV, because no type in the request or
+  domain model has anywhere to put one.
+- The inbound webhook (`POST /api/v1/webhooks/payments/{provider}`) carries
+  only an **outcome** (`CONFIRMED`/`FAILED`) plus the provider's own
+  reference id — again, no cardholder data.
+- `internal/domain/pii.Redact`/`RedactJSON` still exist as a defense-in-depth
+  layer over free-text log lines and error messages, now scoped to PII
+  relevant to this domain — `email`, `document`, `validationCode`,
+  `signature` — rather than card fields, since there are no card fields left
+  to redact.
 
-As a second line of defense (in case a future code path bypasses the
-handler-level mask, e.g. a raw payload echoed into an error message),
-`internal/domain/pii.Redact`/`RedactJSON` independently mask any
-`cardNumber` key — and `payerDocument`/`barcode`/`endToEndId`/`txid` for
-the other payment methods' sensitive fields — wherever they appear in a
-string or JSON document, including free-text log lines.
-
-**Regression test**: [`tests/integration/pci_test.go`](tests/integration/pci_test.go)
-(`TestPCI_CardPayment_NeverLeaksFullPANOrCVV`) posts a real card payment
-end-to-end (ingest → outbox → RabbitMQ → consumer → `payments` table) and
-asserts the full PAN never appears in the outbox payload, the raw RabbitMQ
-message body, or the persisted row — only the last 4 digits. It also
-independently re-confirms `pii.Redact` masks a literal PAN. This test is
-the living assertion of the posture described in this section; if it ever
-fails, the masking described above has regressed.
-
-### CVV is never accepted, stored, or logged
-
-The wire format's card sibling object (`CardDetailsDTO` in
-`internal/adapter/http/dto.go`) has **no `cvv` field at all**. A client
-that sends one is silently dropped by `json.Unmarshal` — there is no code
-path anywhere in the system that reads, stores, publishes, or logs a CVV,
-because the type the JSON is unmarshaled into has nowhere to put it. This
-is enforced structurally, not by a runtime check, and is asserted by the
-same PCI regression test above (it sends a `cvv` field and confirms it
-never appears in any downstream artifact).
+**Practical effect on PCI-DSS scope:** with card data handled entirely by
+the provider's own hosted checkout (SAQ A-eligible integration pattern),
+this system itself carries materially less PCI scope than a system that
+touches a PAN directly. This is a property of the architecture (delegating
+to a hosted checkout), not a control this repo actively enforces — the
+scoping conclusion still needs a real compliance review before being relied
+upon, and holds only as long as every gateway adapter keeps using a hosted
+checkout flow rather than accepting raw card fields itself.
 
 ---
 
@@ -59,14 +51,15 @@ never appears in any downstream artifact).
 |---|---|---|
 | App ↔ Postgres/RDS | plaintext (`sslmode=disable`) | `sslmode=require` (`internal/infrastructure/database/database.go`'s `withSSLMode`, driven by `DB_SSL_MODE`) |
 | App ↔ RabbitMQ/Amazon MQ | plaintext (`amqp://`) | `amqps://` (`internal/infrastructure/rabbitmq/rabbitmq.go`'s `withAMQPS`, driven by `RABBITMQ_TLS`) |
-| Client ↔ ingestion-api | plain HTTP locally | HTTPS via an ALB + ACM certificate (Phase 4 Track 1's ALB front door; cert provisioning is operator-managed) |
+| Client/gateway ↔ ingestion-api | plain HTTP locally | HTTPS via an ALB + ACM certificate (cert provisioning is operator-managed) |
+| ingestion-api ↔ payment gateway | HTTPS (the gateway SDK, e.g. `stripe-go`, always talks TLS regardless of environment) | same |
 
 Both `DB_SSL_MODE` and `RABBITMQ_TLS` default to the plaintext local
 posture so `make up`/the demo never breaks; the Helm chart's
 `configMap.data` sets `DB_SSL_MODE: "disable"`/`RABBITMQ_TLS: "false"` as
 its own explicit default too — a cloud values override is expected to flip
 both for any real deployment, since Amazon MQ requires `amqps://` and RDS
-should always be accessed over TLS for cardholder-adjacent traffic.
+should always be accessed over TLS.
 
 ## 3. Encryption at rest
 
@@ -87,18 +80,21 @@ configured here).
   worker nodes. **Not currently provisioned by anything in this repo** —
   this was Pulumi's job (`infra/pulumi/`, now removed); enforcing it is on
   whatever provisions the cluster/RDS/Amazon MQ next.
-- **Single writer**: `consumer-worker` is the *only* component that writes
-  to the `payments` table (Clean Architecture's port-interface boundary
-  enforces this structurally — `ingestion-api` never imports
-  `PaymentRepository`). This narrows the audit surface for "who touched
-  cardholder-adjacent data" to one code path.
-- **WAF**: the ALB front door (Phase 4 Track 1) is the attach point for an
-  AWS WAF rate-based rule, with the in-process leaky-bucket rate limiter
-  (`internal/adapter/http/ratelimit/`) as a second layer behind it.
+- **Single writer per database**: `order-consumer-worker` and
+  `fulfillment-consumer-worker` are the *only* components that write to the
+  `events` database (Clean Architecture's port-interface boundary enforces
+  this structurally — `ingestion-api` never imports `OrderRepository`/
+  `TicketRepository`/`ChargeRepository`). This narrows the audit surface for
+  "who touched order/ticket/charge data" to two code paths, both of which
+  only ever act on a message the outbox relay itself published.
+- **WAF**: the ALB front door is the attach point for an AWS WAF rate-based
+  rule, with the in-process leaky-bucket rate limiter
+  (`internal/adapter/http/ratelimit/`) as a second layer behind it — see
+  [README.md's Edge protection section](README.md#edge-protection-rate-limiting--waf).
 - **Audit-log gap**: there is currently no centralized, tamper-evident
   audit log of "who/what called the ingestion API and when" beyond
   standard application logs (which themselves go through `pii.Redact`).
-  A real PCI-scoped deployment should add structured, immutable audit
+  A real production deployment should add structured, immutable audit
   logging (e.g. shipped to a write-once store) — this is the single
   largest compliance gap beyond the auth gap noted below.
 
@@ -106,13 +102,15 @@ configured here).
 
 Local/compose uses a static `.env` file and the Helm chart's plaintext
 `templates/secret.yaml` (explicitly marked as a placeholder, never to hold
-real credentials). A cloud target can source `DATABASE_URL`/`RABBITMQ_URL`
-from **AWS Secrets Manager** via the **External Secrets Operator** (ESO),
-authenticating with **IRSA** — no static AWS credentials would then live
-anywhere in the cluster (`helmcharts/transaction-outbox/templates/
-externalsecret.yaml`, gated by `externalSecrets.enabled`) — but ESO itself
-and its IRSA role must be installed separately; the Pulumi program that used
-to do that (`infra/pulumi/`) was removed. ESO's `ExternalSecret` CR re-syncs every 5
+real credentials — this includes `stripeSecretKey`/`stripeWebhookSecret`/
+`ticketSigningSecret` alongside the database/broker URLs). A cloud target
+can source these from **AWS Secrets Manager** via the **External Secrets
+Operator** (ESO), authenticating with **IRSA** — no static AWS credentials
+would then live anywhere in the cluster
+(`helmcharts/transaction-outbox/templates/externalsecret.yaml`, gated by
+`externalSecrets.enabled`) — but ESO itself and its IRSA role must be
+installed separately; the Pulumi program that used to do that
+(`infra/pulumi/`) was removed. ESO's `ExternalSecret` CR re-syncs every 5
 minutes (`refreshInterval`), so a Secrets Manager-side credential rotation
 propagates to the cluster's `Secret` automatically, though pods must still
 be restarted (or watch the mounted Secret for changes, which this app does
@@ -121,33 +119,33 @@ not currently do) to actually pick up new connection strings — see
 
 ---
 
-## 6. The single highest-priority gap: no authentication on the ingestion API
+## 6. The single highest-priority gap: no authentication on order placement
 
-**`POST /api/v1/payments` has no authentication or signature verification
-today.** Any caller that can reach the ALB can submit a payment event. This
-is the most significant gap relative to a real payment-provider webhook
-integration, where the provider signs each delivery (e.g. an HMAC over the
-raw body using a shared secret) so the receiver can verify the request
-genuinely originated from the provider and wasn't tampered with in
-transit.
+**`POST /api/v1/orders` has no authentication today.** Any caller that can
+reach the ALB can submit an order. Unlike the payment-gateway webhook route
+(see below), there is no signature or API-key scheme protecting it.
 
-**If this system were productionized, HMAC signature verification on
-inbound webhook deliveries is the first thing to add** — verifying a
-provider-supplied signature header (e.g. `X-Signature: sha256=<hmac>`
-computed over the raw request body with a per-provider shared secret)
-before any payload parsing happens, rejecting unsigned or invalid requests
-with `401`. This is deliberately **not implemented** in the current system
-because:
+By contrast, **`POST /api/v1/webhooks/payments/{provider}` is already
+signature-verified** — the handler calls the configured
+`PaymentGateway.VerifyWebhook` before any payload is trusted, and the real
+`stripe` adapter uses Stripe's own `webhook.ConstructEvent`, which rejects a
+request whose `Stripe-Signature` header doesn't match an HMAC computed over
+the raw body with `STRIPE_WEBHOOK_SECRET`. The `fake` adapter (the
+local/test default) does **not** enforce a real signature check — by
+design, since it never talks to a real provider — so this protection only
+applies once `PAYMENT_PROVIDER=stripe` (or a future real-provider adapter)
+is actually configured.
 
-- it is orthogonal to the Transactional Outbox pattern that is the actual
-  subject of this project,
-- and faking a "real" provider's signature scheme without an actual
-  provider integration would add complexity without adding to the
-  pattern's own demonstration value.
+**If this system were productionized, the first thing to add is
+authentication on order placement** — e.g. an API key or a signed request
+scheme identifying which storefront/frontend is placing the order, rejecting
+unauthenticated requests with `401`. This is deliberately **not
+implemented** in the current system because it is orthogonal to the
+Transactional Outbox pattern that is the actual subject of this project.
 
 Everything else in this document — TLS, encryption at rest, secrets
-rotation, PAN masking, network segmentation — is genuine production
-hardening already present. Authentication on the write path is the one
-deliberate, documented exception, and should be the first thing addressed
-before this system (or anything derived from it) ever accepts real
-payment-provider traffic.
+rotation, hosted-checkout card-data avoidance, network segmentation, and
+webhook signature verification — is genuine hardening already present.
+Authentication on the order-placement write path is the one deliberate,
+documented exception, and should be the first thing addressed before this
+system (or anything derived from it) ever accepts real customer traffic.

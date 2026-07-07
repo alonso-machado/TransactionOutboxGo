@@ -1,13 +1,14 @@
 // Test 6.1 — two-phase latency baseline (P95/P99), consumers PINNED at 1
-// replica/queue (KEDA disabled or paused). See loadtest/README.md.
+// replica/shard (KEDA disabled or paused). See loadtest/README.md.
 //
-// Phase A (5 min): 100 VUs round-robin across all 5 methods.
-// Phase B (5 min): 100 VUs hit PIX only, to contrast a single hot queue
-// against the spread-out mixed load and show the single-consumer drain
-// ceiling building backlog.
+// Phase A (5 min): 100 VUs round-robin across all shards (SHARDS in
+// payloads.js).
+// Phase B (5 min): 100 VUs hit CONCERT/ROCK only, to contrast a single hot
+// queue against the spread-out mixed load and show the single-consumer
+// drain ceiling building backlog.
 import http from "k6/http";
 import { check } from "k6";
-import { buildBody, METHODS } from "./payloads.js";
+import { buildBody, SHARDS } from "./payloads.js";
 
 export const options = {
   scenarios: {
@@ -18,11 +19,11 @@ export const options = {
       exec: "mixed",
       startTime: "0s",
     },
-    pixOnly: {
+    oneShardOnly: {
       executor: "constant-vus",
       vus: 100,
       duration: "5m",
-      exec: "pixOnly",
+      exec: "oneShardOnly",
       startTime: "5m",
     },
   },
@@ -35,22 +36,22 @@ export const options = {
 
 const BASE = __ENV.TARGET_URL || "http://localhost:8080";
 
-function post(method) {
-  const body = buildBody(method);
-  const res = http.post(`${BASE}/api/v1/payments`, JSON.stringify(body), {
+function post(shard) {
+  const body = buildBody(shard);
+  const res = http.post(`${BASE}/api/v1/orders`, JSON.stringify(body), {
     headers: {
       "Content-Type": "application/json",
       "Idempotency-Key": body.__idempotencyKey,
     },
-    tags: { method },
+    tags: { eventType: shard.eventType, eventSubtype: shard.eventSubtype },
   });
   check(res, { "is 201": (r) => r.status === 201 });
 }
 
 export function mixed() {
-  post(METHODS[__ITER % METHODS.length]);
+  post(SHARDS[__ITER % SHARDS.length]);
 }
 
-export function pixOnly() {
-  post("PIX");
+export function oneShardOnly() {
+  post(SHARDS[0]); // CONCERT/ROCK
 }

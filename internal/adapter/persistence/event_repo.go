@@ -30,10 +30,13 @@ func (r *GORMEventRepository) UpsertBySourceEventID(ctx context.Context, uow dom
 		SourceEventID: e.SourceEventID,
 		CreatedAt:     e.CreatedAt,
 	}
-	tx := db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "source_event_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"name", "location_id"}),
-	}).Create(&m)
+	tx := db.Clauses(
+		clause.OnConflict{
+			Columns:   []clause.Column{{Name: "source_event_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"name", "location_id"}),
+		},
+		clause.Returning{Columns: []clause.Column{{Name: "id"}}},
+	).Create(&m)
 	if tx.Error != nil {
 		return uuid.Nil, tx.Error
 	}

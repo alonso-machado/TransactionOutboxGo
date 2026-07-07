@@ -16,11 +16,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Path #10: 50 concurrent POSTs with unique business identities must result
-// in 50 distinct outbox rows, all of which eventually reach PUBLISHED and
-// are persisted exactly once by the consumer (no row lost, none duplicated,
-// none double-published thanks to FOR UPDATE SKIP LOCKED on FetchPending).
-func TestConcurrentIngestion_FiftyUniquePayments_AllPublishedAndPersistedOnce(t *testing.T) {
+// 50 concurrent POSTs with unique business identities must result in 50
+// distinct order_outbox rows, all of which eventually reach PUBLISHED and
+// are processed exactly once by order-consumer-worker (no row lost, none
+// duplicated, none double-processed thanks to FOR UPDATE SKIP LOCKED on
+// FetchPending and the orders.source_order_id UNIQUE constraint).
+func TestConcurrentIngestion_FiftyUniqueOrders_AllPublishedAndProcessedOnce(t *testing.T) {
 	truncateAll(t)
 
 	const n = 50
@@ -32,9 +33,11 @@ func TestConcurrentIngestion_FiftyUniquePayments_AllPublishedAndPersistedOnce(t 
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			sourceOrderID := fmt.Sprintf("order-concurrent-%d", i)
 			eventID := fmt.Sprintf("evt-concurrent-%d", i)
-			body, headers := pixBody(eventID, fmt.Sprintf("prov-concurrent-%d", i), "")
-			code, resp, err := postPaymentConcurrent(body, headers)
+			ticketID := fmt.Sprintf("TKT-concurrent-%d", i)
+			body, headers := orderBody(sourceOrderID, eventID, ticketID, "")
+			code, resp, err := postOrderConcurrent(body, headers)
 			if err != nil {
 				errs[i] = err
 				return
@@ -55,35 +58,35 @@ func TestConcurrentIngestion_FiftyUniquePayments_AllPublishedAndPersistedOnce(t 
 		require.Equal(t, "accepted", s, "request %d should be accepted, not deduped", i)
 	}
 
-	require.Equal(t, int64(n), countOutboxByStatus("NEW"))
+	require.Equal(t, int64(n), countOrderOutboxByStatus("NEW"))
 
-	dispatcher, _ := newDispatch(20, 5, 100*time.Millisecond, 24*time.Hour)
+	dispatcher, _ := newOrderDispatch(20, 5, 100*time.Millisecond, 24*time.Hour)
 	dispatchCtx, cancelDispatch := context.WithCancel(context.Background())
 	defer cancelDispatch()
 	go dispatcher.Run(dispatchCtx, nil)
 
-	consumer := newConsumer("PIX", 20, 5)
+	consumer := newCheckoutConsumer(testEventType, testEventSubtype, 20, 5)
 	consumeCtx, cancelConsume := context.WithCancel(context.Background())
 	defer cancelConsume()
 	go func() { _ = consumer.Run(consumeCtx) }()
 
 	ok := waitFor(t, 30*time.Second, func() bool {
-		return countOutboxByStatus("PUBLISHED") == int64(n)
+		return countOrderOutboxByStatus("PUBLISHED") == int64(n)
 	})
-	require.True(t, ok, "expected all %d rows to reach PUBLISHED, got %d", n, countOutboxByStatus("PUBLISHED"))
+	require.True(t, ok, "expected all %d rows to reach PUBLISHED, got %d", n, countOrderOutboxByStatus("PUBLISHED"))
 
 	ok2 := waitFor(t, 30*time.Second, func() bool {
-		return countPayments() == int64(n)
+		return countOrders() == int64(n)
 	})
-	require.True(t, ok2, "expected exactly %d payments rows, got %d", n, countPayments())
+	require.True(t, ok2, "expected exactly %d order rows, got %d", n, countOrders())
 }
 
-// postPaymentConcurrent mirrors postPayment but returns plain values (no
+// postOrderConcurrent mirrors postOrder but returns plain values (no
 // *testing.T assertions) since it runs inside a goroutine; each call wires
-// its own router/use-case instance, same as postPayment.
-func postPaymentConcurrent(body string, headers map[string]string) (int, map[string]any, error) {
+// its own router/use-case instance, same as postOrder.
+func postOrderConcurrent(body string, headers map[string]string) (int, map[string]any, error) {
 	router := newRouter()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/payments", bytes.NewBufferString(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orders", bytes.NewBufferString(body))
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}

@@ -1,5 +1,5 @@
 apiVersion: v2
 name: transaction-outbox
-description: Transactional Outbox pattern for a Payments domain — ingestion-api plus one consumer-worker per payment method, autoscaled via KEDA.
+description: Transactional Outbox pattern for an Event Ticket System — ingestion-api plus one order-consumer-worker and one fulfillment-consumer-worker per event-type shard, autoscaled via KEDA.
 type: application
-version: 0.2.0
+version: 0.3.0
