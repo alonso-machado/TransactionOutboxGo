@@ -4,7 +4,7 @@
 
 6.2 needs a real KEDA `ScaledObject`, which only Kubernetes provides — a
 local [KIND](https://kind.sigs.k8s.io/) cluster is the cheapest way to get
-one without touching AWS/Pulumi. Infra (Postgres/RabbitMQ) lives in the
+one without touching AWS. Infra (Postgres/RabbitMQ) lives in the
 `default` namespace; the app (ingestion-api/consumer-worker) is the Helm
 release in its own `transaction-outbox` namespace — same split the chart
 and `infra/kind/*.yaml` assume everywhere else in this repo.

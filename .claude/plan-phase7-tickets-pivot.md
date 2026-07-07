@@ -291,12 +291,19 @@ binds). Remove payment-specific keys. Keep one `DATABASE_URL` per process.
   ingress path for `/api/v1/webhooks/payments/*`.
 - Update `image.*` blocks for the renamed/new services.
 
-### D3. Pulumi (`infra/pulumi/`, review-only — never run)
-Replace the `payments` RDS DB with `events` in [data.go](infra/pulumi/data.go);
-add gateway secrets to Secrets Manager; `imageTagOrderWorker` /
-`imageTagFulfillmentWorker` config keys in
-[config.go](infra/pulumi/config.go)/`Pulumi.*.yaml`; wire the two consumer role
-sets + webhook ingress in [workloads.go](infra/pulumi/workloads.go).
+### D3. Pulumi — **removed from the project**
+`infra/pulumi/` has been deleted entirely, not just deprioritized. Helm + KIND
+is the deploy/test path now (`infra/kind/`, `make k8s-apply`); Pulumi may come
+back as its own initiative later if a real cloud target is needed again, but
+it's out of scope for this pivot. CI's `deploy (pulumi up)` job was removed
+from all three workflows (see D4) — no automated deploy exists right now.
+Structural/comment references to Pulumi were scrubbed from the Helm chart,
+`internal/infrastructure/{config,database}`, CI workflows, and the top-level
+docs (CLAUDE.md/README.md/SECURITY.md/docs/runbook.md/loadtest/README.md) —
+the latter two (SECURITY.md, runbook.md) got a "not currently provisioned by
+anything in this repo" honesty pass rather than a full rewrite, since their
+underlying AWS infra (KMS, RDS PITR/backup, network segmentation) has no
+replacement yet.
 
 ### D4. CI (`.github/workflows/`)
 Rename `consumer-worker.yml` → `order-consumer-worker.yml`; add
@@ -374,13 +381,14 @@ rewritten `tests/integration/*`; rewritten `loadtest/*`.
 `internal/infrastructure/config/config.go`, `internal/domain/{outbox,ticket,
 pii}.go`, `cmd/{ingestion-api,outbox-worker,outbox-admin}/main.go`,
 `docker-compose.yml`, `Makefile`, `infra/kind/*`, Helm `values.yaml`/secrets,
-`infra/pulumi/*`, `go.mod`/`go.sum`, docs.
+`go.mod`/`go.sum`, docs.
 
 **Delete:** `internal/domain/{payment,schema}.go`,
 `internal/adapter/http/{handler,dto,card}.go` (payments),
 `internal/adapter/persistence/payment_repo.go`, `internal/usecase/{ingest,
-consume}/`, `migrations/payments/*`. (Fold Phase 6's planned `ticket_outbox`
-relay / `tickets` DB into this pivot — do not build it separately.)
+consume}/`, `migrations/payments/*`, **`infra/pulumi/*` (entire directory)**.
+(Fold Phase 6's planned `ticket_outbox` relay / `tickets` DB into this pivot —
+do not build it separately.)
 
 **Reuse unchanged:** `domain/{backoff,uow,uuid}.go`, `database.Listener`,
 `telemetry`, `logging`, `observability`, `ratelimit`, the quorum-queue +

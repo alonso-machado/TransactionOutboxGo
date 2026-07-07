@@ -62,7 +62,7 @@ type Config struct {
 
 	// PCI-DSS encryption-in-transit toggles (Phase 5 Track 5.B). Both default
 	// to the plaintext local posture (`make up`/compose) so nothing changes
-	// for the demo; cloud deploys (Pulumi) set these to enforce TLS.
+	// for the demo; cloud deploys set these to enforce TLS.
 	// DBSSLMode is honored by database.Connect (appended as the Postgres
 	// `sslmode` DSN param); RabbitMQTLS is honored by rabbitmq.Connect
 	// (switches the AMQP URL scheme from amqp:// to amqps://).

@@ -15,8 +15,7 @@ import (
 // withSSLMode appends `sslmode=<mode>` to dsn unless the caller already set
 // one explicitly. PCI-DSS encryption-in-transit posture (Phase 5 Track 5.B):
 // local/compose defaults to "disable" (DB_SSL_MODE's own default), cloud
-// (Pulumi's RDS DATABASE_URL — see infra/pulumi/data.go) sets "require" so
-// the connection is TLS-enforced.
+// (the RDS DATABASE_URL) sets "require" so the connection is TLS-enforced.
 func withSSLMode(dsn, sslMode string) string {
 	if sslMode == "" || strings.Contains(dsn, "sslmode=") {
 		return dsn

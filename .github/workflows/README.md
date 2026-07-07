@@ -9,52 +9,48 @@ service never triggers, gates, or redeploys the others: each has its own
 badge, and its own required-check configuration in branch protection.
 
 ```
-Build → golangci-lint (GATE) → Unit Tests (GATE) → Upload (ECR/Docker Hub) → Deploy (AWS)
+Build → golangci-lint (GATE) → Unit Tests (GATE) → Upload (ECR/Docker Hub)
                                         │
                                         └── Integration Tests (OPTIONAL, flag-gated,
                                             TestContainers — never blocks the pipeline)
 ```
 
 Three hard gates, in order: **build → lint → unit-tests**. Any one failing
-stops everything downstream for that service — `upload` and `deploy` never
-run if `unit-tests` (or anything before it) is red.
+stops everything downstream for that service — `upload` never runs if
+`unit-tests` (or anything before it) is red.
 
 `lint` checks three different things, not just Go: `golangci-lint` for the
 code, [`actionlint`](https://github.com/rhysd/actionlint) (via
 `reviewdog/action-actionlint`) for the workflow YAML itself — both these
 files included — and `helm lint` against `helmcharts/transaction-outbox`
-(the chart the `deploy` job installs, via Track 4's Pulumi program). A
-broken expression, an undefined secret reference, bad shell syntax in a
-`run:` step, a deprecated action input (this is how the deprecated
+(the chart deployed to Kubernetes; see the chart's own README). A broken
+expression, an undefined secret reference, bad shell syntax in a `run:`
+step, a deprecated action input (this is how the deprecated
 `fail_on_error` input on the actionlint step itself got caught while writing
 it), or a broken chart template/values schema all fail the same gate a Go
 compile error would.
 
 `integration-tests` (the TestContainers suite) is a **safety measure, not a
 release gate**: it needs `unit-tests` to reuse the gate result, but nothing
-downstream needs it, so it can fail or be skipped without blocking
-`upload`/`deploy`. It's off by default and only runs when explicitly
-requested:
+downstream needs it, so it can fail or be skipped without blocking `upload`.
+It's off by default and only runs when explicitly requested:
 
 - via `workflow_dispatch` with the `run_integration` input checked, or
 - on a pull request labeled `ci:integration`.
 
-`upload` and `deploy` only run on pushes to `main`, after the gates pass.
-`upload` builds that service's image (root `Dockerfile`, `ARG SERVICE=...`)
-and pushes it to ECR (primary, OIDC-authenticated via `AWS_DEPLOY_ROLE_ARN`/
-`AWS_REGION`), with an optional Docker Hub mirror push if the
-`DOCKERHUB_USERNAME` repo/environment variable and `DOCKERHUB_TOKEN` secret
-are configured — if not, that step is skipped automatically. `deploy` runs
-`pulumi up` against the `dev` stack in `infra/pulumi/`, setting **only that
-service's** image-tag config key (`imageTagIngestionApi`,
-`imageTagOutboxWorker`, or `imageTagConsumerWorker` — see `config.go`/
-`workloads.go`), so deploying one service never touches the others' running
-pods. `PULUMI_ACCESS_TOKEN` is required for Pulumi Cloud state backend access.
+`upload` only runs on pushes to `main`, after the gates pass. It builds that
+service's image (root `Dockerfile`, `ARG SERVICE=...`) and pushes it to ECR
+(primary, OIDC-authenticated via `AWS_DEPLOY_ROLE_ARN`/`AWS_REGION`), with an
+optional Docker Hub mirror push if the `DOCKERHUB_USERNAME` repo/environment
+variable and `DOCKERHUB_TOKEN` secret are configured — if not, that step is
+skipped automatically.
 
-A `prod` deploy is intentionally not wired here — it should be a separate job
-gated by a GitHub `environment: prod` protection rule requiring manual
-approval, added once the `dev` path has been exercised for real, for each
-workflow independently.
+There is intentionally no automated `deploy` job right now — Pulumi (which
+used to run `pulumi up` here) was removed from the project; Helm + KIND is
+the deploy/test path instead, applied manually (`make k8s-apply`). A CI-driven
+deploy step (Pulumi again, or a direct `helm upgrade`, ideally gated by a
+GitHub `environment:` protection rule for anything beyond a dev cluster) can
+be added back to each workflow independently once that's wired up.
 
 ## Why separate files instead of one matrixed workflow
 

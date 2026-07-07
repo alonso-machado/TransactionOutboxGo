@@ -2,9 +2,10 @@ name: CI - consumer-worker
 
 # Independent of the other microservices' workflows on purpose — see
 # .github/workflows/README.md for why each service gets its own workflow file
-# rather than one matrixed workflow. Gate order: build -> lint -> unit-tests -> upload -> deploy.
+# rather than one matrixed workflow. Gate order: build -> lint -> unit-tests -> upload.
 # integration-tests is an optional, flag-gated safety measure off the gate
-# path — it never blocks upload/deploy.
+# path — it never blocks upload. Deploy is manual (Helm) for now — Pulumi was
+# removed from the project; a CI-driven deploy step can be added back later.
 on:
   push:
     branches: [main]
@@ -142,32 +143,7 @@ jobs:
           push: true
           tags: ${{ vars.DOCKERHUB_USERNAME }}/${{ env.SERVICE }}:${{ github.sha }}
 
-  deploy:
-    name: deploy (pulumi up)
-    needs: upload
-    if: github.ref == 'refs/heads/main'
-    environment: dev # prod uses a separate, manually-approved environment
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
-      - uses: pulumi/actions@v6
-        with:
-          command: up
-          stack-name: dev
-          work-dir: infra/pulumi
-          # Only this service's image-tag config key — never touches
-          # ingestion-api's, so this deploy can't redeploy the other
-          # service's pods (see Track 4's workloads.go).
-          config-map: '{"transaction-outbox:imageTagConsumerWorker":{"value":"${{ github.sha }}","secret":false}}'
-        env:
-          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+  # No automated deploy job: Pulumi (which used to run here as `pulumi up`)
+  # was removed from the project — Helm + KIND is the deploy/test path now,
+  # run manually (`make k8s-apply`). Re-add a deploy job here (Pulumi or a
+  # direct `helm upgrade`) if/when that needs to be automated again.

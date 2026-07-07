@@ -87,7 +87,6 @@ interfaces.
 | Docker Compose (local dev) | `docker-compose.yml` |
 | Multi-stage Dockerfile (ARG SERVICE) | `Dockerfile` |
 | Helm chart (fixed-replica `ingestion-api` — `ingestionApi.hpa.enabled` opts into an HPA; one `outbox-worker` Deployment + KEDA postgresql ScaledObject; one consumer Deployment/Rollout + ScaledObject per payment method; `canary.enabled` switches Deployment+HPA ↔ Argo Rollout+AnalysisTemplate) | `helmcharts/transaction-outbox/` |
-| Pulumi (AWS: EKS, RDS, Amazon MQ, ECR, KEDA, Argo Rollouts, AWS Load Balancer Controller — installs the Helm chart) | `infra/pulumi/` |
 | Rate limiter (leaky-bucket IP throttle, ingestion-api only) | `internal/adapter/http/ratelimit/` |
 | Prometheus/Grafana provisioning (dashboards, datasource, postgres-exporter queries) | `observability/` |
 | GitHub Actions CI/CD (one workflow per microservice — see below) | `.github/workflows/` |
@@ -219,12 +218,11 @@ done. Key rules enforced:
 [`consumer-worker.yml`](.github/workflows/consumer-worker.yml). Each is
 triggered only by changes to its own `cmd/<service>/**` path (plus shared
 `internal/**`/`go.mod`/`go.sum`/`Dockerfile`), so a change scoped to one
-service never triggers, gates, or redeploys the others, and each `deploy`
-sets only its own `imageTag<Service>` Pulumi config key. All three follow the
-same gate order:
+service never triggers or gates the others. All three follow the same gate
+order:
 
 ```
-build → lint (golangci-lint + actionlint + helm lint, GATE) → unit-tests (GATE) → upload (ECR) → deploy (pulumi up)
+build → lint (golangci-lint + actionlint + helm lint, GATE) → unit-tests (GATE) → upload (ECR)
                                                                         └── integration-tests (optional, flag-gated, never blocks)
 ```
 
@@ -232,12 +230,13 @@ build → lint (golangci-lint + actionlint + helm lint, GATE) → unit-tests (GA
 over the workflow YAML itself (catches a broken pipeline the same way
 golangci-lint catches broken Go), and `helm lint` over
 `helmcharts/transaction-outbox` (catches a broken K8s manifest/values schema
-before the Track 4 `deploy` job ever tries to install it). `integration-tests` (the
+before it's ever installed). `integration-tests` (the
 TestContainers suite) is a safety measure only — off by default, triggered
 via `workflow_dispatch` or a `ci:integration` PR label, and never wired into
-anything `upload`/`deploy` depends on. See
-[`.github/workflows/README.md`](.github/workflows/README.md) for the full
-rationale.
+anything `upload` depends on. There is no automated `deploy` job — Pulumi was
+removed from the project; Helm + KIND is the deploy/test path, applied
+manually. See [`.github/workflows/README.md`](.github/workflows/README.md)
+for the full rationale.
 
 ---
 
@@ -264,7 +263,8 @@ rationale.
   tudo"). The user commits and pushes everything themselves. Stage/diff/log
   read-only git commands are fine; leave the working tree's changes
   uncommitted and tell the user what's ready for them to commit.
-- Do **not** run `pulumi` locally, ever (no `pulumi up`/`preview`/`destroy`/etc.).
-  Pulumi changes are reviewed as code only — the user applies them themselves
-  from their own environment. `grep`/`find`, and read-only `podman run`/`podman
-  logs`/`podman ps` are always fine to run.
+- Pulumi has been **removed from this project** (`infra/pulumi/` no longer
+  exists) — Helm + KIND is the deploy/test path now. It may come back as its
+  own initiative later; don't reintroduce it without being asked.
+  `grep`/`find`, and read-only `podman run`/`podman logs`/`podman ps` are
+  always fine to run.

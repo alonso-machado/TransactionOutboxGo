@@ -713,48 +713,27 @@ not worth a live collector dependency just for this).
 Two independent GitHub Actions workflows, one per microservice —
 [`ingestion-api.yml`](.github/workflows/ingestion-api.yml) and
 [`consumer-worker.yml`](.github/workflows/consumer-worker.yml) — so a change
-scoped to one service never triggers, gates, or redeploys the other. Both
-follow: **Build → lint (golangci-lint + actionlint + helm lint) → Unit Tests
-→ Upload (ECR, OIDC-authenticated) → Deploy (`pulumi up`)**, with an optional
-flag-gated Integration Tests (TestContainers) job that's a safety measure
-only — it never blocks Upload/Deploy. See
+scoped to one service never triggers or gates the other. Both follow:
+**Build → lint (golangci-lint + actionlint + helm lint) → Unit Tests → Upload
+(ECR, OIDC-authenticated)**, with an optional flag-gated Integration Tests
+(TestContainers) job that's a safety measure only — it never blocks Upload.
+There is no automated deploy job. See
 [`.github/workflows/README.md`](.github/workflows/README.md) for the full
 gate breakdown and why two files instead of one matrixed workflow.
 
-## Deploying to AWS
+## Deploying
 
-[`infra/pulumi/`](infra/pulumi/) provisions the AWS target both CI pipelines
-deploy to: EKS (two node groups, one per microservice, Graviton/arm64),
-ECR, RDS Postgres, Amazon MQ for RabbitMQ, and the KEDA operator — then
-installs the existing [`helmcharts/transaction-outbox`](helmcharts/transaction-outbox/)
-chart onto it, unmodified except for image tags, secrets, and per-service
-node selectors.
-
-**Network/security boundary:** `ingestion-api` is the *only* component
-reachable from the public internet — an internet-facing **ALB** (Phase 4
-Track 1 replaced the Phase 3 NLB; see [Edge protection](#edge-protection-rate-limiting--waf)
-below for why). `consumer-worker` has no Kubernetes Service at all — nothing
-to expose, by construction — and both RDS and Amazon MQ are
-`PubliclyAccessible: false` behind a security group whose only ingress rule
-sources from the EKS node security group, not the VPC CIDR or the internet.
-See `.claude/plan-phase3.md`'s Track 4 "Network & Security Boundary" section
-for the full rationale.
-
-`infra/pulumi/` also installs the **AWS Load Balancer Controller** (provisions
-the ALB from the chart's `Ingress`) and the **Argo Rollouts** controller
-(drives the canary deploys — see [Canary deploys](#canary-deploys) below).
-Both are cluster-wide infrastructure, installed before the app chart so their
-CRDs/webhooks exist when the chart's `Rollout`/`Ingress` resources apply.
-
-```bash
-cd infra/pulumi
-pulumi config set --secret dbPassword <...>
-pulumi config set --secret rabbitmqPassword <...>
-# One-time per AWS account — see albcontroller.go for why this isn't
-# provisioned by Pulumi itself.
-pulumi config set albControllerPolicyArn <policy-arn-from-aws-docs>
-pulumi up --stack dev
-```
+Cloud provisioning previously lived in `infra/pulumi/` (Pulumi/AWS: EKS, RDS,
+Amazon MQ, ECR, KEDA, Argo Rollouts, the AWS Load Balancer Controller); that's
+been removed from this repo. **Helm + KIND is the deploy/test path now** —
+[`infra/kind/`](infra/kind/) brings up a local cluster and
+[`helmcharts/transaction-outbox`](helmcharts/transaction-outbox/) installs the
+app onto it (`make k8s-apply` / `make k8s-template` / `make k8s-lint`). A real
+cloud target (a from-scratch Terraform/Pulumi/eksctl setup, or applying the
+same chart to an existing cluster) may come back as its own initiative later —
+the chart itself already supports the cloud-target values (`externalSecrets`,
+`pgbouncer`, `canary`, node selectors, ALB `Ingress`) described elsewhere in
+this README; they just aren't provisioned by anything in this repo right now.
 
 ---
 
@@ -822,9 +801,9 @@ In cloud, Grafana is internal-only (no public Ingress) — reach it via
 ## Canary deploys
 
 Both services roll out progressively via **Argo Rollouts**
-(`helmcharts/transaction-outbox`'s `canary.enabled` — `true` in the Pulumi
-cloud target, `false` locally where the controller isn't installed, falling
-back to a plain `Deployment`+HPA). The two services use different step
+(`helmcharts/transaction-outbox`'s `canary.enabled` — `true` once Argo
+Rollouts is installed cluster-wide, `false` locally where the controller
+isn't installed, falling back to a plain `Deployment`+HPA). The two services use different step
 shapes — see `.claude/plan-phase4.md` Track 4 for the full rationale:
 
 - **ingestion-api:** lands at **0%** → a human promotes → **5%** → a human

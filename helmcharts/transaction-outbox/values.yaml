@@ -37,9 +37,9 @@ configMap:
     RABBITMQ_MANAGEMENT_URL: "http://rabbitmq:15672"
 
     # ── PCI-DSS encryption-in-transit (Phase 5 Track 5.B) ───────────────────
-    # Cloud (RDS/Amazon MQ) enforces TLS; the Pulumi values override
-    # (infra/pulumi/workloads.go) sets these true/"require" for the cloud
-    # target. Default here matches the plaintext local/compose posture.
+    # Cloud (RDS/Amazon MQ) enforces TLS; a cloud values override sets these
+    # true/"require" for that target. Default here matches the plaintext
+    # local/compose posture.
     DB_SSL_MODE: "disable"
     RABBITMQ_TLS: "false"
 
@@ -70,12 +70,10 @@ secret:
 
 # External Secrets Operator (Phase 5 Track 5.A). False by default — local/
 # compose and any bare cluster without ESO installed keep using the static
-# Secret above (templates/secret.yaml). The cloud target
-# (infra/pulumi/workloads.go, after infra/pulumi/externalsecrets.go installs
-# ESO + its IRSA role) sets this true and supplies region/the two Secrets
-# Manager entry names ESO's ExternalSecret CR (templates/externalsecret.yaml)
-# syncs from — see infra/pulumi/data.go for where those entries are created
-# and populated.
+# Secret above (templates/secret.yaml). A cloud values override sets this
+# true (after installing ESO + its IRSA role separately) and supplies
+# region/the two Secrets Manager entry names ESO's ExternalSecret CR
+# (templates/externalsecret.yaml) syncs from.
 externalSecrets:
   enabled: false
   region: "us-east-1"
@@ -87,16 +85,16 @@ externalSecrets:
 # pgbouncer-exporter sidecar, in front of RDS. Mirrors docker-compose.yml's
 # pgbouncer/pgbouncer-exporter services so local and cloud behave
 # identically. Disabled by default so existing deployments aren't forced
-# into the pooler topology change without an explicit opt-in; the cloud
-# target (infra/pulumi) sets this true.
+# into the pooler topology change without an explicit opt-in; a cloud values
+# override sets this true.
 pgbouncer:
   enabled: false
   replicas: 1
   image: "edoburu/pgbouncer:latest"
   # The real Postgres/RDS endpoint PgBouncer pools connections to — set this
-  # to the RDS instance's endpoint (infra/pulumi/data.go) in the cloud
-  # values override; "postgres" only resolves locally via compose, kept here
-  # purely as a documented default.
+  # to the RDS instance's endpoint in the cloud values override; "postgres"
+  # only resolves locally via compose, kept here purely as a documented
+  # default.
   upstreamHost: "postgres"
   upstreamPort: 5432
   authType: scram-sha-256
@@ -131,7 +129,7 @@ pgbouncer:
 # Argo Rollouts canary (Phase 4 Track 4). Off by default — Argo Rollouts'
 # CRDs/controller don't exist in plain docker-compose or a bare cluster, so
 # with this false the chart renders plain Deployments/HPA exactly as before.
-# The cloud target (infra/pulumi/workloads.go) sets this true via --set.
+# A cloud target sets this true via --set once Argo Rollouts is installed.
 canary:
   enabled: false
   ingestionApi:
@@ -154,9 +152,9 @@ canary:
 
 ingestionApi:
   replicas: 1
-  # Empty by default (schedules on any node) — the cloud target
-  # (infra/pulumi/workloads.go) overrides this to pin ingestion-api pods to
-  # its own dedicated node group, separate from consumer-worker's.
+  # Empty by default (schedules on any node) — a cloud values override can
+  # pin ingestion-api pods to its own dedicated node group, separate from
+  # consumer-worker's.
   nodeSelector: {}
   service:
     type: ClusterIP
@@ -232,9 +230,8 @@ outboxWorker:
     scaleDownStabilizationSeconds: 30
 
 consumerWorker:
-  # Empty by default — the cloud target (infra/pulumi/workloads.go)
-  # overrides this to pin consumer-worker pods to its own dedicated node
-  # group, separate from ingestion-api's.
+  # Empty by default — a cloud values override can pin consumer-worker pods
+  # to its own dedicated node group, separate from ingestion-api's.
   nodeSelector: {}
   resources:
     requests:

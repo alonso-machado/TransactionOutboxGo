@@ -55,35 +55,38 @@ never appears in any downstream artifact).
 
 ## 2. Encryption in transit
 
-| Connection | Local/compose | Cloud (Pulumi) |
+| Connection | Local/compose | Cloud target |
 |---|---|---|
 | App ↔ Postgres/RDS | plaintext (`sslmode=disable`) | `sslmode=require` (`internal/infrastructure/database/database.go`'s `withSSLMode`, driven by `DB_SSL_MODE`) |
 | App ↔ RabbitMQ/Amazon MQ | plaintext (`amqp://`) | `amqps://` (`internal/infrastructure/rabbitmq/rabbitmq.go`'s `withAMQPS`, driven by `RABBITMQ_TLS`) |
-| Client ↔ ingestion-api | plain HTTP locally | HTTPS via the ALB + ACM certificate (Phase 4 Track 1's ALB front door; cert provisioning is operator-managed, not yet Pulumi-automated) |
+| Client ↔ ingestion-api | plain HTTP locally | HTTPS via an ALB + ACM certificate (Phase 4 Track 1's ALB front door; cert provisioning is operator-managed) |
 
 Both `DB_SSL_MODE` and `RABBITMQ_TLS` default to the plaintext local
 posture so `make up`/the demo never breaks; the Helm chart's
 `configMap.data` sets `DB_SSL_MODE: "disable"`/`RABBITMQ_TLS: "false"` as
-its own explicit default too — a cloud values override
-(`infra/pulumi/workloads.go`) is expected to flip both for any real EKS
-deployment, since Amazon MQ requires `amqps://` and RDS should always be
-accessed over TLS for cardholder-adjacent traffic.
+its own explicit default too — a cloud values override is expected to flip
+both for any real deployment, since Amazon MQ requires `amqps://` and RDS
+should always be accessed over TLS for cardholder-adjacent traffic.
 
 ## 3. Encryption at rest
 
-RDS storage is encrypted at rest via a dedicated customer-managed KMS key
-(`infra/pulumi/data.go`'s `dbKMSKey`, `kms.NewKey` with
-`EnableKeyRotation: true`) rather than the default AWS-managed `aws/rds`
+RDS storage should be encrypted at rest via a dedicated customer-managed KMS
+key (with key rotation enabled) rather than the default AWS-managed `aws/rds`
 key — this makes key ownership and rotation explicit and auditable rather
-than implicit. EBS volumes backing the EKS worker nodes inherit the
-cluster's default EKS-managed encryption (not separately configured here).
+than implicit. **Not currently provisioned by anything in this repo** — the
+Pulumi program that used to set this up (`infra/pulumi/`) was removed; the
+Helm chart alone doesn't provision RDS. EBS volumes backing EKS worker nodes
+inherit the cluster's default EKS-managed encryption (not separately
+configured here).
 
 ## 4. Network segmentation & audit
 
-- **Private subnets**: RDS and Amazon MQ are both `PubliclyAccessible:
-  false` (`infra/pulumi/data.go`) and reachable only from the EKS node
-  security group — neither is internet-reachable, let alone reachable from
-  outside the cluster's own worker nodes.
+- **Private subnets**: RDS and Amazon MQ should be `PubliclyAccessible:
+  false` and reachable only from the EKS node security group — neither
+  internet-reachable, let alone reachable from outside the cluster's own
+  worker nodes. **Not currently provisioned by anything in this repo** —
+  this was Pulumi's job (`infra/pulumi/`, now removed); enforcing it is on
+  whatever provisions the cluster/RDS/Amazon MQ next.
 - **Single writer**: `consumer-worker` is the *only* component that writes
   to the `payments` table (Clean Architecture's port-interface boundary
   enforces this structurally — `ingestion-api` never imports
@@ -103,12 +106,13 @@ cluster's default EKS-managed encryption (not separately configured here).
 
 Local/compose uses a static `.env` file and the Helm chart's plaintext
 `templates/secret.yaml` (explicitly marked as a placeholder, never to hold
-real credentials). The cloud target sources `DATABASE_URL`/`RABBITMQ_URL`
+real credentials). A cloud target can source `DATABASE_URL`/`RABBITMQ_URL`
 from **AWS Secrets Manager** via the **External Secrets Operator** (ESO),
-authenticating with **IRSA** — no static AWS credentials live anywhere in
-the cluster (`infra/pulumi/externalsecrets.go`,
-`helmcharts/transaction-outbox/templates/externalsecret.yaml`, gated by
-`externalSecrets.enabled`). ESO's `ExternalSecret` CR re-syncs every 5
+authenticating with **IRSA** — no static AWS credentials would then live
+anywhere in the cluster (`helmcharts/transaction-outbox/templates/
+externalsecret.yaml`, gated by `externalSecrets.enabled`) — but ESO itself
+and its IRSA role must be installed separately; the Pulumi program that used
+to do that (`infra/pulumi/`) was removed. ESO's `ExternalSecret` CR re-syncs every 5
 minutes (`refreshInterval`), so a Secrets Manager-side credential rotation
 propagates to the cluster's `Secret` automatically, though pods must still
 be restarted (or watch the mounted Secret for changes, which this app does

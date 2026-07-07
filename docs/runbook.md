@@ -1,11 +1,20 @@
 # Operational Runbook — Disaster Recovery, Replay & Rebuild
 
-This runbook covers the recovery procedures for the Transaction Outbox
-system: RDS point-in-time restore, dead-letter replay, and rebuilding the
-RabbitMQ broker from scratch. It assumes the Phase 5 Track 5 infra
-(`infra/pulumi/data.go`: KMS-encrypted RDS with automated backups + PITR
-and a cross-region AWS Backup copy) is deployed. See [`SECURITY.md`](../SECURITY.md)
-for the PCI-DSS posture this runbook supports.
+> **Stale, pending update.** This runbook covers RDS point-in-time restore,
+> dead-letter replay, and rebuilding the RabbitMQ broker from scratch. §3/§3b
+> (RDS PITR/cross-region restore) assume the Pulumi-provisioned RDS/KMS/AWS
+> Backup infra described here — **that infra was removed** (`infra/pulumi/`
+> is gone; Helm + KIND is the deploy/test path now), so those two sections
+> are reference material for when cloud provisioning returns, not a
+> currently-runnable procedure. §1/§4/§5 (outbox replay, broker rebuild, DLQ
+> drain) still describe the right *mechanism*, but the exact table/command
+> names below predate the Phase 7 Event Ticket System pivot — see
+> `order_outbox`/`payment_event_outbox` and `cmd/outbox-admin`'s
+> `--outbox`/`--stream`/`--event-type`/`--event-subtype` flags for the
+> current shape.
+
+See [`SECURITY.md`](../SECURITY.md) for the PCI-DSS posture this runbook
+supports.
 
 ---
 

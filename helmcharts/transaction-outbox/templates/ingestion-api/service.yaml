@@ -14,11 +14,10 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  # ClusterIP by default (local/dev). The cloud target (infra/pulumi)
-  # overrides this to LoadBalancer so ingestion-api is the ONLY service
-  # reachable from outside the cluster — consumer-worker, RabbitMQ/Amazon MQ,
-  # and Postgres/RDS stay private (see infra/pulumi/data.go's security
-  # group, which only allows ingress from the EKS node security group).
+  # ClusterIP by default (local/dev). A cloud values override sets this to
+  # LoadBalancer so ingestion-api is the ONLY service reachable from outside
+  # the cluster — consumer-worker, RabbitMQ/Amazon MQ, and Postgres/RDS stay
+  # private (enforced at the cloud network layer, outside this chart).
   # kindLocal.enabled forces NodePort regardless of ingestionApi.service.type
   # — k6 on the Windows host (loadtest/README.md) needs a fixed, scriptable
   # address; kind-cluster-config.yaml maps host 8081 to this same NodePort.
