@@ -1,5 +1,5 @@
 {
-  "title": "infra (RabbitMQ + Postgres/Timescale)",
+  "title": "infra (RabbitMQ + Postgres)",
   "uid": "infra",
   "schemaVersion": 39,
   "version": 1,
@@ -15,11 +15,11 @@
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
-      "description": "A poison spike on one method's DLQ (e.g. payments.cartao_credito.dlq) is isolated from the others — Phase 3's per-method queue split",
+      "description": "A poison spike on one shard's DLQ (e.g. events.concert.rock.dlq) is isolated from the others — one queue + DLQ per (stream, event_type, event_subtype)",
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "rabbitmq_queue_messages{queue=~\"payments\\\\..*\"}",
+          "expr": "rabbitmq_queue_messages{queue=~\"(events|payments)\\\\..*\"}",
           "legendFormat": "{{queue}}"
         }
       ]
@@ -33,17 +33,17 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(rate(rabbitmq_queue_messages_published_total{queue=~\"payments\\\\..*\"}[1m]))",
+          "expr": "sum(rate(rabbitmq_queue_messages_published_total{queue=~\"(events|payments)\\\\..*\"}[1m]))",
           "legendFormat": "publish/s"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(rate(rabbitmq_queue_messages_delivered_total{queue=~\"payments\\\\..*\"}[1m]))",
+          "expr": "sum(rate(rabbitmq_queue_messages_delivered_total{queue=~\"(events|payments)\\\\..*\"}[1m]))",
           "legendFormat": "deliver/s"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(rate(rabbitmq_queue_messages_acked_total{queue=~\"payments\\\\..*\"}[1m]))",
+          "expr": "sum(rate(rabbitmq_queue_messages_acked_total{queue=~\"(events|payments)\\\\..*\"}[1m]))",
           "legendFormat": "ack/s"
         }
       ]
@@ -57,12 +57,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "rabbitmq_queue_messages_unacked{queue=~\"payments\\\\..*\"}",
+          "expr": "rabbitmq_queue_messages_unacked{queue=~\"(events|payments)\\\\..*\"}",
           "legendFormat": "unacked {{queue}}"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "rabbitmq_queue_consumers{queue=~\"payments\\\\..*\"}",
+          "expr": "rabbitmq_queue_consumers{queue=~\"(events|payments)\\\\..*\"}",
           "legendFormat": "consumers {{queue}}"
         }
       ]
@@ -159,26 +159,11 @@
       ]
     },
     {
-      "id": 8,
-      "title": "TimescaleDB — chunks per hypertable (Phase 4 Track 2, once enabled)",
-      "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 40 },
-      "description": "Populated once Track 2's per-method hypertables + the postgres-exporter custom query (observability/postgres-exporter/queries.yaml) are enabled. Empty until then.",
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "timescaledb_chunks_total_chunks",
-          "legendFormat": "{{hypertable_name}}"
-        }
-      ]
-    },
-    {
       "id": 9,
       "title": "PgBouncer — clients waiting for a connection",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 48 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 40 },
       "description": "The headline tile (Phase 5 Track 4.D) — non-zero means the pool is too small for the current KEDA fan-out. Pairs with the PgBouncerClientsWaiting alert (observability/prometheus/rules/alerts.yml).",
       "targets": [
         {
@@ -193,7 +178,7 @@
       "title": "PgBouncer — max client wait time",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
       "description": "How long the unluckiest queued client waited (maxwait) — pairs with the waiting-clients panel above.",
       "targets": [
         {
@@ -208,7 +193,7 @@
       "title": "PgBouncer — server connections (active / idle / used)",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
       "description": "Actual upstream Postgres connections PgBouncer is holding open — shows the multiplexing win (many clients -> few server conns).",
       "targets": [
         {
@@ -233,8 +218,8 @@
       "title": "PgBouncer — client connections (active)",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 64 },
-      "description": "Inbound load from ingestion-api + the 5xN consumer-worker replicas.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
+      "description": "Inbound load from ingestion-api + the order-/fulfillment-consumer-worker replicas.",
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -248,7 +233,7 @@
       "title": "PgBouncer — pooling efficiency (client-active ÷ server-active)",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 64 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
       "description": "The collapse ratio PgBouncer buys — the justification panel for running a pooler at all. Higher is better multiplexing.",
       "targets": [
         {
@@ -263,7 +248,7 @@
       "title": "PgBouncer — avg query / wait time",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 72 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 64 },
       "description": "Latency added by pooling itself — should stay near zero unless the pool is saturated.",
       "targets": [
         {

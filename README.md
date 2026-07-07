@@ -697,16 +697,19 @@ make coverage-all   # runs test-unit + test-integration, merges the two
                      # merged-coverage.html
 ```
 
-Measured 2026-07-07 against real Postgres 18 + RabbitMQ 4.3 testcontainers
+Measured against real Postgres 18 + RabbitMQ 4.3 testcontainers
 (`go test -tags=integration -race`, all tests passing, weighted by
-statement count, not a naive average of per-function percentages):
+statement count, not a naive average of per-function percentages). **Every
+`internal/usecase/*` subpackage is required to individually clear 75%**
 
 | Package | Coverage |
 |---|---|
+| `usecase/outbox` | 86.6% |
 | `usecase/checkout` | 84.1% |
-| `adapter/persistence` | 80.0% |
-| `usecase/fulfillment` | 67.2% |
-| `usecase/outbox` | 67.2% |
+| `usecase/order` | 81.8% |
+| `usecase/fulfillment` | 79.7% |
+| `usecase/webhook` | 76.5% |
+| `adapter/persistence` | 85.4% |
 | `adapter/messaging` | 66.0% |
 
 A unit-only number understates real coverage here on purpose:

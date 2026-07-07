@@ -58,13 +58,15 @@ confirms or fails it. Adapters: `stripe` (real, `stripe-go` v82), `fake`
 gateway's own metadata (e.g. a Stripe Checkout Session's metadata) so that
 `ingestion-api` never has to read the `events` database to route a webhook.
 
-Full design (Phase 1 — core system): [`.claude/plan.md`](.claude/plan.md)
-Phase 2 plan (OTel · Swagger · TestContainers · K8s+KEDA): [`.claude/plan-phase2.md`](.claude/plan-phase2.md)
-Phase 3 plan (per-method queues · card payments · CI/CD · Pulumi/AWS · k6): [`.claude/plan-phase3.md`](.claude/plan-phase3.md)
-Phase 4 plan (leaky-bucket rate limiter · canary deploys · Grafana · TimescaleDB): [`.claude/plan-phase4.md`](.claude/plan-phase4.md)
-Phase 5 plan (versioned migrations · retry backoff · DLQ replay · LISTEN/NOTIFY · connection pooling · Loki/Tempo/alerting · External Secrets · PCI/DR): [`.claude/plan-phase5.md`](.claude/plan-phase5.md)
+Phases 1–5's plan docs (`.claude/plan.md`, `plan-phase2.md` through
+`plan-phase5.md` — core system · OTel/Swagger/TestContainers/K8s+KEDA ·
+per-method queues/card payments/CI/CD/Pulumi/k6 · rate limiter/canary/Grafana/
+TimescaleDB · versioned migrations/retry backoff/DLQ replay/LISTEN-NOTIFY/
+connection pooling/Loki-Tempo/alerting/External Secrets/PCI-DR) are **no
+longer in the repo** — removed along with the payments domain they described;
+git history is the only remaining record of them.
 Phase 6 plan — **superseded, absorbed into Phase 7** (its ticket-relay/QR ideas live on inside the pivot below): [`.claude/plan-phase6.md`](.claude/plan-phase6.md)
-Phase 7 plan — **the current architecture**: pivot from the payments domain to this Event Ticket System (two outboxes, `event_type`/`event_subtype` routing, `PaymentGateway` port, Pulumi removed in favor of Helm+KIND): [`.claude/plan-phase7-tickets-pivot.md`](.claude/plan-phase7-tickets-pivot.md)
+Phase 7 plan — **the current architecture, fully implemented**: pivot from the payments domain to this Event Ticket System (two outboxes, `event_type`/`event_subtype` routing, `PaymentGateway` port, Pulumi removed in favor of Helm+KIND): [`.claude/plan-phase7-tickets-pivot.md`](.claude/plan-phase7-tickets-pivot.md)
 User-facing docs: [`README.md`](README.md)
 
 ---

@@ -1,16 +1,16 @@
 {
     "swagger": "2.0",
     "info": {
-        "description": "Accepts payment-provider webhook-shaped events and durably stores them in the\ntransactional outbox for asynchronous relay to RabbitMQ.",
-        "title": "Transaction Outbox — Ingestion API",
+        "description": "Accepts ticket orders and payment-gateway webhook confirmations, durably storing\nboth in the transactional outbox for asynchronous relay to RabbitMQ.",
+        "title": "Transaction Outbox — Event Ticket System Ingestion API",
         "contact": {},
         "version": "1.0"
     },
     "basePath": "/",
     "paths": {
-        "/api/v1/payments": {
+        "/api/v1/orders": {
             "post": {
-                "description": "Accepts a payment-provider webhook-shaped event (PIX, BOLETO, TRANSFER, or any other method)\nand durably stores it in the outbox for asynchronous relay to RabbitMQ. Idempotent on the\nderived idempotency key (provider.name + eventId + optional Idempotency-Key header).",
+                "description": "Accepts a request for tickets to an Event, durably stores it in the order outbox\nfor asynchronous relay to RabbitMQ (routed by eventType/eventSubtype). Idempotent on\nthe derived idempotency key (sourceOrderId + optional Idempotency-Key header).",
                 "consumes": [
                     "application/json"
                 ],
@@ -18,9 +18,9 @@
                     "application/json"
                 ],
                 "tags": [
-                    "payments"
+                    "orders"
                 ],
-                "summary": "Ingest a payment event",
+                "summary": "Place a ticket order",
                 "parameters": [
                     {
                         "type": "string",
@@ -29,12 +29,12 @@
                         "in": "header"
                     },
                     {
-                        "description": "Payment event payload",
-                        "name": "payment",
+                        "description": "Ticket order payload",
+                        "name": "order",
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "$ref": "#/definitions/internal_adapter_http.PaymentRequest"
+                            "$ref": "#/definitions/internal_adapter_http.OrderRequestDTO"
                         }
                     }
                 ],
@@ -42,27 +42,33 @@
                     "201": {
                         "description": "Created",
                         "schema": {
-                            "$ref": "#/definitions/internal_adapter_http.PaymentResponse"
+                            "$ref": "#/definitions/internal_adapter_http.OrderResponseDTO"
                         }
                     },
                     "400": {
                         "description": "Bad Request",
                         "schema": {
-                            "$ref": "#/definitions/internal_adapter_http.ErrorResponse"
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
-                            "$ref": "#/definitions/internal_adapter_http.ErrorResponse"
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     }
                 }
             }
         },
-        "/api/v1/payments/{id}": {
-            "put": {
-                "description": "Accepts a payment-provider webhook-shaped event (PIX, BOLETO, TRANSFER, or any other method)\nand durably stores it in the outbox for asynchronous relay to RabbitMQ. Idempotent on the\nderived idempotency key (provider.name + eventId + optional Idempotency-Key header).",
+        "/api/v1/webhooks/payments/{provider}": {
+            "post": {
+                "description": "Verifies the gateway's signature and lands the confirmation in payment_event_outbox\nfor asynchronous relay to fulfillment-consumer-worker. Idempotent on the gateway's own event id.",
                 "consumes": [
                     "application/json"
                 ],
@@ -70,105 +76,53 @@
                     "application/json"
                 ],
                 "tags": [
-                    "payments"
+                    "webhooks"
                 ],
-                "summary": "Ingest a payment event",
+                "summary": "Receive a payment-gateway webhook",
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "Optional client-supplied idempotency key",
-                        "name": "Idempotency-Key",
-                        "in": "header"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Payment ID (PUT/PATCH only)",
-                        "name": "id",
-                        "in": "path"
-                    },
-                    {
-                        "description": "Payment event payload",
-                        "name": "payment",
-                        "in": "body",
-                        "required": true,
-                        "schema": {
-                            "$ref": "#/definitions/internal_adapter_http.PaymentRequest"
-                        }
+                        "description": "Configured gateway provider name (e.g. stripe, fake)",
+                        "name": "provider",
+                        "in": "path",
+                        "required": true
                     }
                 ],
                 "responses": {
-                    "201": {
-                        "description": "Created",
+                    "200": {
+                        "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/internal_adapter_http.PaymentResponse"
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     },
                     "400": {
                         "description": "Bad Request",
                         "schema": {
-                            "$ref": "#/definitions/internal_adapter_http.ErrorResponse"
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
-                            "$ref": "#/definitions/internal_adapter_http.ErrorResponse"
-                        }
-                    }
-                }
-            },
-            "patch": {
-                "description": "Accepts a payment-provider webhook-shaped event (PIX, BOLETO, TRANSFER, or any other method)\nand durably stores it in the outbox for asynchronous relay to RabbitMQ. Idempotent on the\nderived idempotency key (provider.name + eventId + optional Idempotency-Key header).",
-                "consumes": [
-                    "application/json"
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "payments"
-                ],
-                "summary": "Ingest a payment event",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Optional client-supplied idempotency key",
-                        "name": "Idempotency-Key",
-                        "in": "header"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Payment ID (PUT/PATCH only)",
-                        "name": "id",
-                        "in": "path"
-                    },
-                    {
-                        "description": "Payment event payload",
-                        "name": "payment",
-                        "in": "body",
-                        "required": true,
-                        "schema": {
-                            "$ref": "#/definitions/internal_adapter_http.PaymentRequest"
-                        }
-                    }
-                ],
-                "responses": {
-                    "201": {
-                        "description": "Created",
-                        "schema": {
-                            "$ref": "#/definitions/internal_adapter_http.PaymentResponse"
-                        }
-                    },
-                    "400": {
-                        "description": "Bad Request",
-                        "schema": {
-                            "$ref": "#/definitions/internal_adapter_http.ErrorResponse"
-                        }
-                    },
-                    "500": {
-                        "description": "Internal Server Error",
-                        "schema": {
-                            "$ref": "#/definitions/internal_adapter_http.ErrorResponse"
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     }
                 }
@@ -198,65 +152,59 @@
         }
     },
     "definitions": {
-        "internal_adapter_http.ErrorResponse": {
+        "internal_adapter_http.CustomerDTO": {
             "type": "object",
             "properties": {
-                "detail": {
+                "document": {
                     "type": "string"
                 },
-                "error": {
+                "email": {
+                    "type": "string"
+                },
+                "name": {
                     "type": "string"
                 }
             }
         },
-        "internal_adapter_http.PaymentDataDTO": {
+        "internal_adapter_http.OrderRequestDTO": {
             "type": "object",
             "properties": {
-                "amount": {
-                    "type": "number"
+                "customer": {
+                    "$ref": "#/definitions/internal_adapter_http.CustomerDTO"
                 },
-                "currency": {
-                    "type": "string"
-                },
-                "method": {
-                    "type": "string"
-                },
-                "payerId": {
-                    "type": "string"
-                },
-                "paymentId": {
-                    "type": "string"
-                },
-                "recipientId": {
-                    "type": "string"
-                }
-            }
-        },
-        "internal_adapter_http.PaymentRequest": {
-            "description": "Inbound payment event. Mirrors a payment-provider webhook: a generic envelope (eventId, provider, payment, occurredAt) plus a method-specific sibling object (e.g. \"pix\" or \"boleto\") named after payment.method lowercased.",
-            "type": "object",
-            "properties": {
                 "eventId": {
                     "type": "string"
                 },
-                "occurredAt": {
+                "eventName": {
                     "type": "string"
                 },
-                "payment": {
-                    "$ref": "#/definitions/internal_adapter_http.PaymentDataDTO"
+                "eventSubtype": {
+                    "type": "string"
                 },
-                "provider": {
-                    "$ref": "#/definitions/internal_adapter_http.ProviderDTO"
+                "eventType": {
+                    "type": "string"
+                },
+                "sourceOrderId": {
+                    "type": "string"
+                },
+                "tickets": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/internal_adapter_http.TicketItemDTO"
+                    }
+                },
+                "venue": {
+                    "$ref": "#/definitions/internal_adapter_http.VenueDTO"
                 }
             }
         },
-        "internal_adapter_http.PaymentResponse": {
+        "internal_adapter_http.OrderResponseDTO": {
             "type": "object",
             "properties": {
                 "idempotencyKey": {
                     "type": "string"
                 },
-                "paymentId": {
+                "orderId": {
                     "type": "string"
                 },
                 "status": {
@@ -265,13 +213,39 @@
                 }
             }
         },
-        "internal_adapter_http.ProviderDTO": {
+        "internal_adapter_http.TicketItemDTO": {
             "type": "object",
             "properties": {
-                "name": {
+                "currency": {
                     "type": "string"
                 },
-                "providerPaymentId": {
+                "id": {
+                    "type": "string"
+                },
+                "price": {
+                    "type": "number"
+                },
+                "row": {
+                    "type": "string"
+                },
+                "seat": {
+                    "type": "string"
+                },
+                "section": {
+                    "type": "string"
+                }
+            }
+        },
+        "internal_adapter_http.VenueDTO": {
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "name": {
                     "type": "string"
                 }
             }

@@ -50,3 +50,5 @@ coverage.out
 loadtest/summary-baseline.json
 loadtest/summary-consumer.json
 loadtest/summary-autoscale.json
+
+NUL

@@ -1,0 +1,153 @@
+{
+  "title": "order/fulfillment-consumer-worker",
+  "uid": "consumer-workers",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["transaction-outbox", "order-consumer-worker", "fulfillment-consumer-worker"],
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s",
+  "templating": {
+    "list": [
+      {
+        "name": "event_type",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(consumer_messages_processed_total, event_type)",
+        "current": { "text": "All", "value": "$__all" },
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "event_subtype",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(consumer_messages_processed_total{event_type=~\"$event_type\"}, event_subtype)",
+        "current": { "text": "All", "value": "$__all" },
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Throughput by shard / outcome",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "description": "One counter (consumer.messages_processed_total) shared by order-consumer-worker and fulfillment-consumer-worker (both use AMQPConsumer) — the queue label's events.*/payments.* prefix tells them apart if needed; legend groups by (event_type, event_subtype, outcome) instead since that's what a shard's on-call cares about.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (event_type, event_subtype, outcome) (rate(consumer_messages_processed_total{event_type=~\"$event_type\", event_subtype=~\"$event_subtype\"}[1m]))",
+          "legendFormat": "{{event_type}}/{{event_subtype}} / {{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Retry attempts rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (event_type, event_subtype) (rate(consumer_retry_attempts_total{event_type=~\"$event_type\", event_subtype=~\"$event_subtype\"}[1m]))",
+          "legendFormat": "{{event_type}}/{{event_subtype}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Retry depth (by retry_count)",
+      "type": "heatmap",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (retry_count) (rate(consumer_retry_attempts_total{event_type=~\"$event_type\", event_subtype=~\"$event_subtype\"}[5m]))",
+          "legendFormat": "retry_count={{retry_count}}",
+          "format": "heatmap"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Poison / DLQ rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "description": "consumer_messages_processed_total{outcome=\"poison_dlq\"} — MAX_DELIVERIES exhausted on a genuine processing error; terminal, never auto-retried again. Non-zero here is an incident — see make replay-dead/drain-dlq.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (event_type, event_subtype) (rate(consumer_messages_processed_total{event_type=~\"$event_type\", event_subtype=~\"$event_subtype\", outcome=\"poison_dlq\"}[1m]))",
+          "legendFormat": "{{event_type}}/{{event_subtype}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Duplicate (redelivery dedup) rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "description": "consumer_messages_processed_total{outcome=\"duplicate\"} — a redelivered message that was already persisted (a UNIQUE constraint or a terminal-status check absorbed it as a no-op); Ack'd immediately, never retried or DLQ'd (see README's Consumer outcome taxonomy). Non-zero is informational, not necessarily an incident — but a sustained climb can mean a consumer is crash-looping before Ack.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (event_type, event_subtype) (rate(consumer_messages_processed_total{event_type=~\"$event_type\", event_subtype=~\"$event_subtype\", outcome=\"duplicate\"}[1m]))",
+          "legendFormat": "{{event_type}}/{{event_subtype}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Queue backlog (ready messages, per shard)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "description": "Cross-referenced from the RabbitMQ exporter — queue depth per events.<type>.<subtype>.queue (order-consumer-worker) and payments.<type>.<subtype>.queue (fulfillment-consumer-worker).",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rabbitmq_queue_messages_ready{queue=~\"(events|payments)\\\\..*\\\\.queue\"}",
+          "legendFormat": "{{queue}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Consumer instances up, per shard",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "description": "Static 1/shard per role in compose (see prometheus.yml's order-consumer-worker/fulfillment-consumer-worker jobs); in cloud this tracks KEDA-driven pod count per Rollout/Deployment.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (service, event_type, event_subtype) (up{job=~\"order-consumer-worker|fulfillment-consumer-worker\"})",
+          "legendFormat": "{{service}} {{event_type}}/{{event_subtype}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Unknown schema version rate, per shard",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 },
+      "description": "consumer_messages_processed_total{outcome=\"unknown_schema_version\"} — pairs with the ticket-severity UnknownSchemaVersion alert (observability/prometheus/rules/alerts.yml). Isolated in its own panel (rather than read off panel 1's per-outcome breakdown) since a nonzero rate here specifically means a producer/consumer version skew during a rollout, not ordinary backlog/poison behavior.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (event_type, event_subtype) (rate(consumer_messages_processed_total{event_type=~\"$event_type\", event_subtype=~\"$event_subtype\", outcome=\"unknown_schema_version\"}[5m]))",
+          "legendFormat": "{{event_type}}/{{event_subtype}}"
+        }
+      ]
+    }
+  ]
+}

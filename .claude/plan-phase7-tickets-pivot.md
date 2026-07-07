@@ -1,7 +1,10 @@
 # Plan — Phase 7: Domain pivot to a Tickets-for-Events platform
 
-> **Phase 7 — planned, not yet implemented.** This is the approved plan to pick
-> up in a new session. It is a **domain pivot, not an increment**: the payments
+> **Phase 7 — fully implemented (as of 2026-07-06; coverage rule added
+> 2026-07-07, Part G).** This is the plan that was executed to pivot the
+> system; kept as the historical record of the decisions made and the order
+> they shipped in, not a forward-looking TODO list anymore. It is a **domain
+> pivot, not an increment**: the payments
 > webhook domain is removed and the system is rebuilt around **events & ticket
 > orders**, with payment demoted to an **outbound port/adapter** to a real
 > gateway. Four design decisions already made with the user:
@@ -95,7 +98,7 @@ Four service binaries (+ the `outbox-admin` CLI): `ingestion-api`,
 
 ---
 
-## Part A — Domain & DB rebuild (`events` DB, partitioned by type/subtype)
+## Part A — Domain & DB rebuild (`events` DB, sharded by type/subtype)
 
 ### A1. Domain entities & ports (`internal/domain/`)
 Plain Go structs, **zero framework imports** (dependency rule):
@@ -128,9 +131,23 @@ Plain Go structs, **zero framework imports** (dependency rule):
 - PgBouncer wildcard `[databases]` already pools the new DB; each process keeps
   a single `DATABASE_URL` (events DB for order-consumer-worker + fulfillment-consumer-worker).
 
-### A3. Partition the domain **by `event_type` × `event_subtype`**
-Per the routing decision, the hot tables are **Postgres declaratively
-list-partitioned**:
+### A3. Partition the domain **by `event_type` × `event_subtype`** — superseded by the index-only fallback below (see outcome note)
+
+**Outcome (2026-07): the index-only fallback was implemented, not
+declarative partitioning.** `migrations/events/000001_init.up.sql` ships
+plain `orders`/`tickets` tables with a `(event_type, event_subtype)` btree
+index, not `PARTITION BY LIST`. Rationale: this is a demo-scale system with
+no per-genre vacuum/retention pressure yet to justify the operational cost
+of a `CREATE … PARTITION` migration per new `(type, subtype)` pair; the
+index gets the same query shape (any lookup/scan filtered on the pair still
+hits one index) with zero migration ceremony when the registry grows. This
+is documented at the top of the migration file itself and in `CLAUDE.md`.
+Revisit partitioning if per-genre vacuum/retention independence becomes a
+real operational need — the section below is kept as the design that would
+require reversing this choice, not a currently-open TODO.
+
+Per the routing decision, the hot tables were considered for **Postgres
+declaratively list-partitioning**:
 - `orders` and `tickets` `PARTITION BY LIST (event_type)`, each type
   sub-partitioned `BY LIST (event_subtype)` (or a composite `event_type ||
   '/' || event_subtype` list partition if we prefer one level). `events` may
@@ -401,8 +418,9 @@ manual-ack consumer pattern.
 
 1. `make build`, `make lint` (0 issues), `make test` (`-race`).
 2. **Migrations**: fresh `make migrate` creates `outbox` (`order_outbox` +
-   `payment_event_outbox`) and `events` (six tables, partitioned by
-   `event_type`/`event_subtype`); `payments` DB is gone.
+   `payment_event_outbox`) and `events` (six tables, indexed — not
+   partitioned, see A3's outcome note — on `event_type`/`event_subtype`);
+   `payments` DB is gone.
 3. **End-to-end (`make up`, `PAYMENT_PROVIDER=fake`)**: `POST /api/v1/orders`
    for `CONCERT`/`ROCK` → `order_outbox` NEW → `outbox-worker` PUBLISHED →
    `events.concert.rock.queue` → `order-consumer-worker` reserves tickets + Charge
@@ -424,7 +442,7 @@ manual-ack consumer pattern.
 
 - **Routing = event category & genre** (`event_type` × `event_subtype`),
   replacing per-payment-method routing everywhere: queues, DLQs, retry queues,
-  and the partitioned domain tables.
+  and the indexed (not partitioned — see A3's outcome note) domain tables.
 - **Payment = outbound charge + inbound webhook**; **Stripe real**, `fake`
   sandbox for local/tests/k6, `abacatepay`/`lemonsqueezy` stubbed.
 - **Payments domain fully replaced**; DBs become `outbox` + `events`. **This
@@ -433,10 +451,13 @@ manual-ack consumer pattern.
 - **Two outboxes** (`order_outbox`, `payment_event_outbox`) keep ingestion-api
   broker-independent on both the write and webhook paths; the relay is
   generalized over a table + routing-key function.
-- **DB partitioning by type/subtype** makes "the database too" literally sharded;
-  the trade-off is a `CREATE PARTITION` migration per new `(type, subtype)`. The
-  index-only fallback (no partitions) is available if we want zero-migration
-  extensibility.
+- **DB sharding by type/subtype: index-only fallback chosen, not
+  partitioning** (see A3's outcome note) — a `(type, subtype)` btree index
+  makes "the database too" logically sharded without the `CREATE PARTITION`
+  migration a real declarative-partitioning design would need per new
+  `(type, subtype)` pair. Zero-migration extensibility won out over
+  per-genre vacuum/retention independence at this system's current scale;
+  revisit if that changes.
 - **Four service binaries** (`ingestion-api`, `outbox-worker`, `order-consumer-worker`,
   `fulfillment-consumer-worker`) + `outbox-admin`. `order-consumer-worker` and
   `fulfillment-consumer-worker` could be one binary dispatching on message type; kept

@@ -21,7 +21,7 @@ groups:
           severity: ticket
         annotations:
           summary: "Outbox pending count has been rising for 5+ minutes"
-          description: "outbox.pending_count has had a positive derivative for at least 5 minutes — the dispatcher is falling behind RabbitMQ/DB pressure. Check consumer-worker health and outbox dispatch logs (service=ingestion-api)."
+          description: "outbox.pending_count has had a positive derivative for at least 5 minutes — the dispatcher is falling behind RabbitMQ/DB pressure. Check order-consumer-worker/fulfillment-consumer-worker health and outbox-worker's dispatch logs (service=outbox-worker)."
 
       # internal/usecase/outbox/dispatch.go: meter.Int64Gauge("outbox.dead_letter_count")
       # (added by Phase 5 Track 2.B) -> Prometheus exporter name
@@ -40,15 +40,17 @@ groups:
       # rabbitmq_queue_messages is the rabbitmq_prometheus plugin's own
       # metric (already scraped — observability/prometheus/prometheus.yml's
       # "rabbitmq" job), same metric the infra.json dashboard's panel 1 uses,
-      # filtered to *.dlq queues (declared per-method —
-      # internal/infrastructure/rabbitmq).
+      # filtered to *.dlq queues (declared per (stream, event_type,
+      # event_subtype) shard — internal/infrastructure/rabbitmq). Both
+      # streams' DLQs match: "events.<type>.<subtype>.dlq" (order-consumer-worker)
+      # and "payments.<type>.<subtype>.dlq" (fulfillment-consumer-worker).
       - alert: RabbitMQDLQDepth
-        expr: rabbitmq_queue_messages{queue=~"payments\\..*\\.dlq"} > 0
+        expr: rabbitmq_queue_messages{queue=~"(events|payments)\\..*\\.dlq"} > 0
         for: 1m
         labels:
           severity: page
         annotations:
-          summary: "A payments DLQ has messages ({{ $labels.queue }})"
+          summary: "A shard DLQ has messages ({{ $labels.queue }})"
           description: "{{ $labels.queue }} has {{ $value }} message(s) — these were rejected after MAX_DELIVERIES attempts (internal/adapter/messaging/consumer.go's poison_dlq path) and need manual replay (see cmd/outbox-admin's drain-dlq command) or inspection."
 
   - name: transaction-outbox.ingest-slo
@@ -92,29 +94,34 @@ groups:
   - name: transaction-outbox.consumer
     rules:
       # internal/adapter/messaging/consumer.go: meter.Int64Counter("consumer.messages_processed_total")
-      # with attribute "outcome" = "poison_dlq" | "retry_scheduled" | "ack",
-      # plus "payment_method"/"payment_queue"/"routing_key" — exported as
-      # consumer_messages_processed_total{outcome="poison_dlq", ...}.
+      # with attribute "outcome" = "ack" | "duplicate" | "retry_scheduled" |
+      # "poison_dlq" | "unknown_schema_version", plus "event_type"/
+      # "event_subtype"/"queue"/"routing_key" — exported as
+      # consumer_messages_processed_total{outcome="poison_dlq", ...}. One
+      # counter serves both order-consumer-worker and
+      # fulfillment-consumer-worker (they share AMQPConsumer), so these two
+      # alerts fire for either, distinguished by event_type/event_subtype.
       - alert: ConsumerPoisonRate
-        expr: sum(rate(consumer_messages_processed_total{outcome="poison_dlq"}[5m])) by (payment_method) > 0
+        expr: sum(rate(consumer_messages_processed_total{outcome="poison_dlq"}[5m])) by (event_type, event_subtype) > 0
         for: 2m
         labels:
           severity: page
         annotations:
-          summary: "Consumer is poison-dead-lettering messages ({{ $labels.payment_method }})"
-          description: "consumer.messages_processed_total{outcome=\"poison_dlq\"} rate > 0 for payment_method={{ $labels.payment_method }} over the last 5m — messages are exhausting MAX_DELIVERIES and landing in the DLQ. Pairs with RabbitMQDLQDepth."
+          summary: "Consumer is poison-dead-lettering messages ({{ $labels.event_type }}/{{ $labels.event_subtype }})"
+          description: "consumer.messages_processed_total{outcome=\"poison_dlq\"} rate > 0 for event_type={{ $labels.event_type }}, event_subtype={{ $labels.event_subtype }} over the last 5m — messages are exhausting MAX_DELIVERIES and landing in the DLQ. Pairs with RabbitMQDLQDepth."
 
-      # internal/usecase/consume/process.go: meter.Int64Counter("consumer.unknown_schema_version_total")
-      # (added by Phase 5 Track 2.D) -> Prometheus exporter name
-      # "consumer_unknown_schema_version_total".
+      # Same counter as above, filtered to the "unknown_schema_version"
+      # outcome — a message's envelope schemaVersion wasn't recognized by
+      # this consumer build (rejected to the DLQ on the first attempt,
+      # never retried — see internal/domain.ErrUnknownSchemaVersion).
       - alert: UnknownSchemaVersion
-        expr: consumer_unknown_schema_version_total > 0
+        expr: sum(rate(consumer_messages_processed_total{outcome="unknown_schema_version"}[5m])) by (event_type, event_subtype) > 0
         for: 1m
         labels:
           severity: ticket
         annotations:
-          summary: "Consumer received a message with an unknown schema version"
-          description: "consumer.unknown_schema_version_total > 0 — a message's envelope schemaVersion wasn't recognized by this consumer build. Check for a producer/consumer version skew during a rollout."
+          summary: "Consumer received a message with an unknown schema version ({{ $labels.event_type }}/{{ $labels.event_subtype }})"
+          description: "consumer.messages_processed_total{outcome=\"unknown_schema_version\"} rate > 0 for event_type={{ $labels.event_type }}, event_subtype={{ $labels.event_subtype }} — check for a producer/consumer version skew during a rollout."
 
   - name: transaction-outbox.ratelimit
     rules:

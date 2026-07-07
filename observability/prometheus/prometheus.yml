@@ -18,22 +18,35 @@ scrape_configs:
         labels:
           service: ingestion-api
 
-  # One target per per-method consumer-worker (Phase 3 Track 1) — each binds
-  # to a fixed metrics port (see docker-compose.yml). The "method" label lets
-  # the consumer-worker dashboard's $method template variable isolate one
-  # payment method's throughput/retry/poison rate from the others.
-  - job_name: consumer-worker
+  # The Transactional Outbox relay — its own process, running both
+  # DispatchOutbox loops (order_outbox + payment_event_outbox) on one shared
+  # metrics port (see docker-compose.yml's outbox-worker service).
+  - job_name: outbox-worker
     static_configs:
-      - targets: ["consumer-pix:9091"]
-        labels: { service: consumer-worker, method: PIX }
-      - targets: ["consumer-boleto:9092"]
-        labels: { service: consumer-worker, method: BOLETO }
-      - targets: ["consumer-transfer:9093"]
-        labels: { service: consumer-worker, method: TRANSFER }
-      - targets: ["consumer-cartao-credito:9094"]
-        labels: { service: consumer-worker, method: CARTAO_CREDITO }
-      - targets: ["consumer-cartao-debito:9095"]
-        labels: { service: consumer-worker, method: CARTAO_DEBITO }
+      - targets: ["outbox-worker:9098"]
+        labels:
+          service: outbox-worker
+
+  # One target per (event_type, event_subtype) shard's order-consumer-worker
+  # instance — each binds to a fixed metrics port (see docker-compose.yml).
+  # The event_type/event_subtype labels let the order-consumer-worker
+  # dashboard's $event_type/$event_subtype template variables isolate one
+  # shard's throughput/retry/poison rate from the others.
+  - job_name: order-consumer-worker
+    static_configs:
+      - targets: ["order-consumer-worker-concert-rock:9091"]
+        labels: { service: order-consumer-worker, event_type: CONCERT, event_subtype: ROCK }
+      - targets: ["order-consumer-worker-sports-football:9092"]
+        labels: { service: order-consumer-worker, event_type: SPORTS, event_subtype: FOOTBALL }
+
+  # Same shape as order-consumer-worker above, for the fulfillment side
+  # (payment_event_outbox consumers).
+  - job_name: fulfillment-consumer-worker
+    static_configs:
+      - targets: ["fulfillment-consumer-worker-concert-rock:9093"]
+        labels: { service: fulfillment-consumer-worker, event_type: CONCERT, event_subtype: ROCK }
+      - targets: ["fulfillment-consumer-worker-sports-football:9094"]
+        labels: { service: fulfillment-consumer-worker, event_type: SPORTS, event_subtype: FOOTBALL }
 
   # RabbitMQ's built-in Prometheus plugin (rabbitmq_prometheus) — enabled via
   # the rabbitmq service's command override in docker-compose.yml.
