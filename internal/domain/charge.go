@@ -43,6 +43,12 @@ type ChargeRepository interface {
 	// confirmation (which only carries the gateway's own reference) back to
 	// the Order it belongs to.
 	FindByProviderRef(ctx context.Context, providerRef string) (*Charge, error)
+	// FindByOrderID is how tickets-api's GET /orders/{id} resolves an
+	// order's CheckoutURL — order_id is uniqueIndex (one charge per order),
+	// so this is a single-row lookup. A not-found result is the normal case
+	// while the client is still polling right after 201Created, before
+	// order-consumer-worker has created the Charge yet.
+	FindByOrderID(ctx context.Context, orderID uuid.UUID) (*Charge, error)
 	// UpdateStatus is idempotent in effect: applying PAID/FAILED to an
 	// already-terminal charge is a safe no-op at the use-case layer (see
 	// usecase/fulfillment), not enforced by the repository itself.

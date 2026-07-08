@@ -72,6 +72,11 @@ jobs:
       # Rollout/ScaledObject-retargeted instead of Deployment). The
       # default-values lint above only ever exercises canary.enabled=false.
       - run: helm lint helmcharts/transaction-outbox --set canary.enabled=true
+      # Go vulnerability scan (Phase 8, closing Phase 7's Part F) — checks
+      # go.sum's dependency tree against the official Go vulnerability
+      # database for CVEs actually reachable from this code's call graph,
+      # not just "a vulnerable version is present in go.sum".
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
   unit-tests:
     name: unit-tests (gate 3)

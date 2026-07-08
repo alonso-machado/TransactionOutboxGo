@@ -9,26 +9,33 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	handler "github.com/alonsomachado/transaction-outbox-go/internal/adapter/http"
+	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/http/ratelimit"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/messaging"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/paymentgateway/fake"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/persistence"
+	fakeauth "github.com/alonsomachado/transaction-outbox-go/internal/adapter/staffauth/fake"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/ticketqr"
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/database"
 	rmq "github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/rabbitmq"
+	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/checkin"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/checkout"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/fulfillment"
+	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/notification"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/order"
 	outboxuc "github.com/alonsomachado/transaction-outbox-go/internal/usecase/outbox"
+	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/ticketholder"
 	"github.com/alonsomachado/transaction-outbox-go/internal/usecase/webhook"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	tcrabbitmq "github.com/testcontainers/testcontainers-go/modules/rabbitmq"
@@ -50,6 +57,11 @@ const (
 	// WebhookHandler/gateway is configured with — the fake sandbox adapter,
 	// no network calls.
 	testProvider = "fake"
+
+	// fakeStaffToken/fakeClerkUserID are the fixed staffauth/fake pair every
+	// check-in test authenticates with — no real Clerk account needed.
+	fakeStaffToken  = "integration-test-staff-token"
+	fakeClerkUserID = "integration-test-staff-user"
 )
 
 // suite holds everything shared across the integration test package: one
@@ -218,10 +230,10 @@ func TestMain(m *testing.M) {
 // RabbitMQ topology for speed.
 func truncateAll(t *testing.T) {
 	t.Helper()
-	if err := suite.db.Exec("TRUNCATE TABLE order_outbox, payment_event_outbox").Error; err != nil {
+	if err := suite.db.Exec("TRUNCATE TABLE order_outbox, payment_event_outbox, ticket_notification_outbox").Error; err != nil {
 		t.Fatalf("truncate outbox tables: %v", err)
 	}
-	if err := suite.eventsDB.Exec("TRUNCATE TABLE charges, tickets, orders, event_areas, events, producers, locations").Error; err != nil {
+	if err := suite.eventsDB.Exec("TRUNCATE TABLE charges, tickets, orders, event_areas, events, producers, locations, staff_users").Error; err != nil {
 		t.Fatalf("truncate events tables: %v", err)
 	}
 	for eventType, subtypes := range rmq.EventTypes {
@@ -232,6 +244,8 @@ func truncateAll(t *testing.T) {
 			}
 		}
 	}
+	purgeQueue(t, rmq.QueueFor(rmq.NotificationStream, rmq.NotificationSentinelType, rmq.NotificationSentinelSubtype))
+	purgeQueue(t, rmq.DLQFor(rmq.NotificationStream, rmq.NotificationSentinelType, rmq.NotificationSentinelSubtype))
 }
 
 func purgeQueue(t *testing.T, name string) {
@@ -338,15 +352,42 @@ func newCheckoutConsumer(eventType, eventSubtype string, prefetch, maxDeliveries
 
 // newFulfillmentConsumer wires a real AMQPConsumer + IssueTickets against the
 // shared events DB, bound to (eventType, eventSubtype)'s payment_event_outbox
-// shard queue.
+// shard queue. notificationOutboxRepo points at the outbox DB's
+// ticket_notification_outbox (Phase 8) — a real repo, not a stub, so tests
+// can assert the enqueued row directly (see notification_test.go).
 func newFulfillmentConsumer(eventType, eventSubtype string, prefetch, maxDeliveries int) *messaging.AMQPConsumer {
 	chargeRepo := persistence.NewChargeRepository(suite.eventsDB)
 	ticketRepo := persistence.NewTicketRepository(suite.eventsDB)
 	orderRepo := persistence.NewOrderRepository(suite.eventsDB)
 	uow := persistence.NewUnitOfWork(suite.eventsDB)
 	qr := ticketqr.New(ticketSigningSecret)
-	issueTickets := fulfillment.New(chargeRepo, ticketRepo, orderRepo, qr, uow)
+	notificationOutboxRepo := newTicketNotificationOutboxRepo()
+	issueTickets := fulfillment.New(chargeRepo, ticketRepo, orderRepo, qr, notificationOutboxRepo, uow, eventType, eventSubtype)
 	return messaging.NewConsumer(suite.amqpConn, issueTickets, rmq.PaymentEventStream, eventType, eventSubtype, prefetch, maxDeliveries, 0, 0)
+}
+
+// newTicketNotificationOutboxRepo mirrors newOrderOutboxRepo/
+// newPaymentEventOutboxRepo for the third outbox table (Phase 8) — it lives
+// in the outbox DB (suite.db), like the other two, even though it's enqueued
+// by fulfillment-consumer-worker (which otherwise only touches the events DB).
+func newTicketNotificationOutboxRepo() *persistence.GORMOutboxRepository {
+	return persistence.NewOutboxRepository(suite.db, "ticket_notification_outbox", 0, 0)
+}
+
+// newNotificationDispatch mirrors newOrderDispatch/newPaymentEventDispatch
+// for ticket_notification_outbox.
+func newNotificationDispatch(batchSize, maxRetries int, interval, pruneAfter time.Duration) (*outboxuc.DispatchOutbox, *persistence.GORMOutboxRepository) {
+	repo := newTicketNotificationOutboxRepo()
+	publisher := messaging.NewPublisher(suite.amqpConn)
+	return outboxuc.New(repo, publisher, batchSize, maxRetries, interval, pruneAfter), repo
+}
+
+// newNotificationConsumer wires a real AMQPConsumer + SendNotification
+// against recorder (a spy domain.EmailSender), bound to
+// NotificationStream's single unsharded queue.
+func newNotificationConsumer(recorder domain.EmailSender, prefetch, maxDeliveries int) *messaging.AMQPConsumer {
+	sendNotification := notification.New(recorder)
+	return messaging.NewConsumer(suite.amqpConn, sendNotification, rmq.NotificationStream, rmq.NotificationSentinelType, rmq.NotificationSentinelSubtype, prefetch, maxDeliveries, 0, 0)
 }
 
 // waitFor polls cond until it returns true or timeout elapses, returning the
@@ -398,4 +439,110 @@ func countCharges() int64 {
 	var n int64
 	suite.eventsDB.Table("charges").Count(&n)
 	return n
+}
+
+func countTicketNotificationOutboxByStatus(status domain.OutboxStatus) int64 {
+	var n int64
+	suite.db.Table("ticket_notification_outbox").Where("status = ?", string(status)).Count(&n)
+	return n
+}
+
+// newOrderStatusHandler wires OrderStatusHandler against the shared events
+// DB, mirroring cmd/tickets-api/main.go's DI.
+func newOrderStatusHandler() *handler.OrderStatusHandler {
+	return handler.NewOrderStatusHandler(persistence.NewOrderRepository(suite.eventsDB), persistence.NewChargeRepository(suite.eventsDB))
+}
+
+// newTicketsRouter wires the full tickets-api HTTP stack (router + order-
+// status/check-in/ticket-holder handlers) against the shared events DB,
+// mirroring cmd/tickets-api/main.go's DI. Uses the fake staffauth adapter
+// (fakeStaffToken/fakeClerkUserID below) so check-in tests don't need a
+// real Clerk account.
+func newTicketsRouter() *gin.Engine {
+	return newTicketsRouterWithConfig(handler.RouterConfig{})
+}
+
+// newTicketsRouterRateLimited builds tickets-api's router with rate
+// limiting enabled on the PATCH ticket-holder route (see
+// handler.NewTicketsRouter), for TestTicketHolder_RateLimit_429s.
+func newTicketsRouterRateLimited(store ratelimit.BucketStore, rate float64, burst int) *gin.Engine {
+	return newTicketsRouterWithConfig(handler.RouterConfig{
+		RateLimitEnabled: true,
+		RateLimitStore:   store,
+		RateLimitRate:    rate,
+		RateLimitBurst:   burst,
+	})
+}
+
+func newTicketsRouterWithConfig(rl handler.RouterConfig) *gin.Engine {
+	orderStatusHandler := newOrderStatusHandler()
+	checkinHandler := handler.NewCheckinHandler(newCheckinUC())
+	ticketHolderHandler := handler.NewTicketHolderHandler(newUpdateHolderUC())
+	staffAuthenticator := fakeauth.New(fakeStaffToken, fakeClerkUserID)
+	staffUserRepo := persistence.NewStaffUserRepository(suite.eventsDB)
+	return handler.NewTicketsRouter(orderStatusHandler, checkinHandler, ticketHolderHandler, staffAuthenticator, staffUserRepo, "tickets-api-test", false, rl)
+}
+
+// newCheckinUC wires checkin.CheckIn against the shared events DB.
+func newCheckinUC() *checkin.CheckIn {
+	return checkin.New(persistence.NewTicketRepository(suite.eventsDB), persistence.NewEventRepository(suite.eventsDB), ticketSigningSecret)
+}
+
+// newUpdateHolderUC wires ticketholder.UpdateHolder against the shared
+// events DB.
+func newUpdateHolderUC() *ticketholder.UpdateHolder {
+	return ticketholder.New(persistence.NewTicketRepository(suite.eventsDB))
+}
+
+// seedLocation inserts a locations row directly (independent of any order,
+// unlike the locations upserted by usecase/checkout.ProcessOrder), for tests
+// that need a second, distinct venue to check staff venue-scoping against.
+func seedLocation(t *testing.T, name string) uuid.UUID {
+	t.Helper()
+	id := uuid.Must(uuid.NewV7())
+	if err := suite.eventsDB.Exec(
+		"INSERT INTO locations (id, name, city, source_venue_id, created_at) VALUES (?, ?, ?, ?, now())",
+		id, name, "Test City", "venue-"+id.String(),
+	).Error; err != nil {
+		t.Fatalf("seed location: %v", err)
+	}
+	return id
+}
+
+// seedStaffUser inserts a staff_users row directly (no HTTP endpoint creates
+// these — they're provisioned out of band, e.g. by an admin tool not yet
+// built), returning its id.
+func seedStaffUser(t *testing.T, clerkUserID string, locationID *uuid.UUID) uuid.UUID {
+	t.Helper()
+	id := uuid.Must(uuid.NewV7())
+	if err := suite.eventsDB.Exec(
+		"INSERT INTO staff_users (id, clerk_user_id, name, role, location_id, created_at) VALUES (?, ?, ?, ?, ?, now())",
+		id, clerkUserID, "Test Staff", "door", locationID,
+	).Error; err != nil {
+		t.Fatalf("seed staff user: %v", err)
+	}
+	return id
+}
+
+// recordingEmailSender is a spy domain.EmailSender for notification_test.go
+// — records every Send call instead of delivering anything, so a test can
+// assert the recipient/attachment notification-consumer-worker actually sent.
+type recordingEmailSender struct {
+	mu   sync.Mutex
+	sent []domain.EmailRequest
+}
+
+func (s *recordingEmailSender) Send(req domain.EmailRequest) (*domain.EmailResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sent = append(s.sent, req)
+	return &domain.EmailResult{ProviderMessageID: "test"}, nil
+}
+
+func (s *recordingEmailSender) calls() []domain.EmailRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]domain.EmailRequest, len(s.sent))
+	copy(out, s.sent)
+	return out
 }

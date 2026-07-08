@@ -46,6 +46,29 @@ type Config struct {
 	// every issued ticket's validation code with.
 	TicketSigningSecret string `envconfig:"TICKET_SIGNING_SECRET" default:"dev-ticket-signing-secret"`
 
+	// EmailProvider selects the domain.EmailSender adapter
+	// notification-consumer-worker wires up: "fake" (no network, the
+	// default — local dev/tests) or "smtp" (real, stdlib net/smtp).
+	EmailProvider string `envconfig:"EMAIL_PROVIDER" default:"fake"`
+	SMTPHost      string `envconfig:"SMTP_HOST"`
+	SMTPPort      int    `envconfig:"SMTP_PORT" default:"587"`
+	SMTPUsername  string `envconfig:"SMTP_USERNAME"`
+	SMTPPassword  string `envconfig:"SMTP_PASSWORD"`
+	SMTPFromEmail string `envconfig:"SMTP_FROM_EMAIL" default:"tickets@example.com"`
+	SMTPFromName  string `envconfig:"SMTP_FROM_NAME" default:"Event Tickets"`
+
+	// Staff auth (tickets-api's POST /api/v1/checkin only). StaffAuthProvider
+	// selects the domain.StaffAuthenticator adapter: "fake" (a fixed test
+	// token, no network — the default, for local dev/tests, since a real
+	// Clerk account isn't required to run this system) or "clerk" (real).
+	// ClerkSecretKey is not `required` — only tickets-api with
+	// STAFF_AUTH_PROVIDER=clerk needs it, so every other binary simply never
+	// sets it.
+	StaffAuthProvider        string `envconfig:"STAFF_AUTH_PROVIDER" default:"fake"`
+	ClerkSecretKey           string `envconfig:"CLERK_SECRET_KEY"`
+	StaffAuthFakeToken       string `envconfig:"STAFF_AUTH_FAKE_TOKEN" default:"dev-staff-token"`
+	StaffAuthFakeClerkUserID string `envconfig:"STAFF_AUTH_FAKE_CLERK_USER_ID" default:"dev-staff-user"`
+
 	OtelServiceName string `envconfig:"OTEL_SERVICE_NAME" default:"transaction-outbox-go"`
 	OtelEndpoint    string `envconfig:"OTEL_EXPORTER_OTLP_ENDPOINT" default:"localhost:4318"`
 	MetricsPort     string `envconfig:"METRICS_PORT" default:"9090"`

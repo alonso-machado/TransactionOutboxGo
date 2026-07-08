@@ -77,8 +77,9 @@ func main() {
 	ticketRepo := persistence.NewTicketRepository(db)
 	orderRepo := persistence.NewOrderRepository(db)
 	qr := ticketqr.New(cfg.TicketSigningSecret)
+	notificationOutboxRepo := persistence.NewOutboxRepository(db, "ticket_notification_outbox", cfg.RetryBackoffBase, cfg.RetryBackoffCap)
 
-	issueTicketsUC := fulfillment.New(chargeRepo, ticketRepo, orderRepo, qr, uow)
+	issueTicketsUC := fulfillment.New(chargeRepo, ticketRepo, orderRepo, qr, notificationOutboxRepo, uow, eventType, eventSubtype)
 	consumer := messaging.NewConsumer(conn, issueTicketsUC, stream, eventType, eventSubtype, cfg.PrefetchCount, cfg.MaxDeliveries, cfg.RetryBackoffBase, cfg.RetryBackoffCap)
 
 	runCtx, cancel := context.WithCancel(ctx)

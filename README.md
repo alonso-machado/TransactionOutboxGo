@@ -47,22 +47,29 @@ acknowledges the client, and a separate relay reliably forwards it to the broker
 
 ## Architecture
 
-Four service binaries: **`ingestion-api`** (fixed 1 replica, HTTP write path —
+Six service binaries: **`ingestion-api`** (fixed 1 replica, HTTP write path —
 orders + payment-gateway webhooks), **`outbox-worker`** (the Transactional
-Outbox relay — its own process, running two independent dispatch loops, one
-per outbox table, KEDA-scaled on their summed backlog, min 1),
-**`order-consumer-worker`**, and **`fulfillment-consumer-worker`** — the
-latter two run **N instances each**, one per `(event_type, event_subtype)`
-shard (e.g. `CONCERT`/`ROCK`), bound to exactly one RabbitMQ queue via
-`CONSUMER_QUEUE` so KEDA can scale a shard's consumers independently.
+Outbox relay — its own process, running three independent dispatch loops,
+one per outbox table, KEDA-scaled on their summed backlog, min 1),
+**`order-consumer-worker`**, **`fulfillment-consumer-worker`** — these two run
+**N instances each**, one per `(event_type, event_subtype)` shard (e.g.
+`CONCERT`/`ROCK`), bound to exactly one RabbitMQ queue via `CONSUMER_QUEUE`
+so KEDA can scale a shard's consumers independently — **`tickets-api`** (fixed
+1 replica, a second synchronous HTTP write path: order-status polling,
+staff-authenticated ticket check-in, ticket-holder name correction), and
+**`notification-consumer-worker`** (one unsharded instance — emails an
+issued ticket's QR PNG, KEDA min 0).
 
 Two logical databases share one Postgres instance: `ingestion-api` and
 `outbox-worker` use the **`outbox`** database (`order_outbox` +
-`payment_event_outbox`); `order-consumer-worker` and
-`fulfillment-consumer-worker` use the **`events`** database
-(`locations`/`events`/`producers`/`event_areas`/`orders`/`tickets`/`charges`).
-The API **never writes to the `events` database** — only the two consumer
-workers do.
+`payment_event_outbox` + `ticket_notification_outbox`);
+`order-consumer-worker`, `fulfillment-consumer-worker`, and `tickets-api` use
+the **`events`** database
+(`locations`/`events`/`producers`/`event_areas`/`orders`/`tickets`/`charges`/`staff_users`).
+`ingestion-api` **never writes to the `events` database**, and symmetrically
+`tickets-api` never touches the outbox tables or RabbitMQ —
+`notification-consumer-worker` touches neither database at all (its email
+send has no local state to record).
 
 ```mermaid
 flowchart LR
@@ -172,8 +179,41 @@ sequenceDiagram
     end
     MQ->>FCW: deliver (manual ack)
     FCW->>PG: mark Charge/Order PAID, issue Tickets (QR PNG + HMAC signature)
+    FCW->>PG: (separate, best-effort write) INSERT ticket_notification_outbox
     FCW->>MQ: ack
 ```
+
+### After fulfillment: status polling, notification delivery, and check-in
+
+`fulfillment-consumer-worker`'s ticket issuance isn't the end of the line —
+three more things happen, all served by **`tickets-api`** and
+**`notification-consumer-worker`**, neither of which existed before Phase 8:
+
+- **The client learns its checkout URL** by polling `GET
+  /api/v1/orders/{orderId}` (`tickets-api`) after the original `201` —
+  `checkoutUrl` is empty (and the endpoint may still legitimately `404`,
+  since the `orders` row itself doesn't exist until
+  `order-consumer-worker` runs) until `order-consumer-worker` opens a
+  checkout, at which point it's populated and `status` reads `RESERVED`.
+- **The ticket is emailed.** Right after `MarkIssued` commits,
+  `fulfillment-consumer-worker` enqueues a `ticket_notification_outbox` row
+  — as its **own, separate write against the outbox database** (Postgres
+  has no cross-database transactions, so this can't be atomic with
+  `MarkIssued` the way a same-database outbox write would be). The same
+  generalized `DispatchOutbox` relays it — on a single, deliberately
+  **unsharded** queue (email-sending has no per-genre resource contention
+  to isolate) — to `notification-consumer-worker`, which sends the QR PNG
+  by email via the configured `EmailSender` (`fake` locally, or `smtp`, a
+  real `net/smtp`-based sender using only the Go standard library).
+- **The ticket gets checked in at the door.** `POST /api/v1/checkin`
+  (`tickets-api`, **staff-authenticated** — a Bearer token verified via
+  Clerk, or the `fake` provider locally/in tests) verifies the scanned
+  QR's HMAC signature against the ticket's *stored* row, optionally
+  checks the authenticated staff member's venue scope, and flips
+  `VALID` → `CHECKED_IN` (idempotent — a repeat scan reports
+  `ALREADY_CHECKED_IN`, not an error). A typo'd buyer name can be
+  corrected at any point via `PATCH /api/v1/tickets/{ticketId}/holder`
+  (rate-limited, no auth).
 
 ### Outbox status state machine
 
@@ -266,13 +306,13 @@ boilerplate. Any layer may import it, the same way any layer may import
   fixed 1 replica and does **not** connect to RabbitMQ or the `events`
   database.
 - **`outbox-worker`** — the Transactional Outbox core, its own process,
-  running two independent `DispatchOutbox` loops (one per outbox table):
+  running three independent `DispatchOutbox` loops (one per outbox table):
   polls `NEW`/`RETRYING` rows (deduped via `FOR UPDATE SKIP LOCKED`,
   `order_outbox` also gets a LISTEN/NOTIFY fast path), publishes to RabbitMQ
   with publisher confirms, marks rows `PUBLISHED` (or `RETRYING`/
   `DEAD_LETTER` on failure with exponential backoff), prunes old published
   rows, and declares the shared RabbitMQ topology. KEDA scales it on the
-  **summed** backlog of both outboxes (postgresql scaler), min 1.
+  **summed** backlog of all three outboxes (postgresql scaler), min 1.
 - **`order-consumer-worker`** — RabbitMQ consumer with prefetch + manual ack,
   one instance per `(event_type, event_subtype)` shard. Upserts the
   `Location`/`Event` an order belongs to, reserves `Ticket` rows
@@ -282,10 +322,28 @@ boilerplate. Any layer may import it, the same way any layer may import
 - **`fulfillment-consumer-worker`** — RabbitMQ consumer, same per-shard
   shape. On a `CONFIRMED` payment-gateway webhook it marks the `Charge`/
   `Order` `PAID` and issues every `RESERVED` ticket (QR PNG + HMAC
-  signature); on `FAILED` it marks them `FAILED`/`VOID`.
+  signature); on `FAILED` it marks them `FAILED`/`VOID`. Right after issuing
+  a ticket it also enqueues a `ticket_notification_outbox` row — a separate,
+  best-effort write against the `outbox` database (not atomic with the
+  events-DB transaction above; Postgres has no cross-database transactions).
+- **`tickets-api`** — a second Gin HTTP server, the mirror image of
+  `ingestion-api`: reads/writes the `events` database directly and never
+  touches RabbitMQ or the outbox tables. `GET /api/v1/orders/{id}` (order
+  status + checkout URL), `POST /api/v1/checkin` (staff-authenticated —
+  Bearer token verified via Clerk or the `fake` local/test provider — QR
+  signature verification + venue scoping), `PATCH
+  /api/v1/tickets/{id}/holder` (buyer-name correction, rate-limited, no
+  auth). Fixed 1 replica.
+- **`notification-consumer-worker`** — RabbitMQ consumer for
+  `ticket_notification_outbox`'s single **unsharded** queue (no per-genre
+  resource contention to isolate, and this consumer makes zero DB calls —
+  the one stream not routed by `event_type`/`event_subtype`). Sends the
+  ticket's QR PNG by email via the configured `EmailSender` (`fake` or
+  `smtp`). No dedup — a redelivered message just resends the email.
 - **PostgreSQL** — one instance, two logical databases: `outbox`
-  (`order_outbox` + `payment_event_outbox`) and `events`
-  (`locations`/`events`/`producers`/`event_areas`/`orders`/`tickets`/`charges`).
+  (`order_outbox` + `payment_event_outbox` + `ticket_notification_outbox`)
+  and `events`
+  (`locations`/`events`/`producers`/`event_areas`/`orders`/`tickets`/`charges`/`staff_users`).
 - **RabbitMQ** — durable topic exchange (`tickets.exchange`) + one quorum
   queue + dead-letter queue per `(stream, event_type, event_subtype)` shard.
 - **`outbox-admin`** — a one-shot maintenance CLI, **not** a long-running
@@ -505,20 +563,22 @@ a newer one and out-of-order delivery self-corrects.
 
 ```
 TransactionOutboxGo/
-├── .claude/plan-phase7-tickets-pivot.md   # the current architecture (Event Ticket System pivot)
+├── .claude/plan-phase8-tickets-checkin-notifications.md   # the current architecture (Phase 8)
 ├── CLAUDE.md                  # guidance for Claude Code in this repo
 ├── cmd/
-│   ├── ingestion-api/               # HTTP write path → both outbox tables (composition root)
-│   ├── outbox-worker/               # two DispatchOutbox loops → RabbitMQ, KEDA-scaled (composition root)
+│   ├── ingestion-api/               # HTTP write path → both intake outbox tables (composition root)
+│   ├── outbox-worker/               # three DispatchOutbox loops → RabbitMQ, KEDA-scaled (composition root)
 │   ├── order-consumer-worker/       # order_outbox consumer → events DB (composition root)
 │   ├── fulfillment-consumer-worker/ # payment_event_outbox consumer → events DB (composition root)
+│   ├── tickets-api/                 # order-status/check-in/ticket-holder HTTP path → events DB (composition root)
+│   ├── notification-consumer-worker/# ticket_notification_outbox consumer → email (composition root)
 │   └── outbox-admin/                # one-shot maintenance CLI: replay-dead / drain-dlq / purge-loadtest-dlq
 ├── internal/
-│   ├── domain/                # entities (Order, Ticket, Charge, Event, Location, OutboxMessage) + ports (no framework imports)
+│   ├── domain/                # entities (Order, Ticket, Charge, Event, Location, OutboxMessage, StaffUser) + ports (no framework imports)
 │   ├── observability/         # tiny OTel metric-instrument helpers shared by usecase + adapter (no framework imports beyond the otel API)
-│   ├── usecase/                # order (PlaceOrder) / webhook (ReceivePaymentEvent) / outbox (DispatchOutbox) / checkout (ProcessOrder) / fulfillment (IssueTickets)
-│   ├── adapter/                # http · persistence · messaging · paymentgateway · ticketqr
-│   └── infrastructure/         # config · database · rabbitmq (EventTypes registry) · telemetry · logging
+│   ├── usecase/                # order / webhook / outbox / checkout / fulfillment / checkin / ticketholder / notification
+│   ├── adapter/                # http (incl. staffauth) · persistence · messaging · paymentgateway · emailsender · staffauth · ticketqr
+│   └── infrastructure/         # config · database · rabbitmq (EventTypes registry + NotificationStream) · telemetry · logging
 ├── migrations/
 │   ├── outbox/                 # golang-migrate set for the `outbox` database
 │   └── events/                 # golang-migrate set for the `events` database
@@ -532,17 +592,20 @@ TransactionOutboxGo/
 
 ## Environment variables
 
-All four service binaries read config via [`internal/infrastructure/config`](internal/infrastructure/config/config.go)
+All six service binaries read config via [`internal/infrastructure/config`](internal/infrastructure/config/config.go)
 (`envconfig`). `DATABASE_URL` and `RABBITMQ_URL` are the only two marked
-`required` — everything else has a default. (ingestion-api still requires
-`RABBITMQ_URL` to be set because the `Config` struct is shared, but it never
-opens a connection.) Each service points `DATABASE_URL` at its own logical
-database: `outbox` for ingestion-api/outbox-worker, `events` for the two
-consumer workers. See [`.env.example`](.env.example) for local-dev values and
-[`docker-compose.yml`](docker-compose.yml) for how each service's env block is
-wired.
+`required` — everything else has a default. (ingestion-api and
+notification-consumer-worker still require these to be set because the
+`Config` struct is shared, even though each of them never opens one of the
+two connections — same "provide but ignore" precedent both follow.) Each
+service points `DATABASE_URL` at its own logical database: `outbox` for
+ingestion-api/outbox-worker, `events` for order-consumer-worker/
+fulfillment-consumer-worker/tickets-api (notification-consumer-worker's
+`DATABASE_URL` is unused). See [`.env.example`](.env.example) for local-dev
+values and [`docker-compose.yml`](docker-compose.yml) for how each service's
+env block is wired.
 
-### Shared (all four services)
+### Shared (all six services)
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -583,7 +646,25 @@ wired.
 | `PREFETCH_COUNT` | `10` | AMQP consumer prefetch count |
 | `MAX_DELIVERIES` | `5` | Redelivery attempts before a message is routed to its shard's DLQ |
 | `CHECKOUT_SUCCESS_URL` | `http://localhost:8080/orders/success` | `order-consumer-worker` only — where the gateway redirects the customer after a successful checkout |
-| `TICKET_SIGNING_SECRET` | `dev-ticket-signing-secret` | `fulfillment-consumer-worker` only — HMAC key for ticket validation signatures |
+| `TICKET_SIGNING_SECRET` | `dev-ticket-signing-secret` | `fulfillment-consumer-worker`/`tickets-api` — HMAC key for ticket validation signatures (issuance and check-in verification both use it) |
+
+### `tickets-api` only
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HTTP_PORT` | `8080` | HTTP listen port |
+| `RATE_LIMIT_ENABLED` / `RATE_LIMIT_RATE` / `RATE_LIMIT_BURST` | same as ingestion-api | Guards only `PATCH /api/v1/tickets/{id}/holder` — `GET /orders/{id}` and `POST /checkin` are unlimited |
+| `STAFF_AUTH_PROVIDER` | `fake` | `StaffAuthenticator` adapter for check-in: `fake` (fixed test token, no network) or `clerk` (real) |
+| `CLERK_SECRET_KEY` | *(empty)* | Only meaningful when `STAFF_AUTH_PROVIDER=clerk` |
+| `STAFF_AUTH_FAKE_TOKEN` / `STAFF_AUTH_FAKE_CLERK_USER_ID` | `dev-staff-token` / `dev-staff-user` | Only meaningful when `STAFF_AUTH_PROVIDER=fake` |
+
+### `notification-consumer-worker` only
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `EMAIL_PROVIDER` | `fake` | `EmailSender` adapter: `fake` (no network) or `smtp` (real, stdlib `net/smtp`) |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` | *(empty)* / `587` / *(empty)* / *(empty)* | Only meaningful when `EMAIL_PROVIDER=smtp` |
+| `SMTP_FROM_EMAIL` / `SMTP_FROM_NAME` | `tickets@example.com` / `Event Tickets` | Sender identity on outgoing mail |
 
 ---
 
@@ -599,7 +680,7 @@ make test     # go test -race ./...
 make tidy     # go mod tidy
 make lint     # golangci-lint run ./...
 
-# Podman Compose — starts Postgres + RabbitMQ + all four app services
+# Podman Compose — starts Postgres + RabbitMQ + all six app services
 # (two shards run by default: CONCERT/ROCK, SPORTS/FOOTBALL)
 make up       # podman compose -f docker-compose.yml up --build -d
 make logs     # tail logs from all services
@@ -613,6 +694,7 @@ make seed     # curl a sample order POST to the ingestion-api
 |---|---|
 | Ingestion API | http://localhost:8080 |
 | API health | http://localhost:8080/healthz |
+| Tickets API | http://localhost:8081 |
 | RabbitMQ management UI | http://localhost:15672 (user/pass from `.env`) |
 | Postgres | `localhost:5432` |
 
@@ -712,6 +794,14 @@ statement count, not a naive average of per-function percentages). **Every
 | `adapter/persistence` | 85.4% |
 | `adapter/messaging` | 66.0% |
 
+Phase 8's new `usecase/checkin`/`usecase/ticketholder`/`usecase/notification`
+packages are exercised end-to-end by the integration suite
+(`checkin_test.go`/`ticketholder_test.go`/`notification_test.go`) following
+the same convention as every other `usecase` package — a per-package
+percentage for these three hasn't been re-measured since Phase 7's
+statement-weighted pass above; re-run `make coverage-all` for current
+numbers across all eight `usecase` packages.
+
 A unit-only number understates real coverage here on purpose:
 `adapter/persistence`, `infrastructure/database`, and `infrastructure/rabbitmq`
 are thin wrappers over GORM/pgx/amqp091 that are exercised against the
@@ -723,20 +813,25 @@ that reflects this project's actual line coverage.
 
 ## CI/CD
 
-Four independent GitHub Actions workflows, one per microservice —
+Six independent GitHub Actions workflows, one per microservice —
 [`ingestion-api.yml`](.github/workflows/ingestion-api.yml),
 [`outbox-worker.yml`](.github/workflows/outbox-worker.yml),
 [`order-consumer-worker.yml`](.github/workflows/order-consumer-worker.yml),
-and [`fulfillment-consumer-worker.yml`](.github/workflows/fulfillment-consumer-worker.yml)
+[`fulfillment-consumer-worker.yml`](.github/workflows/fulfillment-consumer-worker.yml),
+[`tickets-api.yml`](.github/workflows/tickets-api.yml), and
+[`notification-consumer-worker.yml`](.github/workflows/notification-consumer-worker.yml)
 — so a change scoped to one service never triggers or gates the others. All follow:
-**Build → lint (golangci-lint + actionlint + helm lint) → Unit Tests → Upload
+**Build → lint (golangci-lint + actionlint + helm lint + govulncheck) → Unit Tests → Upload
 (ECR, OIDC-authenticated)**, with an optional flag-gated Integration Tests
 (TestContainers) job that's a safety measure only — it never blocks Upload.
-There is no automated deploy job. A Go vulnerability-scanning gate
-(`govulncheck`) is planned but not yet added — see
-`.claude/plan-phase7-tickets-pivot.md`'s Part F. See
+There is no automated deploy job. `govulncheck` (Go vulnerability scanning,
+checking `go.sum`'s dependency tree for CVEs actually reachable from this
+code's call graph) is wired into all six workflows as of Phase 8 — it
+caught a real, reachable CVE in `go-jose/v3` (pulled in transitively by the
+new Clerk SDK dependency) on its first run, fixed by bumping that
+dependency directly. See
 [`.github/workflows/README.md`](.github/workflows/README.md) for the full
-gate breakdown and why four files instead of one matrixed workflow.
+gate breakdown and why six files instead of one matrixed workflow.
 
 ## Deploying
 

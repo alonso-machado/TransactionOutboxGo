@@ -1,8 +1,9 @@
 # CI pipelines
 
-Four **independent** workflows, one per microservice — `ingestion-api.yml`,
-`outbox-worker.yml`, `order-consumer-worker.yml`, and
-`fulfillment-consumer-worker.yml`. They're the same shape, but kept as
+Six **independent** workflows, one per microservice — `ingestion-api.yml`,
+`outbox-worker.yml`, `order-consumer-worker.yml`,
+`fulfillment-consumer-worker.yml`, `tickets-api.yml`, and
+`notification-consumer-worker.yml`. They're the same shape, but kept as
 separate files rather than one matrixed workflow so a change to one service
 never triggers or gates the others: each has its own `paths:` trigger filter
 (scoped to its own `cmd/<service>/**` plus the shared
@@ -10,7 +11,7 @@ never triggers or gates the others: each has its own `paths:` trigger filter
 badge, and its own required-check configuration in branch protection.
 
 ```
-Build → golangci-lint (GATE) → Unit Tests (GATE) → Upload (ECR/Docker Hub)
+Build → lint: golangci-lint + actionlint + helm lint + govulncheck (GATE) → Unit Tests (GATE) → Upload (ECR/Docker Hub)
                                         │
                                         └── Integration Tests (OPTIONAL, flag-gated,
                                             TestContainers — never blocks the pipeline)
@@ -20,15 +21,21 @@ Three hard gates, in order: **build → lint → unit-tests**. Any one failing
 stops everything downstream for that service — `upload` never runs if
 `unit-tests` (or anything before it) is red.
 
-`lint` checks three different things, not just Go: `golangci-lint` for the
+`lint` checks four different things, not just Go: `golangci-lint` for the
 code, [`actionlint`](https://github.com/rhysd/actionlint) (via
 `reviewdog/action-actionlint`) for the workflow YAML itself — both these
-files included — and `helm lint` against `helmcharts/transaction-outbox`
-(the chart deployed to Kubernetes; see the chart's own README). A broken
-expression, an undefined secret reference, bad shell syntax in a `run:`
-step, a deprecated action input (this is how the deprecated
-`fail_on_error` input on the actionlint step itself got caught while writing
-it), or a broken chart template/values schema all fail the same gate a Go
+files included — `helm lint` against `helmcharts/transaction-outbox`
+(the chart deployed to Kubernetes; see the chart's own README), and
+`govulncheck` (`go run golang.org/x/vuln/cmd/govulncheck@latest ./...`) —
+Go's official vulnerability database, filtered to CVEs actually
+**reachable** from this code's call graph rather than every vulnerable
+version merely present in `go.sum`. A broken expression, an undefined
+secret reference, bad shell syntax in a `run:` step, a deprecated action
+input (this is how the deprecated `fail_on_error` input on the actionlint
+step itself got caught while writing it), a broken chart template/values
+schema, or a reachable CVE (this gate caught a real one — `go-jose/v3`
+GO-2026-4945, pulled in transitively by the Clerk SDK added in Phase 8,
+fixed by bumping that dependency directly) all fail the same gate a Go
 compile error would.
 
 `integration-tests` (the TestContainers suite) is a **safety measure, not a
@@ -56,10 +63,11 @@ be added back to each workflow independently once that's wired up.
 ## Why separate files instead of one matrixed workflow
 
 A single workflow with `strategy.matrix.service: [ingestion-api,
-outbox-worker, order-consumer-worker, fulfillment-consumer-worker]` is still
-**one workflow run** — a failure in one matrix leg shows up in the same run
-as the others, and a single trigger (e.g. a path filter) would have to cover
-every service's paths, so an `internal/`-only change would always run all
-legs even when only one binary actually changed behavior-relevant code.
-Separate files give true independence at the cost of duplicating ~80 lines
-of near-identical YAML per service — an acceptable trade-off at this count.
+outbox-worker, order-consumer-worker, fulfillment-consumer-worker,
+tickets-api, notification-consumer-worker]` is still **one workflow run** —
+a failure in one matrix leg shows up in the same run as the others, and a
+single trigger (e.g. a path filter) would have to cover every service's
+paths, so an `internal/`-only change would always run all legs even when
+only one binary actually changed behavior-relevant code. Separate files
+give true independence at the cost of duplicating ~80 lines of
+near-identical YAML per service — an acceptable trade-off at this count.

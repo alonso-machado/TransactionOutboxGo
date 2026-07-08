@@ -57,23 +57,23 @@ func (EventModel) TableName() string { return "events" }
 // jsonb column rather than a child table — an order's line items are never
 // queried independently of the order itself.
 type OrderModel struct {
-	ID                uuid.UUID `gorm:"type:uuid;primaryKey"`
-	SourceOrderID     string    `gorm:"column:source_order_id;uniqueIndex;not null"`
-	EventType         string    `gorm:"column:event_type;not null"`
-	EventSubtype      string    `gorm:"column:event_subtype;not null"`
-	SourceEventID     string    `gorm:"column:source_event_id;not null"`
-	SourceVenueID     string    `gorm:"column:source_venue_id"`
-	VenueName         string    `gorm:"column:venue_name"`
-	VenueCity         string    `gorm:"column:venue_city"`
-	Items             []byte    `gorm:"type:jsonb;not null"`
-	CustomerName      string    `gorm:"column:customer_name"`
-	CustomerEmail     string    `gorm:"column:customer_email"`
-	CustomerDocument  string    `gorm:"column:customer_document"`
-	Amount            int64     `gorm:"not null"`
-	Currency          string    `gorm:"not null"`
-	Status            string    `gorm:"not null;default:PENDING"`
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	ID               uuid.UUID `gorm:"type:uuid;primaryKey"`
+	SourceOrderID    string    `gorm:"column:source_order_id;uniqueIndex;not null"`
+	EventType        string    `gorm:"column:event_type;not null"`
+	EventSubtype     string    `gorm:"column:event_subtype;not null"`
+	SourceEventID    string    `gorm:"column:source_event_id;not null"`
+	SourceVenueID    string    `gorm:"column:source_venue_id"`
+	VenueName        string    `gorm:"column:venue_name"`
+	VenueCity        string    `gorm:"column:venue_city"`
+	Items            []byte    `gorm:"type:jsonb;not null"`
+	CustomerName     string    `gorm:"column:customer_name"`
+	CustomerEmail    string    `gorm:"column:customer_email"`
+	CustomerDocument string    `gorm:"column:customer_document"`
+	Amount           int64     `gorm:"not null"`
+	Currency         string    `gorm:"not null"`
+	Status           string    `gorm:"not null;default:PENDING"`
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 func (OrderModel) TableName() string { return "orders" }
@@ -97,9 +97,22 @@ type TicketModel struct {
 	Signature      string
 	Status         string `gorm:"not null;default:RESERVED"`
 	CreatedAt      time.Time
+	CheckedInAt    *time.Time `gorm:"column:checked_in_at"`
 }
 
 func (TicketModel) TableName() string { return "tickets" }
+
+// StaffUserModel is the staff_users table (events DB).
+type StaffUserModel struct {
+	ID          uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ClerkUserID string     `gorm:"column:clerk_user_id;uniqueIndex;not null"`
+	Name        string     `gorm:"not null"`
+	Role        string     `gorm:"not null"`
+	LocationID  *uuid.UUID `gorm:"type:uuid;column:location_id"`
+	CreatedAt   time.Time
+}
+
+func (StaffUserModel) TableName() string { return "staff_users" }
 
 // ChargeModel is the charges table (events DB).
 type ChargeModel struct {

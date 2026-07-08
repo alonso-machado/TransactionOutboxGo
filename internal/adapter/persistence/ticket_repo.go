@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"time"
 
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/google/uuid"
@@ -62,6 +63,38 @@ func (r *GORMTicketRepository) MarkVoid(ctx context.Context, uow domain.UnitOfWo
 		Update("status", string(domain.TicketStatusVoid)).Error
 }
 
+func (r *GORMTicketRepository) FindByID(ctx context.Context, id uuid.UUID) (*domain.Ticket, error) {
+	var m TicketModel
+	if err := r.db.WithContext(ctx).Where("id = ?", id).First(&m).Error; err != nil {
+		return nil, err
+	}
+	return toDomainTicket(m), nil
+}
+
+// CheckIn's WHERE clause only matches a currently-VALID row, so
+// RowsAffected == 0 means the ticket was not VALID at the moment of the
+// UPDATE — either already CHECKED_IN or never issued (RESERVED/VOID). The
+// caller (usecase/checkin) already holds the ticket from FindByID and uses
+// its Status to tell those two cases apart.
+func (r *GORMTicketRepository) CheckIn(ctx context.Context, uow domain.UnitOfWork, id uuid.UUID, checkedInAt time.Time) (bool, error) {
+	db := TxFromContext(ctx, r.db)
+	tx := db.Model(&TicketModel{}).
+		Where("id = ? AND status = ?", id, string(domain.TicketStatusValid)).
+		Updates(map[string]any{
+			"status":        string(domain.TicketStatusCheckedIn),
+			"checked_in_at": checkedInAt,
+		})
+	if tx.Error != nil {
+		return false, tx.Error
+	}
+	return tx.RowsAffected == 0, nil
+}
+
+func (r *GORMTicketRepository) UpdateHolderName(ctx context.Context, uow domain.UnitOfWork, id uuid.UUID, name string) error {
+	db := TxFromContext(ctx, r.db)
+	return db.Model(&TicketModel{}).Where("id = ?", id).Update("buyer_name", name).Error
+}
+
 func toTicketModel(t *domain.Ticket) TicketModel {
 	return TicketModel{
 		ID:             t.ID,
@@ -103,5 +136,6 @@ func toDomainTicket(m TicketModel) *domain.Ticket {
 		Signature:      m.Signature,
 		Status:         domain.TicketStatus(m.Status),
 		CreatedAt:      m.CreatedAt,
+		CheckedInAt:    m.CheckedInAt,
 	}
 }

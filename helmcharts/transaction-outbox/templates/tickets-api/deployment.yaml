@@ -1,0 +1,76 @@
+# Phase 8: tickets-api's own Deployment. Unlike ingestion-api/
+# order-consumer-worker/fulfillment-consumer-worker, this is ALWAYS a plain
+# Deployment — there is no Rollout/canary variant for this service yet
+# (a deliberate Phase 8 scope cut, flagged rather than silently applied);
+# it renders regardless of .Values.canary.enabled.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tickets-api
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: tickets-api
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+spec:
+  {{- if .Values.ticketsApi.hpa.enabled }}
+  # No replicas field — see ingestion-api/deployment.yaml's comment on why
+  # an HPA-owned workload must not also template .spec.replicas here.
+  {{- else }}
+  replicas: {{ .Values.ticketsApi.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app: tickets-api
+  template:
+    metadata:
+      labels:
+        app: tickets-api
+    spec:
+      {{- with .Values.ticketsApi.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: tickets-api
+          image: {{ .Values.image.ticketsApi }}
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          envFrom:
+            - configMapRef:
+                name: transaction-outbox-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  # events DB — tickets-api reads/writes orders/charges/
+                  # tickets/staff_users directly, unlike ingestion-api (which
+                  # only ever touches the outbox DB).
+                  key: EVENTS_DATABASE_URL
+            - name: TICKET_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: TICKET_SIGNING_SECRET
+            - name: CLERK_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: CLERK_SECRET_KEY
+          resources:
+            {{- toYaml .Values.ticketsApi.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10

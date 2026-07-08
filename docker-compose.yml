@@ -320,6 +320,53 @@ services:
       - outbox
     restart: unless-stopped
 
+  # Phase 8: synchronous REST reading/writing the events DB directly (order
+  # status/checkout URL, ticket check-in, ticket-holder name update) — the
+  # mirror image of ingestion-api (which touches outbox+broker but never
+  # events; this touches events but never outbox/broker).
+  tickets-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: tickets-api
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@pgbouncer:6432/events?sslmode=disable"
+      # Still provided because the shared Config struct marks RABBITMQ_URL
+      # required — tickets-api never connects to RabbitMQ (purely
+      # synchronous REST against events), same "provide but ignore"
+      # precedent ingestion-api sets.
+      RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
+      HTTP_PORT: "${TICKETS_API_PORT:-8081}"
+      SWAGGER_ENABLED: "${SWAGGER_ENABLED:-true}"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-tickets-api}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-tempo:4318}"
+      METRICS_PORT: "${TICKETS_API_METRICS_PORT:-9095}"
+      LOG_FORMAT: "${LOG_FORMAT:-json}"
+      RATE_LIMIT_ENABLED: "${RATE_LIMIT_ENABLED:-false}"
+      RATE_LIMIT_RATE: "${RATE_LIMIT_RATE:-50}"
+      RATE_LIMIT_BURST: "${RATE_LIMIT_BURST:-100}"
+      TRUSTED_PROXIES: "${TRUSTED_PROXIES:-}"
+      TICKET_SIGNING_SECRET: "${TICKET_SIGNING_SECRET:-dev-ticket-signing-secret}"
+      # fake locally — make up/tests don't need a real Clerk account.
+      STAFF_AUTH_PROVIDER: "${STAFF_AUTH_PROVIDER:-fake}"
+      STAFF_AUTH_FAKE_TOKEN: "${STAFF_AUTH_FAKE_TOKEN:-dev-staff-token}"
+      STAFF_AUTH_FAKE_CLERK_USER_ID: "${STAFF_AUTH_FAKE_CLERK_USER_ID:-dev-staff-user}"
+      CLERK_SECRET_KEY: "${CLERK_SECRET_KEY:-}"
+    ports:
+      - "${TICKETS_API_PORT:-8081}:${TICKETS_API_PORT:-8081}"
+      - "${TICKETS_API_METRICS_PORT:-9095}:${TICKETS_API_METRICS_PORT:-9095}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate-events:
+        condition: service_completed_successfully
+      pgbouncer:
+        condition: service_healthy
+    networks:
+      - outbox
+    restart: unless-stopped
+
   # The Transactional Outbox relay (DispatchOutbox), run once for each of the
   # two outboxes (order_outbox, payment_event_outbox). It is the only reader
   # of either outbox table and the only publisher to RabbitMQ; it also
@@ -404,6 +451,55 @@ services:
       METRICS_PORT: "9094"
     ports:
       - "9094:9094"
+
+  # Phase 8: sends an issued ticket's QR by email, consuming
+  # ticket_notification_outbox's single unsharded queue — one instance, not
+  # a shard pair like order/fulfillment above (see
+  # internal/infrastructure/rabbitmq.NotificationStream's doc comment).
+  notification-consumer-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: notification-consumer-worker
+    environment:
+      # Unused (usecase/notification.SendNotification never queries a
+      # database) but config.Config's DatabaseURL carries a shared
+      # required:"true" tag — same "provide but ignore" precedent
+      # ingestion-api sets for its own unused RABBITMQ_URL.
+      DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@pgbouncer:6432/events?sslmode=disable"
+      RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
+      PREFETCH_COUNT: "${CONSUMER_PREFETCH:-10}"
+      MAX_DELIVERIES: "${RABBITMQ_MAX_REDELIVERIES:-5}"
+      RETRY_BACKOFF_BASE: "${RETRY_BACKOFF_BASE:-1s}"
+      RETRY_BACKOFF_CAP: "${RETRY_BACKOFF_CAP:-5m}"
+      # fake locally — no SMTP server running in compose; fake makes no
+      # network calls at all, so no mailhog/maildev catcher is required.
+      EMAIL_PROVIDER: "${EMAIL_PROVIDER:-fake}"
+      SMTP_HOST: "${SMTP_HOST:-}"
+      SMTP_PORT: "${SMTP_PORT:-587}"
+      SMTP_USERNAME: "${SMTP_USERNAME:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      SMTP_FROM_EMAIL: "${SMTP_FROM_EMAIL:-tickets@example.com}"
+      SMTP_FROM_NAME: "${SMTP_FROM_NAME:-Event Tickets}"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-notification-consumer-worker}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-tempo:4318}"
+      METRICS_PORT: "9096"
+      LOG_FORMAT: "${LOG_FORMAT:-json}"
+    ports:
+      - "9096:9096"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate-events:
+        condition: service_completed_successfully
+      pgbouncer:
+        condition: service_healthy
+    networks:
+      - outbox
+    restart: unless-stopped
 
   # ── Observability (Phase 4 Track 3) ───────────────────────────────────────
 

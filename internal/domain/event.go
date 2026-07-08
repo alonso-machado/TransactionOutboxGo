@@ -32,4 +32,8 @@ type Event struct {
 // insert on first sight, return the existing row's ID otherwise.
 type EventRepository interface {
 	UpsertBySourceEventID(ctx context.Context, uow UnitOfWork, e *Event) (uuid.UUID, error)
+	// FindByID looks up an event by its own UUID — usecase/checkin resolves
+	// a ticket's Event.LocationID this way to check the authenticated
+	// staff member's venue scoping.
+	FindByID(ctx context.Context, id uuid.UUID) (*Event, error)
 }

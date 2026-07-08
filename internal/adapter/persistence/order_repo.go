@@ -62,6 +62,14 @@ func (r *GORMOrderRepository) FindBySourceOrderID(ctx context.Context, sourceOrd
 	return toDomainOrder(m)
 }
 
+func (r *GORMOrderRepository) FindByID(ctx context.Context, id uuid.UUID) (*domain.Order, error) {
+	var m OrderModel
+	if err := r.db.WithContext(ctx).Where("id = ?", id).First(&m).Error; err != nil {
+		return nil, err
+	}
+	return toDomainOrder(m)
+}
+
 func (r *GORMOrderRepository) UpdateStatus(ctx context.Context, uow domain.UnitOfWork, id uuid.UUID, status domain.OrderStatus) error {
 	db := TxFromContext(ctx, r.db)
 	return db.Model(&OrderModel{}).Where("id = ?", id).Update("status", string(status)).Error

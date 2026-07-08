@@ -1,0 +1,38 @@
+{{- if .Values.ticketsApi.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: tickets-api
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tickets-api
+  minReplicas: {{ .Values.ticketsApi.hpa.minReplicas }}
+  maxReplicas: {{ .Values.ticketsApi.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.ticketsApi.hpa.cpuUtilization }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.ticketsApi.hpa.memoryUtilization }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: {{ .Values.ticketsApi.hpa.scaleUpStabilizationSeconds }}
+      policies:
+        - type: Pods
+          value: {{ .Values.ticketsApi.hpa.maxReplicas }}
+          periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: {{ .Values.ticketsApi.hpa.scaleDownStabilizationSeconds }}
+{{- end }}

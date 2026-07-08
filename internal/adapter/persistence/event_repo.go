@@ -42,3 +42,19 @@ func (r *GORMEventRepository) UpsertBySourceEventID(ctx context.Context, uow dom
 	}
 	return m.ID, nil
 }
+
+func (r *GORMEventRepository) FindByID(ctx context.Context, id uuid.UUID) (*domain.Event, error) {
+	var m EventModel
+	if err := r.db.WithContext(ctx).Where("id = ?", id).First(&m).Error; err != nil {
+		return nil, err
+	}
+	return &domain.Event{
+		ID:            m.ID,
+		EventType:     m.EventType,
+		EventSubtype:  m.EventSubtype,
+		Name:          m.Name,
+		LocationID:    m.LocationID,
+		SourceEventID: m.SourceEventID,
+		CreatedAt:     m.CreatedAt,
+	}, nil
+}

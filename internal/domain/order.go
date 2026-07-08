@@ -67,5 +67,9 @@ type Order struct {
 type OrderRepository interface {
 	Save(ctx context.Context, uow UnitOfWork, o *Order) (created bool, err error)
 	FindBySourceOrderID(ctx context.Context, sourceOrderID string) (*Order, error)
+	// FindByID looks up an order by its own UUID — tickets-api's GET
+	// /orders/{id} receives that UUID from the URL path, not the caller's
+	// own SourceOrderID, so FindBySourceOrderID doesn't fit.
+	FindByID(ctx context.Context, id uuid.UUID) (*Order, error)
 	UpdateStatus(ctx context.Context, uow UnitOfWork, id uuid.UUID, status OrderStatus) error
 }

@@ -1,0 +1,36 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: notification-consumer-worker
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: notification-consumer-worker
+  minReplicaCount: {{ .Values.notificationConsumerWorker.keda.minReplicaCount }}
+  maxReplicaCount: {{ .Values.notificationConsumerWorker.keda.maxReplicaCount }}
+  pollingInterval: {{ .Values.notificationConsumerWorker.keda.pollingInterval }}
+  cooldownPeriod: {{ .Values.notificationConsumerWorker.keda.cooldownPeriod }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: {{ .Values.notificationConsumerWorker.keda.scaleUpStabilizationSeconds }}
+          policies:
+            - type: Pods
+              value: {{ .Values.notificationConsumerWorker.keda.maxReplicaCount }}
+              periodSeconds: {{ .Values.notificationConsumerWorker.keda.pollingInterval }}
+        scaleDown:
+          stabilizationWindowSeconds: {{ .Values.notificationConsumerWorker.keda.scaleDownStabilizationSeconds }}
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: http
+        # The one unsharded notification queue — see rmq.NotificationStream's
+        # doc comment for why this isn't per-(event_type,event_subtype) like
+        # the order/fulfillment ScaledObjects.
+        queueName: {{ .Values.notificationConsumerWorker.queueName }}
+        mode: QueueLength
+        value: {{ .Values.notificationConsumerWorker.keda.queueLengthValue | quote }}
+        hostFromEnv: RABBITMQ_MANAGEMENT_URL

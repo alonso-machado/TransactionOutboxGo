@@ -41,6 +41,14 @@ func (r *GORMChargeRepository) FindByProviderRef(ctx context.Context, providerRe
 	return toDomainCharge(m), nil
 }
 
+func (r *GORMChargeRepository) FindByOrderID(ctx context.Context, orderID uuid.UUID) (*domain.Charge, error) {
+	var m ChargeModel
+	if err := r.db.WithContext(ctx).Where("order_id = ?", orderID).First(&m).Error; err != nil {
+		return nil, err
+	}
+	return toDomainCharge(m), nil
+}
+
 func (r *GORMChargeRepository) UpdateStatus(ctx context.Context, uow domain.UnitOfWork, id uuid.UUID, status domain.ChargeStatus) error {
 	db := TxFromContext(ctx, r.db)
 	return db.Model(&ChargeModel{}).Where("id = ?", id).Update("status", string(status)).Error
