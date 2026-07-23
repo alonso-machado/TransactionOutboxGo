@@ -4,9 +4,9 @@
 // RabbitMQ). fulfillment-consumer-worker consumes one payment_event_outbox
 // shard's queue (CONSUMER_QUEUE, e.g.
 // "payments.concert.rock.queue"): on a CONFIRMED payment it marks the
-// Charge/Order PAID and issues every RESERVED ticket for the order (QR PNG +
-// HMAC signature); on FAILED it marks them FAILED/VOID, releasing the
-// reservation.
+// Charge/Order PAID, issues every RESERVED ticket for the order (QR PNG +
+// HMAC signature), and emails it synchronously; on FAILED it marks them
+// FAILED/VOID, releasing the reservation.
 package main
 
 import (
@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/emailsender"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/messaging"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/persistence"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/ticketqr"
@@ -77,9 +78,14 @@ func main() {
 	ticketRepo := persistence.NewTicketRepository(db)
 	orderRepo := persistence.NewOrderRepository(db)
 	qr := ticketqr.New(cfg.TicketSigningSecret)
-	notificationOutboxRepo := persistence.NewOutboxRepository(db, "ticket_notification_outbox", cfg.RetryBackoffBase, cfg.RetryBackoffCap)
+	notificationRepo := persistence.NewTicketNotificationRepository(db, cfg.RetryBackoffBase, cfg.RetryBackoffCap)
+	sender, err := emailsender.New(cfg.EmailProvider, cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUsername, cfg.SMTPPassword, cfg.SMTPFromEmail, cfg.SMTPFromName)
+	if err != nil {
+		slog.ErrorContext(ctx, "email sender init failed", "err", err.Error())
+		os.Exit(1)
+	}
 
-	issueTicketsUC := fulfillment.New(chargeRepo, ticketRepo, orderRepo, qr, notificationOutboxRepo, uow, eventType, eventSubtype)
+	issueTicketsUC := fulfillment.New(chargeRepo, ticketRepo, orderRepo, qr, notificationRepo, sender, uow)
 	consumer := messaging.NewConsumer(conn, issueTicketsUC, stream, eventType, eventSubtype, cfg.PrefetchCount, cfg.MaxDeliveries, cfg.RetryBackoffBase, cfg.RetryBackoffCap)
 
 	runCtx, cancel := context.WithCancel(ctx)

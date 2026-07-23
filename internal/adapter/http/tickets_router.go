@@ -1,10 +1,13 @@
 package handler
 
 import (
+	docs "github.com/alonsomachado/transaction-outbox-go/docs/tickets-api"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/http/ratelimit"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/http/staffauth"
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/gin-gonic/gin"
+	swaggerFiles "github.com/swaggo/files"
+	ginSwagger "github.com/swaggo/gin-swagger"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 )
 
@@ -47,6 +50,11 @@ func NewTicketsRouter(
 		holderGroup.Use(ratelimit.Middleware(rl.RateLimitStore, rl.RateLimitRate, rl.RateLimitBurst))
 	}
 	holderGroup.PATCH("/tickets/:id/holder", ticketHolderHandler.Handle)
+
+	if swaggerEnabled {
+		docs.SwaggerInfo.Title = serviceName
+		r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+	}
 
 	return r
 }

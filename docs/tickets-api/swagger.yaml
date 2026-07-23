@@ -1,0 +1,215 @@
+basePath: /
+definitions:
+  internal_adapter_http.CheckinRequestDTO:
+    properties:
+      signature:
+        type: string
+      ticketId:
+        type: string
+      validationCode:
+        type: string
+    type: object
+  internal_adapter_http.CheckinResponseDTO:
+    properties:
+      outcome:
+        type: string
+      ticket:
+        $ref: '#/definitions/internal_adapter_http.CheckinTicketDTO'
+    type: object
+  internal_adapter_http.CheckinTicketDTO:
+    properties:
+      buyerName:
+        type: string
+      row:
+        type: string
+      seat:
+        type: string
+      section:
+        type: string
+    type: object
+  internal_adapter_http.OrderStatusResponseDTO:
+    properties:
+      checkoutUrl:
+        type: string
+      orderId:
+        type: string
+      status:
+        type: string
+    type: object
+  internal_adapter_http.UpdateHolderRequestDTO:
+    properties:
+      name:
+        type: string
+    type: object
+  internal_adapter_http.UpdateHolderResponseDTO:
+    properties:
+      buyerName:
+        type: string
+      ticketId:
+        type: string
+    type: object
+info:
+  contact: {}
+  description: |-
+    Order-status lookup, staff-authenticated ticket check-in, and ticket-holder
+    name correction, reading/writing the events database directly.
+  title: Transaction Outbox — Event Ticket System Tickets API
+  version: "1.0"
+paths:
+  /api/v1/checkin:
+    post:
+      consumes:
+      - application/json
+      description: |-
+        Verifies the ticket's HMAC signature and flips it VALID -> CHECKED_IN. Requires a
+        staff Bearer token. Idempotent: checking in an already-checked-in ticket returns
+        ALREADY_CHECKED_IN, not an error.
+      parameters:
+      - description: Scanned ticket QR fields
+        in: body
+        name: checkin
+        required: true
+        schema:
+          $ref: '#/definitions/internal_adapter_http.CheckinRequestDTO'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/internal_adapter_http.CheckinResponseDTO'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Conflict
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Check in a ticket
+      tags:
+      - checkin
+  /api/v1/orders/{id}:
+    get:
+      description: |-
+        Returns the order's status and checkout URL. checkoutUrl is empty until
+        order-consumer-worker has opened a checkout for this order — keep polling, not an error.
+      parameters:
+      - description: Order ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/internal_adapter_http.OrderStatusResponseDTO'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Get order status
+      tags:
+      - order-status
+  /api/v1/tickets/{id}/holder:
+    patch:
+      consumes:
+      - application/json
+      description: Updates the buyer name on a VALID or CHECKED_IN ticket. Rate-limited
+        per source IP.
+      parameters:
+      - description: Ticket ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: New holder name
+        in: body
+        name: holder
+        required: true
+        schema:
+          $ref: '#/definitions/internal_adapter_http.UpdateHolderRequestDTO'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/internal_adapter_http.UpdateHolderResponseDTO'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Conflict
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Too Many Requests
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Correct a ticket holder's name
+      tags:
+      - tickets
+  /healthz:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Health check
+      tags:
+      - health
+swagger: "2.0"

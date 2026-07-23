@@ -1,0 +1,18 @@
+{{- if .Values.backstage.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: backstage
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: backstage
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.backstage.service.type | default "ClusterIP" }}
+  selector:
+    app: backstage
+  ports:
+    - name: http
+      port: 7007
+      targetPort: 7007
+{{- end }}

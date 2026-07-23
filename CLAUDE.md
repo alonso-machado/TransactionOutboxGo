@@ -37,16 +37,18 @@ A Go monorepo implementing the **Transactional Outbox** pattern for an
   messages (same routing): on a `CONFIRMED` payment it marks the `Charge`/
   `Order` `PAID` and issues every `RESERVED` ticket for the order (QR PNG +
   HMAC signature); on `FAILED` it marks them `FAILED`/`VOID`, releasing the
-  reservation. Right after `MarkIssued`, it also enqueues a
-  `ticket_notification_outbox` row per issued ticket — **as a separate,
-  best-effort write against the `outbox` database**, not inside the same
-  transaction as `MarkIssued` (Postgres has no cross-database transactions,
-  so `order_outbox`/`payment_event_outbox`/`ticket_notification_outbox`
-  living in a different logical database than `tickets`/`charges`/`orders`
-  makes true atomicity impossible here — a real, documented gap: a ticket
-  can end up issued with no notification enqueued if this second write
-  fails). Both consumer workers scale on their own shard's queue depth via
-  KEDA (min 0).
+  reservation. Right after `MarkIssued`, it also inserts a
+  `ticket_notifications` row per issued ticket — **inside the same
+  events-DB transaction as `MarkIssued`**, since (unlike the old
+  cross-database outbox design) this table lives in the `events` database
+  too, so it's genuinely atomic: a ticket can never end up issued without a
+  notification row, or vice versa. Once that transaction commits, it emails
+  the ticket synchronously via the configured `domain.EmailSender` (no
+  RabbitMQ hop) and records the outcome on that row
+  (`email_sent_timestamp`/`email_sent_error`); a send failure there is
+  best-effort/log-only — `notification-retry-cron` (see below) picks up
+  anything still unsent. Both consumer workers scale on their own shard's
+  queue depth via KEDA (min 0).
 - **`tickets-api`** (Phase 8) — a synchronous REST service, the mirror
   image of `ingestion-api`: reads/writes the `events` database directly and
   never touches RabbitMQ or the outbox tables. Serves `GET
@@ -58,15 +60,15 @@ A Go monorepo implementing the **Transactional Outbox** pattern for an
   `VALID`→`CHECKED_IN`), and `PATCH /api/v1/tickets/{id}/holder` (buyer-name
   correction, rate-limited per source IP via the same leaky-bucket
   `ratelimit` package `ingestion-api` uses, **no auth**).
-- **`notification-consumer-worker`** (Phase 8) — consumes
-  `ticket_notification_outbox`'s single, **unsharded** queue (see
-  `rmq.NotificationStream`'s doc comment: email-sending has no per-genre
-  resource contention to isolate and this consumer makes zero DB calls, so
-  it's the one stream deliberately not routed by `event_type`/`event_subtype`)
-  and sends the ticket's QR PNG by email via the configured
-  `domain.EmailSender` (`fake` default, or `smtp` — a real, stdlib-only
-  `net/smtp` sender, no third-party email SDK). No dedup/replay-safety: a
-  redelivered message just resends the email (documented scope cut).
+- **`notification-retry-cron`** — a **Kubernetes `CronJob`**, not a
+  `-consumer-worker` (it never consumes from RabbitMQ, so that naming
+  convention doesn't apply to it): wakes up on a schedule (every 2 minutes
+  by default), finds every `ticket_notifications` row still missing
+  `email_sent_timestamp` whose backoff window (`next_retry_at`) has passed,
+  retries sending each via the same `domain.EmailSender` (`fake` default, or
+  `smtp` — a real, stdlib-only `net/smtp` sender, no third-party email SDK),
+  and exits. No RabbitMQ connection, no long-running process, no metrics
+  server — a job this small and short-lived doesn't need one.
 
 **No observable "PENDING, no charge yet" window**: `checkout.ProcessOrder`
 creates the `Order` row and the `Charge`/checkout URL in one transaction —
@@ -79,20 +81,22 @@ loop must treat an early `404` on its own just-created `orderId` as "keep
 polling," not a hard failure.
 
 **Two databases, one Postgres instance:** `ingestion-api` + `outbox-worker`
-use the `outbox` database (`order_outbox` + `payment_event_outbox` +
-`ticket_notification_outbox`); `order-consumer-worker` +
-`fulfillment-consumer-worker` + `tickets-api` use the `events` database
-(`locations`, `events`, `producers`, `event_areas`, `orders`, `tickets`,
-`charges`, `staff_users`). No transaction spans the two — this is a hard
-Postgres limitation, not just a convention — so the transactional-outbox
+use the `outbox` database (`order_outbox` + `payment_event_outbox`);
+`order-consumer-worker` + `fulfillment-consumer-worker` + `tickets-api` +
+`notification-retry-cron` use the `events` database (`locations`, `events`,
+`producers`, `event_areas`, `orders`, `tickets`, `charges`, `staff_users`,
+`ticket_notifications`). No transaction spans the two databases — this is a
+hard Postgres limitation, not just a convention — so the transactional-outbox
 guarantee (atomic outbox insert) is preserved for `ingestion-api`'s own
-writes; `fulfillment-consumer-worker`'s notification enqueue is the one
-place this system does a **best-effort, non-atomic** cross-database write
-(see above). Each process keeps a single `DATABASE_URL` pointed at its own
-database. `notification-consumer-worker` still requires a `DATABASE_URL`
-env (pointed at `events`, unused) purely to satisfy `config.Config`'s
-shared `required:"true"` tag — same "provide but ignore" precedent
-`ingestion-api` already sets for its own unused `RABBITMQ_URL`.
+writes; ticket notifications avoid the cross-database problem entirely by
+living in the `events` database alongside the `tickets` they track, so
+`fulfillment-consumer-worker` inserts the notification row in the same
+transaction as `MarkIssued` — no best-effort write needed there anymore.
+Each process keeps a single `DATABASE_URL` pointed at its own database.
+`notification-retry-cron` still requires a `RABBITMQ_URL` env (unused —
+it never connects to RabbitMQ) purely to satisfy `config.Config`'s shared
+`required:"true"` tag — same "provide but ignore" precedent `ingestion-api`
+already sets for its own unused `RABBITMQ_URL`.
 
 **Payment is an outbound port, not the domain.** `internal/domain.PaymentGateway`
 is the only place the system touches payment: `order-consumer-worker` calls
@@ -130,7 +134,9 @@ longer in the repo** — removed along with the payments domain they described;
 git history is the only remaining record of them.
 Phase 6 plan — **superseded, absorbed into Phase 7** (its ticket-relay/QR ideas live on inside the pivot below): [`.claude/plan-phase6.md`](.claude/plan-phase6.md)
 Phase 7 plan — pivot from the payments domain to this Event Ticket System (two outboxes, `event_type`/`event_subtype` routing, `PaymentGateway` port, Pulumi removed in favor of Helm+KIND): [`.claude/plan-phase7-tickets-pivot.md`](.claude/plan-phase7-tickets-pivot.md)
-Phase 8 plan — **the current architecture, fully implemented**: order-status polling, `tickets-api`, staff-authenticated check-in (Clerk), ticket-holder name correction, ticket email delivery (`notification-consumer-worker`, third outbox table), `govulncheck` wired into CI for real: [`.claude/plan-phase8-tickets-checkin-notifications.md`](.claude/plan-phase8-tickets-checkin-notifications.md)
+Phase 8 plan — order-status polling, `tickets-api`, staff-authenticated check-in (Clerk), ticket-holder name correction, `govulncheck` wired into CI for real: [`.claude/plan-phase8-tickets-checkin-notifications.md`](.claude/plan-phase8-tickets-checkin-notifications.md). **Its notification-delivery design (RabbitMQ + `ticket_notification_outbox` + `notification-consumer-worker`) has since been superseded** — see the simplification below: ticket email now sends synchronously from `fulfillment-consumer-worker`, tracked in the `events`-DB `ticket_notifications` table, retried by the `notification-retry-cron` Kubernetes CronJob (no RabbitMQ involved).
+Phase 9 plan — self-hosted Backstage (Software Catalog + API docs + TechDocs) cataloging all six services + `outbox-admin`, closing a real swaggo gap where `tickets-api` was never wired into `make swag`: [`.claude/plan-phase9-backstage.md`](.claude/plan-phase9-backstage.md)
+Phase 10 plan — **not yet implemented, sequenced after Phase 9**. RabbitMQ → Kafka (KRaft) migration: `segmentio/kafka-go`, Bitnami Kafka on KIND, KEDA scaling switches from queue-depth to consumer-group lag: [`.claude/plan-phase10-kafka-migration.md`](.claude/plan-phase10-kafka-migration.md)
 User-facing docs: [`README.md`](README.md)
 
 ---
@@ -142,7 +148,7 @@ User-facing docs: [`README.md`](README.md)
 ```
 infrastructure  (Gin · GORM · amqp091 · Postgres · config · main / DI)
   └── adapter   (http handlers/DTOs · GORM repos · RabbitMQ pub/consumer · PaymentGateway/EmailSender/StaffAuthenticator adapters · QR)
-        └── usecase   (PlaceOrder · ReceivePaymentEvent · DispatchOutbox · ProcessOrder · IssueTickets · CheckIn · UpdateHolder · SendNotification)
+        └── usecase   (PlaceOrder · ReceivePaymentEvent · DispatchOutbox · ProcessOrder · IssueTickets · CheckIn · UpdateHolder · SendTicketNotification)
               └── domain   (entities + port interfaces) ← ZERO external imports
 ```
 
@@ -157,42 +163,45 @@ domain port interfaces.
 
 | What | Path |
 |---|---|
-| Entities (`Order`, `Ticket`, `Charge`, `Event`, `Location`, `OutboxMessage`, `StaffUser`) | `internal/domain/` |
-| Port interfaces (`OrderRepository`, `TicketRepository`, `ChargeRepository`, `EventRepository`, `LocationRepository`, `OutboxRepository`, `PaymentGateway`, `EmailSender`, `StaffAuthenticator`, `StaffUserRepository`, `TicketQR`, `Publisher`, `UnitOfWork`) | `internal/domain/` |
+| Entities (`Order`, `Ticket`, `Charge`, `Event`, `Location`, `OutboxMessage`, `TicketNotification`, `StaffUser`) | `internal/domain/` |
+| Port interfaces (`OrderRepository`, `TicketRepository`, `ChargeRepository`, `EventRepository`, `LocationRepository`, `OutboxRepository`, `TicketNotificationRepository`, `PaymentGateway`, `EmailSender`, `StaffAuthenticator`, `StaffUserRepository`, `TicketQR`, `Publisher`, `UnitOfWork`) | `internal/domain/` |
 | `PlaceOrder` use-case (`POST /api/v1/orders` → `order_outbox`) | `internal/usecase/order/` |
 | `ReceivePaymentEvent` use-case (`POST /api/v1/webhooks/payments/{provider}` → `payment_event_outbox`) | `internal/usecase/webhook/` |
-| `DispatchOutbox` use-case — Transactional Outbox core (poll → dedup → publish → mark), generalized over a table name so one implementation drives all three outboxes | `internal/usecase/outbox/` |
+| `DispatchOutbox` use-case — Transactional Outbox core (poll → dedup → publish → mark), generalized over a table name so one implementation drives both outboxes | `internal/usecase/outbox/` |
 | `ProcessOrder` use-case (order-consumer-worker: upsert Location/Event, reserve Tickets, `PaymentGateway.CreateCheckout`, persist Charge) | `internal/usecase/checkout/` |
-| `IssueTickets` use-case (fulfillment-consumer-worker: mark Charge/Order PAID + issue Tickets (or FAILED/VOID) + best-effort enqueue `ticket_notification_outbox`) | `internal/usecase/fulfillment/` |
+| `IssueTickets` use-case (fulfillment-consumer-worker: mark Charge/Order PAID + issue Tickets (or FAILED/VOID), insert a `ticket_notifications` row atomically with `MarkIssued`, then email each ticket synchronously) | `internal/usecase/fulfillment/` |
 | `CheckIn` use-case (tickets-api: verify QR signature + venue scope, flip VALID→CHECKED_IN) | `internal/usecase/checkin/` |
 | `UpdateHolder` use-case (tickets-api: correct a ticket's buyer name) | `internal/usecase/ticketholder/` |
-| `SendNotification` use-case (notification-consumer-worker: `MessageProcessor` over `ticket_notification_outbox`, no DB access) | `internal/usecase/notification/` |
+| `SendTicketNotification` use-case (`Send` is duplicated into `usecase/fulfillment` too — use-cases must not depend on one another — but `RetryPending` is notification-retry-cron's whole job: find every `ticket_notifications` row still unsent and retry) | `internal/usecase/notification/` |
 | Gin router(s), order/webhook/order-status/checkin/ticketholder handlers, DTOs, middleware | `internal/adapter/http/` |
 | Staff-auth Gin middleware (Bearer token → `StaffUser` on context, check-in route only) | `internal/adapter/http/staffauth/` |
 | GORM DB models + repository implementations + UnitOfWork | `internal/adapter/persistence/` |
-| RabbitMQ publisher + one generalized consumer (`MessageProcessor` interface, shared by all three consumer workers) | `internal/adapter/messaging/` |
+| RabbitMQ publisher + one generalized consumer (`MessageProcessor` interface, shared by order-consumer-worker and fulfillment-consumer-worker) | `internal/adapter/messaging/` |
 | `PaymentGateway` adapters (`stripe` real, `fake` sandbox, `abacatepay`/`lemonsqueezy`/`pagarme`/`mercadopago`/`pagseguro`/`sumup` stubs) | `internal/adapter/paymentgateway/` |
-| `EmailSender` adapters (`fake` default, `smtp` real via stdlib `net/smtp`) | `internal/adapter/emailsender/` |
+| `EmailSender` adapters (`fake` default, `smtp` real via stdlib `net/smtp`) + the shared `EMAIL_PROVIDER` selection factory | `internal/adapter/emailsender/` |
 | `StaffAuthenticator` adapters (`clerk` real via `clerk-sdk-go/v2`, `fake` default) | `internal/adapter/staffauth/` |
 | Ticket QR PNG + HMAC signing/verification | `internal/adapter/ticketqr/` |
 | `Config` struct (envconfig) | `internal/infrastructure/config/` |
 | DB connection bootstrap | `internal/infrastructure/database/` |
-| RabbitMQ connection + `EventTypes` registry + topology declaration + `NotificationStream`'s unsharded sentinel | `internal/infrastructure/rabbitmq/` |
+| RabbitMQ connection + `EventTypes` registry + topology declaration | `internal/infrastructure/rabbitmq/` |
 | Composition root / DI (ingestion-api — HTTP + rate limit, writes both outboxes) | `cmd/ingestion-api/main.go` |
-| Composition root / DI (outbox-worker — three `DispatchOutbox` loops + LISTEN/NOTIFY) | `cmd/outbox-worker/main.go` |
+| Composition root / DI (outbox-worker — two `DispatchOutbox` loops + LISTEN/NOTIFY) | `cmd/outbox-worker/main.go` |
 | Composition root / DI (order-consumer-worker) | `cmd/order-consumer-worker/main.go` |
-| Composition root / DI (fulfillment-consumer-worker) | `cmd/fulfillment-consumer-worker/main.go` |
+| Composition root / DI (fulfillment-consumer-worker — also wires `EmailSender`) | `cmd/fulfillment-consumer-worker/main.go` |
 | Composition root / DI (tickets-api — HTTP, events DB, no RabbitMQ) | `cmd/tickets-api/main.go` |
-| Composition root / DI (notification-consumer-worker — no DB access, one unsharded queue) | `cmd/notification-consumer-worker/main.go` |
+| Composition root / DI (notification-retry-cron — a Kubernetes CronJob, no RabbitMQ, runs `RetryPending` once and exits) | `cmd/notification-retry-cron/main.go` |
 | Maintenance CLI (DLQ replay/drain, `--outbox`/`--stream`/`--event-type`/`--event-subtype` flags) | `cmd/outbox-admin/main.go` |
 | Versioned migrations, split per database | `migrations/outbox/`, `migrations/events/` |
 | Docker Compose (local dev) | `docker-compose.yml` |
 | Multi-stage Dockerfile (ARG SERVICE) | `Dockerfile` |
-| Helm chart (fixed-replica `ingestion-api`/`tickets-api`; one `outbox-worker` Deployment + KEDA postgresql ScaledObject summing all three outboxes; one order/fulfillment-consumer-worker Deployment/Rollout + ScaledObject pair per `eventShards` entry; one unsharded `notification-consumer-worker` Deployment + ScaledObject; `canary.enabled` switches Deployment+HPA ↔ Argo Rollout+AnalysisTemplate for the four Phase 7 services — `tickets-api`/`notification-consumer-worker` have no Rollout variant yet, always plain Deployments) | `helmcharts/transaction-outbox/` |
+| Helm chart (fixed-replica `ingestion-api`/`tickets-api`; one `outbox-worker` Deployment + KEDA postgresql ScaledObject summing both outboxes; one order/fulfillment-consumer-worker Deployment/Rollout + ScaledObject pair per `eventShards` entry; one `notification-retry-cron` Kubernetes CronJob, no Deployment/ScaledObject; `canary.enabled` switches Deployment+HPA ↔ Argo Rollout+AnalysisTemplate for the four Phase 7 services — `tickets-api`/`notification-retry-cron` have no Rollout variant, the latter because a CronJob isn't a canary-able rollout target) | `helmcharts/transaction-outbox/` |
 | KIND cluster + values override (the actual deploy/test path — see "What NOT to do") | `infra/kind/` |
 | Rate limiter (leaky-bucket IP throttle; ingestion-api's `POST /orders`, tickets-api's `PATCH .../holder`) | `internal/adapter/http/ratelimit/` |
 | Prometheus/Grafana provisioning (dashboards, datasource, postgres-exporter queries) | `observability/` |
 | GitHub Actions CI/CD (one workflow per microservice — see below) | `.github/workflows/` |
+| Backstage developer portal (Software Catalog + API docs + TechDocs, Phase 9 — Node/TypeScript, the repo's only non-Go toolchain, **not** built/linted via `make build`/`make lint`) | `backstage/` |
+| Backstage catalog entities (System + Group + one Component per binary + API entities for ingestion-api/tickets-api) | `catalog-info.yaml` |
+| TechDocs source (rendered by Backstage) | `mkdocs.yml`, `docs/index.md` |
 | PII redaction (`Redact`/`RedactJSON`, masks `email`/`document`/`validationCode`/`signature` — buyer **name** deliberately NOT masked, see Phase 8 plan Part I) | `internal/domain/pii/` |
 | Integration tests (TestContainers: Postgres + RabbitMQ) | `tests/integration/` |
 | k6 load tests (order intake, KEDA autoscaling, order-consumer-worker in isolation) | `loadtest/` |
@@ -202,11 +211,13 @@ domain port interfaces.
 ## Key conventions
 
 - **GORM structs** live only in `adapter/persistence`, not in `domain`. Domain
-  entities are plain Go structs. Repositories map between them. All three
-  outbox tables (`order_outbox`/`payment_event_outbox`/`ticket_notification_outbox`)
-  share ONE GORM repository implementation (`GORMOutboxRepository`), parameterized
-  by table name via `.Table(name)` rather than a fixed `TableName()` model — the
-  tables are schema-identical.
+  entities are plain Go structs. Repositories map between them. The two
+  outbox tables (`order_outbox`/`payment_event_outbox`) share ONE GORM
+  repository implementation (`GORMOutboxRepository`), parameterized by table
+  name via `.Table(name)` rather than a fixed `TableName()` model — the
+  tables are schema-identical. `ticket_notifications` is a different shape
+  (no RabbitMQ routing columns needed) and gets its own repository,
+  `GORMTicketNotificationRepository`.
 - **Port interfaces** are defined in `domain` and implemented in `adapter`.
   `usecase` depends on the interface type, never on the concrete adapter.
 - **UnitOfWork** (`domain/uow.go`) abstracts DB transactions so `usecase` can
@@ -260,24 +271,21 @@ domain port interfaces.
   `PUBLISHED`, `NEW` → `RETRYING`, `RETRYING` → `PUBLISHED`, `RETRYING` →
   `DEAD_LETTER` (after max retries).
 - **`DispatchOutbox`** (`usecase/outbox`) is the Transactional Outbox core: it
-  runs as **three goroutines inside the `outbox-worker` process**
+  runs as **two goroutines inside the `outbox-worker` process**
   (`cmd/outbox-worker/main.go`), one per outbox table, sharing one publisher
   and connection. Use `context.Context` for graceful shutdown. Use
   `FOR UPDATE SKIP LOCKED` so multiple replicas (KEDA can scale past 1 under
   backlog) never double-publish. Only `order_outbox` gets a LISTEN/NOTIFY
-  trigger (channel `order_outbox_new`) — `payment_event_outbox` and
-  `ticket_notification_outbox` are poll-only (lower volume, no low-latency
-  need).
+  trigger (channel `order_outbox_new`) — `payment_event_outbox` is poll-only
+  (lower volume, no low-latency need).
 - **Publisher confirms** must be enabled on the `DispatchOutbox` AMQP channel. Never
   mark a row `PUBLISHED` before the confirm ACK arrives.
 - **Manual ack + prefetch** on every consumer worker — one generalized
   `AMQPConsumer` (`internal/adapter/messaging/consumer.go`) parameterized by a
   `MessageProcessor` interface serves `order-consumer-worker`
-  (`checkout.ProcessOrder`), `fulfillment-consumer-worker`
-  (`fulfillment.IssueTickets`), and `notification-consumer-worker`
-  (`notification.SendNotification`); only call `msg.Ack()` after the DB
-  transaction commits successfully (`notification-consumer-worker` has no DB
-  transaction at all — it acks once `EmailSender.Send` returns without error).
+  (`checkout.ProcessOrder`) and `fulfillment-consumer-worker`
+  (`fulfillment.IssueTickets`); only call `msg.Ack()` after the DB
+  transaction commits successfully.
 - **Ticket issuance**: `fulfillment.IssueTickets` generates a random
   `validationCode`, an HMAC-SHA256 `signature` over `ticketID + ":" +
   validationCode` (key: `TICKET_SIGNING_SECRET`), a compact `qrContent` token
@@ -287,20 +295,11 @@ domain port interfaces.
   secret) bool` is the symmetric check `usecase/checkin.CheckIn` calls,
   recomputing the HMAC from the ticket's **stored** row (never trusting the
   check-in request's fields in isolation, so a QR copied from a
-  different/voided ticket can't be replayed).
-- **`ticket_notification_outbox`'s `EventType`/`EventSubtype` columns hold a
-  fixed sentinel (`"_ALL"`/`"_ALL"`), never the ticket's real event type** —
-  `AMQPPublisher.fire` computes the routing key straight from
-  `OutboxMessage.EventType`/`EventSubtype`, and `notification-consumer-worker`'s
-  queue is bound only to routing key `notification._all._all`; stamping the
-  real `(event_type, event_subtype)` there instead would route the message
-  to a key nothing is bound to — a topic-exchange black hole, caught by the
-  integration suite, not by code review or `go vet`. The real event
-  type/subtype still ride in the JSON **payload** body for reporting;
-  `internal/infrastructure/rabbitmq.NotificationSentinelType`/
-  `NotificationSentinelSubtype` are the canonical constants (duplicated as a
-  bare string literal inside `usecase/fulfillment`, which must not import
-  `infrastructure/rabbitmq` per the dependency rule).
+  different/voided ticket can't be replayed). Right after `MarkIssued`,
+  `IssueTickets` inserts the ticket's `ticket_notifications` row in the same
+  transaction, then (once committed) emails it synchronously and records
+  `email_sent_timestamp`/`email_sent_error` — `notification-retry-cron`
+  retries anything still unsent later.
 
 ---
 
@@ -333,6 +332,12 @@ make up       # podman compose up --build -d
 make logs     # tail logs from all services
 make down     # podman compose down -v (removes volumes)
 make seed     # curl a sample order POST to the ingestion-api
+
+# Backstage (backstage/) is Node/TypeScript, not Go — it is NOT covered by
+# make build/test/lint above. It has its own containerized targets and its
+# own CI workflow (backstage.yml); see "Where things live".
+make backstage-build
+make backstage-up
 ```
 
 ## Linting rules
@@ -357,7 +362,7 @@ done. Key rules enforced:
 [`order-consumer-worker.yml`](.github/workflows/order-consumer-worker.yml),
 [`fulfillment-consumer-worker.yml`](.github/workflows/fulfillment-consumer-worker.yml),
 [`tickets-api.yml`](.github/workflows/tickets-api.yml), and
-[`notification-consumer-worker.yml`](.github/workflows/notification-consumer-worker.yml).
+[`notification-retry-cron.yml`](.github/workflows/notification-retry-cron.yml).
 Each is triggered only by changes to its own `cmd/<service>/**` path (plus
 shared `internal/**`/`go.mod`/`go.sum`/`Dockerfile`), so a change scoped to
 one service never triggers or gates the others. All six follow the same
@@ -401,29 +406,26 @@ for the full rationale.
   There are **six** service binaries plus the `outbox-admin` CLI.
 - Do **not** point a service at the wrong database. ingestion-api and
   outbox-worker → `outbox` DB; order-consumer-worker,
-  fulfillment-consumer-worker, and tickets-api → `events` DB;
-  notification-consumer-worker touches neither (its `DATABASE_URL` is
-  unused, see above). New outbox-related migrations go in
-  `migrations/outbox/`, events-domain ones in `migrations/events/`.
-- Do **not** try to make `fulfillment-consumer-worker`'s notification
-  enqueue atomic with `MarkIssued` by wrapping both in the same
-  `UnitOfWork.Execute` call — they're on two different databases, and
-  Postgres has no cross-database transactions. Passing the events-DB
-  transaction's `ctx` into `GORMOutboxRepository.Enqueue` (which targets the
-  outbox DB) silently redirects the INSERT onto the wrong database's
-  transaction via `TxFromContext`, failing with "relation does not exist"
-  — a real bug this exact mistake caused during Phase 8, caught only by the
-  integration suite. Enqueue the notification with a **fresh, non-tx
-  context** (`nil` for `uow`) after the events-DB transaction has already
-  committed.
+  fulfillment-consumer-worker, tickets-api, and notification-retry-cron →
+  `events` DB. New outbox-related migrations go in `migrations/outbox/`,
+  events-domain ones (including `ticket_notifications`) in
+  `migrations/events/`.
+- Do **not** try to route `usecase/fulfillment.IssueTickets`'s
+  `notificationRepo.Create` call through a **fresh, non-tx context** (`nil`
+  `uow`) the way the old cross-database `ticket_notification_outbox` enqueue
+  had to — `ticket_notifications` lives in the same `events` database as
+  `tickets` now, so it belongs **inside** `confirmAndIssue`'s transaction
+  (same `uow`), same as `MarkIssued`. That's what makes it atomic; passing a
+  non-tx context here would silently reintroduce the old best-effort gap for
+  no reason.
 - Do **not** use `AutoMigrate` in tests — use a test transaction rollback or a
   dedicated test schema.
 - **Any service that consumes from RabbitMQ must have a name ending in
   `-consumer-worker`** (company convention) — e.g.
-  `order-consumer-worker`/`fulfillment-consumer-worker`/
-  `notification-consumer-worker`, never `order-worker`/`fulfillment-worker`/
-  `notification-worker`. `outbox-worker` is exempt (it only publishes, never
-  consumes).
+  `order-consumer-worker`/`fulfillment-consumer-worker`, never
+  `order-worker`/`fulfillment-worker`. `outbox-worker` is exempt (it only
+  publishes, never consumes); `notification-retry-cron` is exempt too (it's
+  a Kubernetes CronJob that never touches RabbitMQ at all).
 - Do **not** reintroduce card/PAN handling anywhere in this codebase. Payment
   is Stripe-hosted checkout (`PaymentGateway.CreateCheckout` redirects to a
   gateway-hosted page) — no card data ever reaches this system, which is

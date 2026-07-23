@@ -47,8 +47,9 @@ type Config struct {
 	TicketSigningSecret string `envconfig:"TICKET_SIGNING_SECRET" default:"dev-ticket-signing-secret"`
 
 	// EmailProvider selects the domain.EmailSender adapter
-	// notification-consumer-worker wires up: "fake" (no network, the
-	// default — local dev/tests) or "smtp" (real, stdlib net/smtp).
+	// fulfillment-consumer-worker/notification-retry-cron wire up: "fake"
+	// (no network, the default — local dev/tests) or "smtp" (real, stdlib
+	// net/smtp).
 	EmailProvider string `envconfig:"EMAIL_PROVIDER" default:"fake"`
 	SMTPHost      string `envconfig:"SMTP_HOST"`
 	SMTPPort      int    `envconfig:"SMTP_PORT" default:"587"`
@@ -56,6 +57,10 @@ type Config struct {
 	SMTPPassword  string `envconfig:"SMTP_PASSWORD"`
 	SMTPFromEmail string `envconfig:"SMTP_FROM_EMAIL" default:"tickets@example.com"`
 	SMTPFromName  string `envconfig:"SMTP_FROM_NAME" default:"Event Tickets"`
+	// NotificationRetryBatchSize is notification-retry-cron-only — how many
+	// ticket_notifications rows (still missing email_sent_timestamp, backoff
+	// window elapsed) it retries per run.
+	NotificationRetryBatchSize int `envconfig:"NOTIFICATION_RETRY_BATCH_SIZE" default:"50"`
 
 	// Staff auth (tickets-api's POST /api/v1/checkin only). StaffAuthProvider
 	// selects the domain.StaffAuthenticator adapter: "fake" (a fixed test

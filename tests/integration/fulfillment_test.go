@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	emailfake "github.com/alonsomachado/transaction-outbox-go/internal/adapter/emailsender/fake"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/persistence"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/ticketqr"
 	rmq "github.com/alonsomachado/transaction-outbox-go/internal/infrastructure/rabbitmq"
@@ -100,7 +101,7 @@ func TestFulfillment_EndToEnd_OrderToIssuedTickets(t *testing.T) {
 	defer cancelPaymentDispatch()
 	go paymentDispatcher.Run(paymentDispatchCtx, nil)
 
-	fulfillmentConsumer := newFulfillmentConsumer(testEventType, testEventSubtype, 10, 5)
+	fulfillmentConsumer := newFulfillmentConsumer(testEventType, testEventSubtype, 10, 5, emailfake.New())
 	fulfillmentCtx, cancelFulfillment := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelFulfillment()
 	go func() { _ = fulfillmentConsumer.Run(fulfillmentCtx) }()
@@ -164,7 +165,7 @@ func TestFulfillment_PaymentFailed_VoidsTickets(t *testing.T) {
 	defer cancelPaymentDispatch()
 	go paymentDispatcher.Run(paymentDispatchCtx, nil)
 
-	fulfillmentConsumer := newFulfillmentConsumer(testEventType, testEventSubtype, 10, 5)
+	fulfillmentConsumer := newFulfillmentConsumer(testEventType, testEventSubtype, 10, 5, emailfake.New())
 	fulfillmentCtx, cancelFulfillment := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelFulfillment()
 	go func() { _ = fulfillmentConsumer.Run(fulfillmentCtx) }()
@@ -221,7 +222,7 @@ func TestFulfillment_RedeliveredConfirmation_IsNoOp(t *testing.T) {
 	publishPaymentEventRaw(t, msgID, confirmedBody)
 	publishPaymentEventRaw(t, msgID, confirmedBody)
 
-	fulfillmentConsumer := newFulfillmentConsumer(testEventType, testEventSubtype, 10, 5)
+	fulfillmentConsumer := newFulfillmentConsumer(testEventType, testEventSubtype, 10, 5, emailfake.New())
 	fulfillmentCtx, cancelFulfillment := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelFulfillment()
 	go func() { _ = fulfillmentConsumer.Run(fulfillmentCtx) }()
@@ -246,7 +247,7 @@ func TestFulfillment_PoisonMessage_RoutesToDeadLetterQueue(t *testing.T) {
 	publishPaymentEventRaw(t, msgID, body)
 
 	const maxDeliveries = 2
-	consumer := newFulfillmentConsumer(testEventType, testEventSubtype, 10, maxDeliveries)
+	consumer := newFulfillmentConsumer(testEventType, testEventSubtype, 10, maxDeliveries, emailfake.New())
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	go func() { _ = consumer.Run(ctx) }()
@@ -276,7 +277,7 @@ func TestFulfillment_UnknownSchemaVersion_RejectsToDLQOnFirstAttempt(t *testing.
 
 	// maxDeliveries high on purpose: an unknown schema must DLQ on attempt 1
 	// regardless, never retrying.
-	consumer := newFulfillmentConsumer(testEventType, testEventSubtype, 10, 5)
+	consumer := newFulfillmentConsumer(testEventType, testEventSubtype, 10, 5, emailfake.New())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go func() { _ = consumer.Run(ctx) }()
@@ -299,7 +300,7 @@ func TestFulfillment_UnknownProviderRef_RoutesToDeadLetterQueue(t *testing.T) {
 	publishPaymentEventRaw(t, msgID, body)
 
 	const maxDeliveries = 2
-	consumer := newFulfillmentConsumer(testEventType, testEventSubtype, 10, maxDeliveries)
+	consumer := newFulfillmentConsumer(testEventType, testEventSubtype, 10, maxDeliveries, emailfake.New())
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	go func() { _ = consumer.Run(ctx) }()

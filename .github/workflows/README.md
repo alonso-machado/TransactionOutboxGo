@@ -1,14 +1,19 @@
 # CI pipelines
 
-Six **independent** workflows, one per microservice — `ingestion-api.yml`,
+Seven **independent** workflows, one per microservice — `ingestion-api.yml`,
 `outbox-worker.yml`, `order-consumer-worker.yml`,
-`fulfillment-consumer-worker.yml`, `tickets-api.yml`, and
-`notification-consumer-worker.yml`. They're the same shape, but kept as
-separate files rather than one matrixed workflow so a change to one service
-never triggers or gates the others: each has its own `paths:` trigger filter
-(scoped to its own `cmd/<service>/**` plus the shared
-`internal/**`/`go.mod`/`go.sum`/`Dockerfile`), its own run history/status
-badge, and its own required-check configuration in branch protection.
+`fulfillment-consumer-worker.yml`, `tickets-api.yml`,
+`notification-retry-cron.yml`, and (Phase 9) `backstage.yml`. They're the
+same shape, but kept as separate files rather than one matrixed workflow so
+a change to one service never triggers or gates the others: each has its
+own `paths:` trigger filter (scoped to its own `cmd/<service>/**` plus the
+shared `internal/**`/`go.mod`/`go.sum`/`Dockerfile` for the six Go services,
+or `backstage/**` plus `catalog-info.yaml`/`mkdocs.yml`/`docs/index.md` for
+`backstage.yml`), its own run history/status badge, and its own
+required-check configuration in branch protection. `backstage.yml` is
+Node/Yarn tooling instead of Go (`yarn tsc`/`yarn lint:all`/`yarn test:all`
+in place of `go build`/`golangci-lint`/`go test`) but follows the identical
+build → lint → unit-tests → upload gate shape.
 
 ```
 Build → lint: golangci-lint + actionlint + helm lint + govulncheck (GATE) → Unit Tests (GATE) → Upload (ECR/Docker Hub)
@@ -64,7 +69,7 @@ be added back to each workflow independently once that's wired up.
 
 A single workflow with `strategy.matrix.service: [ingestion-api,
 outbox-worker, order-consumer-worker, fulfillment-consumer-worker,
-tickets-api, notification-consumer-worker]` is still **one workflow run** —
+tickets-api, notification-retry-cron]` is still **one workflow run** —
 a failure in one matrix leg shows up in the same run as the others, and a
 single trigger (e.g. a path filter) would have to cover every service's
 paths, so an `internal/`-only change would always run all legs even when

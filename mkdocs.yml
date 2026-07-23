@@ -1,0 +1,9 @@
+site_name: 'Transaction Outbox — Event Ticket System'
+site_description: 'TechDocs source for the Event Ticket System monorepo, rendered by Backstage.'
+
+nav:
+  - Home: index.md
+  - Operations Runbook: runbook.md
+
+plugins:
+  - techdocs-core

@@ -83,6 +83,16 @@ x-fulfillment-consumer-worker-env: &fulfillment-consumer-worker-env
   # validation code with — a fixed dev default here, a real secret via Helm
   # in cloud.
   TICKET_SIGNING_SECRET: "${TICKET_SIGNING_SECRET:-dev-ticket-signing-secret}"
+  # Sends the issued ticket's email synchronously (usecase/fulfillment.
+  # IssueTickets) — fake locally, no SMTP server running in compose; fake
+  # makes no network calls at all, so no mailhog/maildev catcher is required.
+  EMAIL_PROVIDER: "${EMAIL_PROVIDER:-fake}"
+  SMTP_HOST: "${SMTP_HOST:-}"
+  SMTP_PORT: "${SMTP_PORT:-587}"
+  SMTP_USERNAME: "${SMTP_USERNAME:-}"
+  SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+  SMTP_FROM_EMAIL: "${SMTP_FROM_EMAIL:-tickets@example.com}"
+  SMTP_FROM_NAME: "${SMTP_FROM_NAME:-Event Tickets}"
   OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-tempo:4318}"
   LOG_FORMAT: "${LOG_FORMAT:-json}"
 
@@ -452,27 +462,31 @@ services:
     ports:
       - "9094:9094"
 
-  # Phase 8: sends an issued ticket's QR by email, consuming
-  # ticket_notification_outbox's single unsharded queue — one instance, not
-  # a shard pair like order/fulfillment above (see
-  # internal/infrastructure/rabbitmq.NotificationStream's doc comment).
-  notification-consumer-worker:
+  # Retries any ticket_notifications row still missing email_sent_timestamp
+  # (the immediate send happens synchronously inside fulfillment-consumer-worker
+  # instead — see internal/usecase/fulfillment.IssueTickets). This mirrors a
+  # Kubernetes CronJob (helmcharts/transaction-outbox/templates/
+  # notification-retry-cron/cronjob.yaml) but the image is distroless with no
+  # shell, so it can't loop internally like a cron daemon locally — it's a
+  # one-shot, invoked on demand via `make notification-retry-cron` (same
+  # precedent as `make seed`'s one-off curl), never started by `make up`
+  # (the "tools" profile keeps it out of the default service set).
+  notification-retry-cron:
+    profiles: ["tools"]
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        SERVICE: notification-consumer-worker
+        SERVICE: notification-retry-cron
     environment:
-      # Unused (usecase/notification.SendNotification never queries a
-      # database) but config.Config's DatabaseURL carries a shared
-      # required:"true" tag — same "provide but ignore" precedent
-      # ingestion-api sets for its own unused RABBITMQ_URL.
       DATABASE_URL: "postgres://${POSTGRES_USER:-outbox}:${POSTGRES_PASSWORD:-outbox}@pgbouncer:6432/events?sslmode=disable"
+      # Unused (this binary never connects to RabbitMQ) but config.Config's
+      # RabbitMQURL carries a shared required:"true" tag — same "provide but
+      # ignore" precedent ingestion-api sets for its own unused RABBITMQ_URL.
       RABBITMQ_URL: "amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/"
-      PREFETCH_COUNT: "${CONSUMER_PREFETCH:-10}"
-      MAX_DELIVERIES: "${RABBITMQ_MAX_REDELIVERIES:-5}"
       RETRY_BACKOFF_BASE: "${RETRY_BACKOFF_BASE:-1s}"
       RETRY_BACKOFF_CAP: "${RETRY_BACKOFF_CAP:-5m}"
+      NOTIFICATION_RETRY_BATCH_SIZE: "${NOTIFICATION_RETRY_BATCH_SIZE:-50}"
       # fake locally — no SMTP server running in compose; fake makes no
       # network calls at all, so no mailhog/maildev catcher is required.
       EMAIL_PROVIDER: "${EMAIL_PROVIDER:-fake}"
@@ -482,16 +496,9 @@ services:
       SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
       SMTP_FROM_EMAIL: "${SMTP_FROM_EMAIL:-tickets@example.com}"
       SMTP_FROM_NAME: "${SMTP_FROM_NAME:-Event Tickets}"
-      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-notification-consumer-worker}"
-      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-tempo:4318}"
-      METRICS_PORT: "9096"
       LOG_FORMAT: "${LOG_FORMAT:-json}"
-    ports:
-      - "9096:9096"
     depends_on:
       postgres:
-        condition: service_healthy
-      rabbitmq:
         condition: service_healthy
       migrate-events:
         condition: service_completed_successfully
@@ -499,7 +506,6 @@ services:
         condition: service_healthy
     networks:
       - outbox
-    restart: unless-stopped
 
   # ── Observability (Phase 4 Track 3) ───────────────────────────────────────
 
@@ -605,6 +611,27 @@ services:
       - prometheus
       - loki
       - tempo
+    networks:
+      - outbox
+    restart: unless-stopped
+
+  # Phase 9: Software Catalog + API docs + TechDocs over the six service
+  # binaries + outbox-admin (see catalog-info.yaml, .claude/plan-phase9-backstage.md).
+  # Self-contained multi-stage build (backstage/Dockerfile) — the backend
+  # serves the built frontend on the same port in production, so there's
+  # only one port here, same "one container, one port" shape as every Go
+  # service in this file. No RabbitMQ/Postgres dependency: Backstage's own
+  # catalog/techdocs/scaffolder state lives in its in-memory sqlite DB
+  # (app-config.yaml), unrelated to this repo's outbox/events databases.
+  backstage:
+    build:
+      # Repo root, not ./backstage — the Dockerfile also needs the sibling
+      # catalog-info.yaml/mkdocs.yml/docs/ it catalogs (Docker/Podman build
+      # contexts can't reach outside themselves via `..`).
+      context: .
+      dockerfile: backstage/Dockerfile
+    ports:
+      - "7007:7007"
     networks:
       - outbox
     restart: unless-stopped

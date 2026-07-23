@@ -129,3 +129,16 @@ type ChargeModel struct {
 }
 
 func (ChargeModel) TableName() string { return "charges" }
+
+// TicketNotificationModel is the ticket_notifications table (events DB) —
+// tracks email delivery for one issued ticket.
+type TicketNotificationModel struct {
+	TicketID           uuid.UUID  `gorm:"type:uuid;primaryKey;column:ticket_id"`
+	AttemptCount       int        `gorm:"column:attempt_count;not null;default:0"`
+	EmailSentTimestamp *time.Time `gorm:"column:email_sent_timestamp"`
+	EmailSentError     string     `gorm:"column:email_sent_error"`
+	NextRetryAt        *time.Time `gorm:"column:next_retry_at"`
+	CreatedAt          time.Time  `gorm:"column:created_at;not null"`
+}
+
+func (TicketNotificationModel) TableName() string { return "ticket_notifications" }

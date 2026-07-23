@@ -1,0 +1,47 @@
+{{- if .Values.backstage.enabled }}
+# Phase 9: Backstage developer portal (Software Catalog + API docs +
+# TechDocs) — see catalog-info.yaml and .claude/plan-phase9-backstage.md.
+# Plain Deployment, no HPA/canary/KEDA — same shape as pgbouncer/
+# notification-retry-cron, an internal tool rather than a scaled workload
+# on the request path.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backstage
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: backstage
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.backstage.replicas }}
+  selector:
+    matchLabels:
+      app: backstage
+  template:
+    metadata:
+      labels:
+        app: backstage
+    spec:
+      {{- with .Values.backstage.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: backstage
+          image: {{ .Values.image.backstage }}
+          ports:
+            - name: http
+              containerPort: 7007
+          resources:
+            {{- toYaml .Values.backstage.resources | nindent 12 }}
+          readinessProbe:
+            tcpSocket:
+              port: 7007
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 7007
+            initialDelaySeconds: 30
+            periodSeconds: 15
+{{- end }}

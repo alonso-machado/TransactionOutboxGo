@@ -100,11 +100,6 @@ func main() {
 	paymentEventOutboxRepo := persistence.NewOutboxRepository(db, "payment_event_outbox", cfg.RetryBackoffBase, cfg.RetryBackoffCap)
 	paymentEventDispatchUC := outboxuc.New(paymentEventOutboxRepo, publisher, cfg.DispatchBatchSize, cfg.MaxRetries, dispatchInterval, pruneAfter)
 
-	// Third outbox (Phase 8): ticket_notification_outbox, poll-only like
-	// payment_event_outbox (low volume, no low-latency need).
-	ticketNotificationOutboxRepo := persistence.NewOutboxRepository(db, "ticket_notification_outbox", cfg.RetryBackoffBase, cfg.RetryBackoffCap)
-	ticketNotificationDispatchUC := outboxuc.New(ticketNotificationOutboxRepo, publisher, cfg.DispatchBatchSize, cfg.MaxRetries, dispatchInterval, pruneAfter)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -125,6 +120,5 @@ func main() {
 
 	slog.InfoContext(ctx, "outbox-worker started")
 	go paymentEventDispatchUC.Run(ctx, nil)
-	go ticketNotificationDispatchUC.Run(ctx, nil)
 	orderDispatchUC.Run(ctx, orderNotifyListener.Notify)
 }

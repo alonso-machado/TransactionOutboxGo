@@ -34,44 +34,18 @@ var (
 	// confirmations from ingestion-api to fulfillment-consumer-worker, e.g.
 	// queue "payments.concert.rock.queue", routing key "payment.concert.rock".
 	PaymentEventStream = Stream{QueuePrefix: "payments", RoutingPrefix: "payment"}
-	// NotificationStream carries ticket_notification_outbox rows from
-	// fulfillment-consumer-worker (via outbox-worker's third dispatch loop)
-	// to notification-consumer-worker. Deliberately NOT sharded by
-	// (event_type, event_subtype) like the other two streams — email-sending
-	// has no per-genre resource contention to isolate and this consumer
-	// makes zero DB calls, so a shard-per-genre Deployment/ScaledObject would
-	// be pure ceremony (see Phase 8 plan, Part D). Bound to exactly one
-	// queue via the sentinel pair (NotificationSentinelType,
-	// NotificationSentinelSubtype) below instead of a real (type, subtype)
-	// from EventTypes.
-	NotificationStream = Stream{QueuePrefix: "notifications", RoutingPrefix: "notification"}
-)
-
-// NotificationSentinelType/NotificationSentinelSubtype are a fixed
-// pseudo-(event_type, event_subtype) pair used only to address
-// NotificationStream's single queue through the existing
-// Stream/QueueFor/AMQPConsumer machinery, without building a parallel
-// unsharded-queue abstraction. Never added to EventTypes — an order intake
-// request can never legitimately carry this pair (ValidateEventType would
-// reject it), so it can't collide with a real shard.
-const (
-	NotificationSentinelType    = "_ALL"
-	NotificationSentinelSubtype = "_ALL"
 )
 
 // StreamForAggregateType maps an OutboxMessage.AggregateType ("order" /
-// "payment_event" / "ticket_notification") to its Stream — how
-// AMQPPublisher decides which queue prefix/routing-key prefix a row
-// publishes under without needing the caller to pass the stream through
-// separately.
+// "payment_event") to its Stream — how AMQPPublisher decides which queue
+// prefix/routing-key prefix a row publishes under without needing the
+// caller to pass the stream through separately.
 func StreamForAggregateType(aggregateType string) (Stream, bool) {
 	switch aggregateType {
 	case "order":
 		return OrderStream, true
 	case "payment_event":
 		return PaymentEventStream, true
-	case "ticket_notification":
-		return NotificationStream, true
 	default:
 		return Stream{}, false
 	}
@@ -165,9 +139,6 @@ func DLXRoutingKeyFor(stream Stream, eventType, eventSubtype string) string {
 // their retry queue, keeping the
 // queue<->(stream,type,subtype) mapping in one place.
 func ParseQueueName(queue string) (stream Stream, eventType, eventSubtype string, ok bool) {
-	if queue == QueueFor(NotificationStream, NotificationSentinelType, NotificationSentinelSubtype) {
-		return NotificationStream, NotificationSentinelType, NotificationSentinelSubtype, true
-	}
 	for _, s := range []Stream{OrderStream, PaymentEventStream} {
 		for et, subtypes := range EventTypes {
 			for _, est := range subtypes {
@@ -195,11 +166,6 @@ func DeclareTopology(ch *amqp.Channel) error {
 				}
 			}
 		}
-	}
-	// NotificationStream is a single unsharded queue, declared once outside
-	// the EventTypes-driven double loop above — see its doc comment.
-	if err := declareShardQueue(ch, NotificationStream, NotificationSentinelType, NotificationSentinelSubtype); err != nil {
-		return err
 	}
 	return nil
 }

@@ -19,14 +19,11 @@ const (
 type OutboxMessage struct {
 	ID             uuid.UUID
 	IdempotencyKey string
-	// AggregateType is "order", "payment_event", or "ticket_notification" —
-	// which of the three outboxes (order_outbox / payment_event_outbox /
-	// ticket_notification_outbox) this row belongs to. The publisher uses it
-	// to pick the RabbitMQ stream (queue-name/routing-key prefix) a message
-	// routes to (rmq.StreamForAggregateType); EventType/EventSubtype pick
-	// the specific queue within that stream — except ticket_notification,
-	// whose stream is a single unsharded queue regardless of these two
-	// fields (see rmq.NotificationStream's doc comment).
+	// AggregateType is "order" or "payment_event" — which of the two
+	// outboxes (order_outbox / payment_event_outbox) this row belongs to.
+	// The publisher uses it to pick the RabbitMQ stream (queue-name/
+	// routing-key prefix) a message routes to (rmq.StreamForAggregateType);
+	// EventType/EventSubtype pick the specific queue within that stream.
 	AggregateType string
 	HTTPMethod    string
 	Route         string

@@ -5,29 +5,29 @@ Deploys the Transactional Outbox Event Ticket System:
 - one `ingestion-api` Deployment + Service (fixed replica count by default;
   `ingestionApi.hpa.enabled: true` opts back into a CPU/memory HPA);
 - one `outbox-worker` Deployment + KEDA `ScaledObject` (the Transactional
-  Outbox relay — runs three dispatch loops, one per outbox table, and scales
-  on the SUMMED backlog of all three via the postgresql scaler,
+  Outbox relay — runs two dispatch loops, one per outbox table, and scales
+  on the SUMMED backlog of both via the postgresql scaler,
   `outboxWorker.keda.minReplicaCount` defaults to 1 — see
   `templates/outbox-worker/`);
 - one `order-consumer-worker` Deployment + KEDA `ScaledObject` pair and one
   `fulfillment-consumer-worker` Deployment + KEDA `ScaledObject` pair per
   `(event_type, event_subtype)` shard (driven by `values.yaml`'s
   `eventShards` list — see `templates/order-consumer-worker/`,
-  `templates/fulfillment-consumer-worker/`);
+  `templates/fulfillment-consumer-worker/`); `fulfillment-consumer-worker`
+  also sends the issued ticket's email synchronously, no separate consumer;
 - one `tickets-api` Deployment + Service (fixed replica count, same shape as
   `ingestion-api` — no Rollout/canary variant yet, no Ingress yet either, see
   `templates/tickets-api/`);
-- one **unsharded** `notification-consumer-worker` Deployment + KEDA
-  `ScaledObject` (not one per `eventShards` entry — `ticket_notification_outbox`'s
-  stream is deliberately not routed by `(event_type, event_subtype)`, see
-  `templates/notification-consumer-worker/`).
+- one `notification-retry-cron` Kubernetes `CronJob` (no RabbitMQ, no
+  Deployment/ScaledObject) that retries any `ticket_notifications` row still
+  missing `email_sent_timestamp` — see `templates/notification-retry-cron/`.
 
 Two logical databases (one Postgres/RDS instance): ingestion-api and
 outbox-worker use `secret.databaseUrl` (the `outbox` DB — `order_outbox` +
-`payment_event_outbox` + `ticket_notification_outbox`); order-consumer-worker,
-fulfillment-consumer-worker, and tickets-api use `secret.eventsDatabaseUrl`
-(the `events` DB — locations/events/orders/tickets/charges/staff_users).
-`notification-consumer-worker` touches neither database.
+`payment_event_outbox`); order-consumer-worker, fulfillment-consumer-worker,
+tickets-api, and notification-retry-cron use `secret.eventsDatabaseUrl` (the
+`events` DB — locations/events/orders/tickets/charges/staff_users/
+ticket_notifications).
 
 ## Install
 

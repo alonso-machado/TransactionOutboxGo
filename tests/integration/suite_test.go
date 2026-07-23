@@ -230,10 +230,10 @@ func TestMain(m *testing.M) {
 // RabbitMQ topology for speed.
 func truncateAll(t *testing.T) {
 	t.Helper()
-	if err := suite.db.Exec("TRUNCATE TABLE order_outbox, payment_event_outbox, ticket_notification_outbox").Error; err != nil {
+	if err := suite.db.Exec("TRUNCATE TABLE order_outbox, payment_event_outbox").Error; err != nil {
 		t.Fatalf("truncate outbox tables: %v", err)
 	}
-	if err := suite.eventsDB.Exec("TRUNCATE TABLE charges, tickets, orders, event_areas, events, producers, locations, staff_users").Error; err != nil {
+	if err := suite.eventsDB.Exec("TRUNCATE TABLE ticket_notifications, charges, tickets, orders, event_areas, events, producers, locations, staff_users").Error; err != nil {
 		t.Fatalf("truncate events tables: %v", err)
 	}
 	for eventType, subtypes := range rmq.EventTypes {
@@ -244,8 +244,6 @@ func truncateAll(t *testing.T) {
 			}
 		}
 	}
-	purgeQueue(t, rmq.QueueFor(rmq.NotificationStream, rmq.NotificationSentinelType, rmq.NotificationSentinelSubtype))
-	purgeQueue(t, rmq.DLQFor(rmq.NotificationStream, rmq.NotificationSentinelType, rmq.NotificationSentinelSubtype))
 }
 
 func purgeQueue(t *testing.T, name string) {
@@ -352,42 +350,33 @@ func newCheckoutConsumer(eventType, eventSubtype string, prefetch, maxDeliveries
 
 // newFulfillmentConsumer wires a real AMQPConsumer + IssueTickets against the
 // shared events DB, bound to (eventType, eventSubtype)'s payment_event_outbox
-// shard queue. notificationOutboxRepo points at the outbox DB's
-// ticket_notification_outbox (Phase 8) — a real repo, not a stub, so tests
-// can assert the enqueued row directly (see notification_test.go).
-func newFulfillmentConsumer(eventType, eventSubtype string, prefetch, maxDeliveries int) *messaging.AMQPConsumer {
+// shard queue. sender is the domain.EmailSender IssueTickets emails each
+// issued ticket through synchronously — pass a recordingEmailSender (or a
+// spy that fails) so tests can assert what was sent (see notification_test.go).
+func newFulfillmentConsumer(eventType, eventSubtype string, prefetch, maxDeliveries int, sender domain.EmailSender) *messaging.AMQPConsumer {
 	chargeRepo := persistence.NewChargeRepository(suite.eventsDB)
 	ticketRepo := persistence.NewTicketRepository(suite.eventsDB)
 	orderRepo := persistence.NewOrderRepository(suite.eventsDB)
 	uow := persistence.NewUnitOfWork(suite.eventsDB)
 	qr := ticketqr.New(ticketSigningSecret)
-	notificationOutboxRepo := newTicketNotificationOutboxRepo()
-	issueTickets := fulfillment.New(chargeRepo, ticketRepo, orderRepo, qr, notificationOutboxRepo, uow, eventType, eventSubtype)
+	notificationRepo := newTicketNotificationRepo()
+	issueTickets := fulfillment.New(chargeRepo, ticketRepo, orderRepo, qr, notificationRepo, sender, uow)
 	return messaging.NewConsumer(suite.amqpConn, issueTickets, rmq.PaymentEventStream, eventType, eventSubtype, prefetch, maxDeliveries, 0, 0)
 }
 
-// newTicketNotificationOutboxRepo mirrors newOrderOutboxRepo/
-// newPaymentEventOutboxRepo for the third outbox table (Phase 8) — it lives
-// in the outbox DB (suite.db), like the other two, even though it's enqueued
-// by fulfillment-consumer-worker (which otherwise only touches the events DB).
-func newTicketNotificationOutboxRepo() *persistence.GORMOutboxRepository {
-	return persistence.NewOutboxRepository(suite.db, "ticket_notification_outbox", 0, 0)
+// newTicketNotificationRepo wires GORMTicketNotificationRepository against
+// the shared events DB (ticket_notifications lives alongside tickets now,
+// not in the outbox DB — see internal/domain/ticket_notification.go).
+func newTicketNotificationRepo() *persistence.GORMTicketNotificationRepository {
+	return persistence.NewTicketNotificationRepository(suite.eventsDB, 0, 0)
 }
 
-// newNotificationDispatch mirrors newOrderDispatch/newPaymentEventDispatch
-// for ticket_notification_outbox.
-func newNotificationDispatch(batchSize, maxRetries int, interval, pruneAfter time.Duration) (*outboxuc.DispatchOutbox, *persistence.GORMOutboxRepository) {
-	repo := newTicketNotificationOutboxRepo()
-	publisher := messaging.NewPublisher(suite.amqpConn)
-	return outboxuc.New(repo, publisher, batchSize, maxRetries, interval, pruneAfter), repo
-}
-
-// newNotificationConsumer wires a real AMQPConsumer + SendNotification
-// against recorder (a spy domain.EmailSender), bound to
-// NotificationStream's single unsharded queue.
-func newNotificationConsumer(recorder domain.EmailSender, prefetch, maxDeliveries int) *messaging.AMQPConsumer {
-	sendNotification := notification.New(recorder)
-	return messaging.NewConsumer(suite.amqpConn, sendNotification, rmq.NotificationStream, rmq.NotificationSentinelType, rmq.NotificationSentinelSubtype, prefetch, maxDeliveries, 0, 0)
+// newSendTicketNotification wires notification.SendTicketNotification
+// against the shared events DB and sender — this is notification-retry-cron's
+// whole use-case, exercised directly (no RabbitMQ/subprocess involved) by
+// notification_test.go's retry test.
+func newSendTicketNotification(sender domain.EmailSender) *notification.SendTicketNotification {
+	return notification.New(sender, newTicketNotificationRepo(), persistence.NewTicketRepository(suite.eventsDB))
 }
 
 // waitFor polls cond until it returns true or timeout elapses, returning the
@@ -441,10 +430,17 @@ func countCharges() int64 {
 	return n
 }
 
-func countTicketNotificationOutboxByStatus(status domain.OutboxStatus) int64 {
-	var n int64
-	suite.db.Table("ticket_notification_outbox").Where("status = ?", string(status)).Count(&n)
-	return n
+// getTicketNotification fetches ticket_notifications' row for ticketID
+// directly (bypassing the repository) so a test can assert on
+// email_sent_timestamp/email_sent_error without depending on repository
+// behavior it might itself be testing.
+func getTicketNotification(t *testing.T, ticketID uuid.UUID) persistence.TicketNotificationModel {
+	t.Helper()
+	var m persistence.TicketNotificationModel
+	if err := suite.eventsDB.Where("ticket_id = ?", ticketID).First(&m).Error; err != nil {
+		t.Fatalf("get ticket_notifications row for %s: %v", ticketID, err)
+	}
+	return m
 }
 
 // newOrderStatusHandler wires OrderStatusHandler against the shared events
@@ -526,7 +522,7 @@ func seedStaffUser(t *testing.T, clerkUserID string, locationID *uuid.UUID) uuid
 
 // recordingEmailSender is a spy domain.EmailSender for notification_test.go
 // — records every Send call instead of delivering anything, so a test can
-// assert the recipient/attachment notification-consumer-worker actually sent.
+// assert the recipient/attachment fulfillment-consumer-worker actually sent.
 type recordingEmailSender struct {
 	mu   sync.Mutex
 	sent []domain.EmailRequest

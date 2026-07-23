@@ -6,7 +6,7 @@ import (
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 
-	"github.com/alonsomachado/transaction-outbox-go/docs"
+	docs "github.com/alonsomachado/transaction-outbox-go/docs/ingestion-api"
 	"github.com/alonsomachado/transaction-outbox-go/internal/adapter/http/ratelimit"
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"

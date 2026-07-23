@@ -7,8 +7,11 @@
 #
 # fulfillment-consumer-worker consumes this shard's payment_event_outbox
 # queue: on a CONFIRMED payment it issues every RESERVED ticket for the
-# order (QR PNG + HMAC signature) — see
-# internal/usecase/fulfillment.IssueTickets.
+# order (QR PNG + HMAC signature) and emails it synchronously — see
+# internal/usecase/fulfillment.IssueTickets. EMAIL_PROVIDER/SMTP_HOST/
+# SMTP_PORT/SMTP_FROM_EMAIL/SMTP_FROM_NAME arrive via envFrom (configMap)
+# below; only the SMTP credentials are secrets, so only those need an
+# explicit env: entry here.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -61,6 +64,16 @@ spec:
                 secretKeyRef:
                   name: transaction-outbox-secrets
                   key: TICKET_SIGNING_SECRET
+            - name: SMTP_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: SMTP_USERNAME
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: transaction-outbox-secrets
+                  key: SMTP_PASSWORD
             - name: CONSUMER_QUEUE
               value: {{ .paymentQueue }}
             - name: METRICS_PORT

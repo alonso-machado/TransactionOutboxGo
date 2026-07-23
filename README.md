@@ -49,27 +49,27 @@ acknowledges the client, and a separate relay reliably forwards it to the broker
 
 Six service binaries: **`ingestion-api`** (fixed 1 replica, HTTP write path —
 orders + payment-gateway webhooks), **`outbox-worker`** (the Transactional
-Outbox relay — its own process, running three independent dispatch loops,
+Outbox relay — its own process, running two independent dispatch loops,
 one per outbox table, KEDA-scaled on their summed backlog, min 1),
 **`order-consumer-worker`**, **`fulfillment-consumer-worker`** — these two run
 **N instances each**, one per `(event_type, event_subtype)` shard (e.g.
 `CONCERT`/`ROCK`), bound to exactly one RabbitMQ queue via `CONSUMER_QUEUE`
-so KEDA can scale a shard's consumers independently — **`tickets-api`** (fixed
+so KEDA can scale a shard's consumers independently, and
+`fulfillment-consumer-worker` also emails each issued ticket's QR PNG
+synchronously, no separate consumer needed — **`tickets-api`** (fixed
 1 replica, a second synchronous HTTP write path: order-status polling,
 staff-authenticated ticket check-in, ticket-holder name correction), and
-**`notification-consumer-worker`** (one unsharded instance — emails an
-issued ticket's QR PNG, KEDA min 0).
+**`notification-retry-cron`** (a Kubernetes CronJob, not a long-running
+service — retries any ticket whose email didn't send the first time).
 
 Two logical databases share one Postgres instance: `ingestion-api` and
 `outbox-worker` use the **`outbox`** database (`order_outbox` +
-`payment_event_outbox` + `ticket_notification_outbox`);
-`order-consumer-worker`, `fulfillment-consumer-worker`, and `tickets-api` use
-the **`events`** database
-(`locations`/`events`/`producers`/`event_areas`/`orders`/`tickets`/`charges`/`staff_users`).
+`payment_event_outbox`); `order-consumer-worker`,
+`fulfillment-consumer-worker`, `tickets-api`, and `notification-retry-cron`
+use the **`events`** database
+(`locations`/`events`/`producers`/`event_areas`/`orders`/`tickets`/`charges`/`staff_users`/`ticket_notifications`).
 `ingestion-api` **never writes to the `events` database**, and symmetrically
-`tickets-api` never touches the outbox tables or RabbitMQ —
-`notification-consumer-worker` touches neither database at all (its email
-send has no local state to record).
+`tickets-api` never touches the outbox tables or RabbitMQ.
 
 ```mermaid
 flowchart LR
@@ -178,8 +178,9 @@ sequenceDiagram
         OW->>PG: UPDATE status = PUBLISHED
     end
     MQ->>FCW: deliver (manual ack)
-    FCW->>PG: mark Charge/Order PAID, issue Tickets (QR PNG + HMAC signature)
-    FCW->>PG: (separate, best-effort write) INSERT ticket_notification_outbox
+    FCW->>PG: tx: mark Charge/Order PAID, issue Tickets (QR PNG + HMAC signature), INSERT ticket_notifications
+    FCW->>Mail: EmailSender.Send (QR PNG) — after the tx commits
+    FCW->>PG: UPDATE ticket_notifications SET email_sent_timestamp / email_sent_error
     FCW->>MQ: ack
 ```
 
@@ -187,7 +188,7 @@ sequenceDiagram
 
 `fulfillment-consumer-worker`'s ticket issuance isn't the end of the line —
 three more things happen, all served by **`tickets-api`** and
-**`notification-consumer-worker`**, neither of which existed before Phase 8:
+**`notification-retry-cron`**, neither of which existed before Phase 8:
 
 - **The client learns its checkout URL** by polling `GET
   /api/v1/orders/{orderId}` (`tickets-api`) after the original `201` —
@@ -195,16 +196,17 @@ three more things happen, all served by **`tickets-api`** and
   since the `orders` row itself doesn't exist until
   `order-consumer-worker` runs) until `order-consumer-worker` opens a
   checkout, at which point it's populated and `status` reads `RESERVED`.
-- **The ticket is emailed.** Right after `MarkIssued` commits,
-  `fulfillment-consumer-worker` enqueues a `ticket_notification_outbox` row
-  — as its **own, separate write against the outbox database** (Postgres
-  has no cross-database transactions, so this can't be atomic with
-  `MarkIssued` the way a same-database outbox write would be). The same
-  generalized `DispatchOutbox` relays it — on a single, deliberately
-  **unsharded** queue (email-sending has no per-genre resource contention
-  to isolate) — to `notification-consumer-worker`, which sends the QR PNG
-  by email via the configured `EmailSender` (`fake` locally, or `smtp`, a
-  real `net/smtp`-based sender using only the Go standard library).
+- **The ticket is emailed.** Right after `MarkIssued`,
+  `fulfillment-consumer-worker` inserts a `ticket_notifications` row —
+  inside the **same events-DB transaction**, since (unlike the RabbitMQ-based
+  design this replaced) the table lives right alongside `tickets` now, so
+  the insert is genuinely atomic with `MarkIssued`. Once that transaction
+  commits, `fulfillment-consumer-worker` emails the QR PNG synchronously via
+  the configured `EmailSender` (`fake` locally, or `smtp`, a real
+  `net/smtp`-based sender using only the Go standard library) and records
+  the outcome on that row. If the send fails, **`notification-retry-cron`**
+  — a Kubernetes CronJob, no RabbitMQ involved — wakes up on a schedule and
+  retries any row still missing `email_sent_timestamp`.
 - **The ticket gets checked in at the door.** `POST /api/v1/checkin`
   (`tickets-api`, **staff-authenticated** — a Bearer token verified via
   Clerk, or the `fake` provider locally/in tests) verifies the scanned
@@ -306,13 +308,13 @@ boilerplate. Any layer may import it, the same way any layer may import
   fixed 1 replica and does **not** connect to RabbitMQ or the `events`
   database.
 - **`outbox-worker`** — the Transactional Outbox core, its own process,
-  running three independent `DispatchOutbox` loops (one per outbox table):
+  running two independent `DispatchOutbox` loops (one per outbox table):
   polls `NEW`/`RETRYING` rows (deduped via `FOR UPDATE SKIP LOCKED`,
   `order_outbox` also gets a LISTEN/NOTIFY fast path), publishes to RabbitMQ
   with publisher confirms, marks rows `PUBLISHED` (or `RETRYING`/
   `DEAD_LETTER` on failure with exponential backoff), prunes old published
   rows, and declares the shared RabbitMQ topology. KEDA scales it on the
-  **summed** backlog of all three outboxes (postgresql scaler), min 1.
+  **summed** backlog of both outboxes (postgresql scaler), min 1.
 - **`order-consumer-worker`** — RabbitMQ consumer with prefetch + manual ack,
   one instance per `(event_type, event_subtype)` shard. Upserts the
   `Location`/`Event` an order belongs to, reserves `Ticket` rows
@@ -323,9 +325,11 @@ boilerplate. Any layer may import it, the same way any layer may import
   shape. On a `CONFIRMED` payment-gateway webhook it marks the `Charge`/
   `Order` `PAID` and issues every `RESERVED` ticket (QR PNG + HMAC
   signature); on `FAILED` it marks them `FAILED`/`VOID`. Right after issuing
-  a ticket it also enqueues a `ticket_notification_outbox` row — a separate,
-  best-effort write against the `outbox` database (not atomic with the
-  events-DB transaction above; Postgres has no cross-database transactions).
+  a ticket it also inserts a `ticket_notifications` row **inside the same
+  events-DB transaction** as the issuance itself (both tables live in
+  `events` now, so this is genuinely atomic), then — once that transaction
+  commits — emails the QR PNG synchronously via the configured
+  `EmailSender` (`fake` or `smtp`), recording the outcome on that row.
 - **`tickets-api`** — a second Gin HTTP server, the mirror image of
   `ingestion-api`: reads/writes the `events` database directly and never
   touches RabbitMQ or the outbox tables. `GET /api/v1/orders/{id}` (order
@@ -334,16 +338,14 @@ boilerplate. Any layer may import it, the same way any layer may import
   signature verification + venue scoping), `PATCH
   /api/v1/tickets/{id}/holder` (buyer-name correction, rate-limited, no
   auth). Fixed 1 replica.
-- **`notification-consumer-worker`** — RabbitMQ consumer for
-  `ticket_notification_outbox`'s single **unsharded** queue (no per-genre
-  resource contention to isolate, and this consumer makes zero DB calls —
-  the one stream not routed by `event_type`/`event_subtype`). Sends the
-  ticket's QR PNG by email via the configured `EmailSender` (`fake` or
-  `smtp`). No dedup — a redelivered message just resends the email.
+- **`notification-retry-cron`** — a Kubernetes `CronJob`, not a long-running
+  service and not a RabbitMQ consumer: on a schedule (every 2 minutes by
+  default), it retries any `ticket_notifications` row still missing
+  `email_sent_timestamp` whose backoff window has passed, via the same
+  configured `EmailSender`, then exits.
 - **PostgreSQL** — one instance, two logical databases: `outbox`
-  (`order_outbox` + `payment_event_outbox` + `ticket_notification_outbox`)
-  and `events`
-  (`locations`/`events`/`producers`/`event_areas`/`orders`/`tickets`/`charges`/`staff_users`).
+  (`order_outbox` + `payment_event_outbox`) and `events`
+  (`locations`/`events`/`producers`/`event_areas`/`orders`/`tickets`/`charges`/`staff_users`/`ticket_notifications`).
 - **RabbitMQ** — durable topic exchange (`tickets.exchange`) + one quorum
   queue + dead-letter queue per `(stream, event_type, event_subtype)` shard.
 - **`outbox-admin`** — a one-shot maintenance CLI, **not** a long-running
@@ -567,22 +569,25 @@ TransactionOutboxGo/
 ├── CLAUDE.md                  # guidance for Claude Code in this repo
 ├── cmd/
 │   ├── ingestion-api/               # HTTP write path → both intake outbox tables (composition root)
-│   ├── outbox-worker/               # three DispatchOutbox loops → RabbitMQ, KEDA-scaled (composition root)
+│   ├── outbox-worker/               # two DispatchOutbox loops → RabbitMQ, KEDA-scaled (composition root)
 │   ├── order-consumer-worker/       # order_outbox consumer → events DB (composition root)
-│   ├── fulfillment-consumer-worker/ # payment_event_outbox consumer → events DB (composition root)
+│   ├── fulfillment-consumer-worker/ # payment_event_outbox consumer → events DB, also emails issued tickets (composition root)
 │   ├── tickets-api/                 # order-status/check-in/ticket-holder HTTP path → events DB (composition root)
-│   ├── notification-consumer-worker/# ticket_notification_outbox consumer → email (composition root)
+│   ├── notification-retry-cron/     # Kubernetes CronJob: retries unsent ticket_notifications rows (composition root)
 │   └── outbox-admin/                # one-shot maintenance CLI: replay-dead / drain-dlq / purge-loadtest-dlq
 ├── internal/
-│   ├── domain/                # entities (Order, Ticket, Charge, Event, Location, OutboxMessage, StaffUser) + ports (no framework imports)
+│   ├── domain/                # entities (Order, Ticket, Charge, Event, Location, OutboxMessage, TicketNotification, StaffUser) + ports (no framework imports)
 │   ├── observability/         # tiny OTel metric-instrument helpers shared by usecase + adapter (no framework imports beyond the otel API)
 │   ├── usecase/                # order / webhook / outbox / checkout / fulfillment / checkin / ticketholder / notification
 │   ├── adapter/                # http (incl. staffauth) · persistence · messaging · paymentgateway · emailsender · staffauth · ticketqr
-│   └── infrastructure/         # config · database · rabbitmq (EventTypes registry + NotificationStream) · telemetry · logging
+│   └── infrastructure/         # config · database · rabbitmq (EventTypes registry + topology) · telemetry · logging
 ├── migrations/
 │   ├── outbox/                 # golang-migrate set for the `outbox` database
 │   └── events/                 # golang-migrate set for the `events` database
 ├── tests/integration/          # TestContainers suite (Postgres + RabbitMQ) — see Testing below
+├── backstage/                  # Backstage developer portal (Node/TS) — Software Catalog + API docs + TechDocs
+├── catalog-info.yaml           # Backstage System/Group/Component/API entities for this repo
+├── mkdocs.yml, docs/index.md   # TechDocs source, rendered by Backstage
 ├── docker-compose.yml
 ├── Dockerfile
 └── Makefile
@@ -595,15 +600,15 @@ TransactionOutboxGo/
 All six service binaries read config via [`internal/infrastructure/config`](internal/infrastructure/config/config.go)
 (`envconfig`). `DATABASE_URL` and `RABBITMQ_URL` are the only two marked
 `required` — everything else has a default. (ingestion-api and
-notification-consumer-worker still require these to be set because the
-`Config` struct is shared, even though each of them never opens one of the
-two connections — same "provide but ignore" precedent both follow.) Each
+notification-retry-cron still require `RABBITMQ_URL` to be set because the
+`Config` struct is shared, even though neither of them ever opens a RabbitMQ
+connection — same "provide but ignore" precedent both follow.) Each
 service points `DATABASE_URL` at its own logical database: `outbox` for
 ingestion-api/outbox-worker, `events` for order-consumer-worker/
-fulfillment-consumer-worker/tickets-api (notification-consumer-worker's
-`DATABASE_URL` is unused). See [`.env.example`](.env.example) for local-dev
-values and [`docker-compose.yml`](docker-compose.yml) for how each service's
-env block is wired.
+fulfillment-consumer-worker/tickets-api/notification-retry-cron. See
+[`.env.example`](.env.example) for local-dev values and
+[`docker-compose.yml`](docker-compose.yml) for how each service's env block
+is wired.
 
 ### Shared (all six services)
 
@@ -658,13 +663,19 @@ env block is wired.
 | `CLERK_SECRET_KEY` | *(empty)* | Only meaningful when `STAFF_AUTH_PROVIDER=clerk` |
 | `STAFF_AUTH_FAKE_TOKEN` / `STAFF_AUTH_FAKE_CLERK_USER_ID` | `dev-staff-token` / `dev-staff-user` | Only meaningful when `STAFF_AUTH_PROVIDER=fake` |
 
-### `notification-consumer-worker` only
+### `fulfillment-consumer-worker` / `notification-retry-cron` email settings
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `EMAIL_PROVIDER` | `fake` | `EmailSender` adapter: `fake` (no network) or `smtp` (real, stdlib `net/smtp`) |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` | *(empty)* / `587` / *(empty)* / *(empty)* | Only meaningful when `EMAIL_PROVIDER=smtp` |
 | `SMTP_FROM_EMAIL` / `SMTP_FROM_NAME` | `tickets@example.com` / `Event Tickets` | Sender identity on outgoing mail |
+
+### `notification-retry-cron` only
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `NOTIFICATION_RETRY_BATCH_SIZE` | `50` | Max `ticket_notifications` rows retried per run |
 
 ---
 
@@ -680,12 +691,19 @@ make test     # go test -race ./...
 make tidy     # go mod tidy
 make lint     # golangci-lint run ./...
 
-# Podman Compose — starts Postgres + RabbitMQ + all six app services
-# (two shards run by default: CONCERT/ROCK, SPORTS/FOOTBALL)
+# Podman Compose — starts Postgres + RabbitMQ + all six app services +
+# Backstage (two shards run by default: CONCERT/ROCK, SPORTS/FOOTBALL)
 make up       # podman compose -f docker-compose.yml up --build -d
 make logs     # tail logs from all services
 make down     # podman compose -f docker-compose.yml down -v
 make seed     # curl a sample order POST to the ingestion-api
+
+# Backstage on its own (heavier Node build than the rest of `make up`)
+make backstage-build
+make backstage-up
+
+# Regenerate ingestion-api's and tickets-api's Swagger specs
+make swag
 ```
 
 ### Endpoints once `make up` is healthy
@@ -694,7 +712,10 @@ make seed     # curl a sample order POST to the ingestion-api
 |---|---|
 | Ingestion API | http://localhost:8080 |
 | API health | http://localhost:8080/healthz |
+| Ingestion API Swagger UI | http://localhost:8080/swagger/index.html |
 | Tickets API | http://localhost:8081 |
+| Tickets API Swagger UI | http://localhost:8081/swagger/index.html |
+| Backstage developer portal | http://localhost:7007 |
 | RabbitMQ management UI | http://localhost:15672 (user/pass from `.env`) |
 | Postgres | `localhost:5432` |
 
@@ -819,7 +840,7 @@ Six independent GitHub Actions workflows, one per microservice —
 [`order-consumer-worker.yml`](.github/workflows/order-consumer-worker.yml),
 [`fulfillment-consumer-worker.yml`](.github/workflows/fulfillment-consumer-worker.yml),
 [`tickets-api.yml`](.github/workflows/tickets-api.yml), and
-[`notification-consumer-worker.yml`](.github/workflows/notification-consumer-worker.yml)
+[`notification-retry-cron.yml`](.github/workflows/notification-retry-cron.yml)
 — so a change scoped to one service never triggers or gates the others. All follow:
 **Build → lint (golangci-lint + actionlint + helm lint + govulncheck) → Unit Tests → Upload
 (ECR, OIDC-authenticated)**, with an optional flag-gated Integration Tests
@@ -912,6 +933,29 @@ the same files serve local Grafana and cloud Grafana, so they never drift:
 
 In cloud, Grafana is internal-only (no public Ingress) — reach it via
 `kubectl port-forward svc/...grafana 3000`.
+
+## Developer Portal: Backstage
+
+[Backstage](https://backstage.io) (self-hosted, [`backstage/`](backstage/))
+is the centralized Software Catalog for this monorepo — all six service
+binaries plus the `outbox-admin` CLI, defined in the root
+[`catalog-info.yaml`](catalog-info.yaml). It closes a real gap: previously
+only `ingestion-api` had a working generated Swagger spec even though
+`tickets-api` also has swaggo annotations on its handlers (see
+[`.claude/plan-phase9-backstage.md`](.claude/plan-phase9-backstage.md)).
+
+- **Software Catalog** — one `System` (`event-ticket-system`) grouping a
+  `Component` per service.
+- **API docs** — `ingestion-api` and `tickets-api` are the two services
+  with real HTTP surfaces; each has an `API` entity backed by its generated
+  `docs/<service>/swagger.json` (`make swag` regenerates both).
+- **TechDocs** — renders [`docs/index.md`](docs/index.md) (architecture
+  diagram, service table) via `mkdocs.yml` at the repo root.
+
+`make backstage-up` (or `make up`, which now includes it) builds and starts
+it at `http://localhost:7007`. In KIND, it's `helmcharts/transaction-outbox/templates/backstage/`
+— a plain Deployment/Service like `pgbouncer`/`notification-retry-cron`
+(no HPA/canary/KEDA), toggleable via `backstage.enabled` in `values.yaml`.
 
 ## Canary deploys
 

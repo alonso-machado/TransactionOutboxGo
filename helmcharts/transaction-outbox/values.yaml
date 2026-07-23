@@ -6,7 +6,8 @@ image:
   orderConsumerWorker: transaction-outbox-go/order-consumer-worker:latest
   fulfillmentConsumerWorker: transaction-outbox-go/fulfillment-consumer-worker:latest
   ticketsApi: transaction-outbox-go/tickets-api:latest
-  notificationConsumerWorker: transaction-outbox-go/notification-consumer-worker:latest
+  notificationRetryCron: transaction-outbox-go/notification-retry-cron:latest
+  backstage: transaction-outbox-go/backstage:latest
 
 # Non-sensitive configuration shared across services, rendered verbatim into
 # the transaction-outbox-config ConfigMap.
@@ -51,7 +52,8 @@ configMap:
     DB_SSL_MODE: "disable"
     RABBITMQ_TLS: "false"
 
-    # ── Email delivery (Phase 8 — notification-consumer-worker) ────────────
+    # ── Email delivery (fulfillment-consumer-worker sends synchronously;
+    # notification-retry-cron retries any failed send) ─────────────────────
     EMAIL_PROVIDER: "fake"
     SMTP_HOST: ""
     SMTP_PORT: "587"
@@ -101,8 +103,9 @@ secret:
   # code with — fulfillment-consumer-worker only.
   ticketSigningSecret: "CHANGE_ME"
   # Clerk secret key (tickets-api, STAFF_AUTH_PROVIDER=clerk only) and SMTP
-  # credentials (notification-consumer-worker, EMAIL_PROVIDER=smtp only).
-  # Harmless placeholders when those providers aren't selected.
+  # credentials (fulfillment-consumer-worker + notification-retry-cron,
+  # EMAIL_PROVIDER=smtp only). Harmless placeholders when those providers
+  # aren't selected.
   clerkSecretKey: "CHANGE_ME"
   smtpUsername: "CHANGE_ME"
   smtpPassword: "CHANGE_ME"
@@ -351,33 +354,43 @@ ticketsApi:
     scaleUpStabilizationSeconds: 0
     scaleDownStabilizationSeconds: 30
 
-# notification-consumer-worker (Phase 8): sends an issued ticket's QR by
-# email, consuming ticket_notification_outbox's single unsharded queue (see
-# internal/infrastructure/rabbitmq.NotificationStream's doc comment) — one
-# Deployment/ScaledObject, not one per eventShards entry like order/
-# fulfillment.
-notificationConsumerWorker:
+# notification-retry-cron: a Kubernetes CronJob (no RabbitMQ, no
+# Deployment/ScaledObject) that retries any ticket_notifications row still
+# missing email_sent_timestamp — the immediate send happens synchronously in
+# fulfillment-consumer-worker instead (see internal/usecase/fulfillment.
+# IssueTickets), this is only the retry path.
+notificationRetryCron:
   nodeSelector: {}
-  metricsPort: 9095
-  # Must match internal/infrastructure/rabbitmq.QueueFor(NotificationStream,
-  # NotificationSentinelType, NotificationSentinelSubtype) —
-  # "notifications._all._all.queue".
-  queueName: notifications._all._all.queue
+  # Every 2 minutes — frequent enough that a transient SMTP hiccup recovers
+  # quickly, infrequent enough not to matter that concurrencyPolicy: Forbid
+  # (cronjob.yaml) serializes runs.
+  schedule: "*/2 * * * *"
+  batchSize: 50
   resources:
     requests:
-      cpu: "100m"
-      memory: "128Mi"
+      cpu: "50m"
+      memory: "64Mi"
     limits:
-      cpu: "500m"
-      memory: "256Mi"
-  keda:
-    minReplicaCount: 0
-    maxReplicaCount: 5
-    pollingInterval: 15
-    cooldownPeriod: 60
-    queueLengthValue: "100"
-    scaleUpStabilizationSeconds: 0
-    scaleDownStabilizationSeconds: 30
+      cpu: "250m"
+      memory: "128Mi"
+
+# Phase 9: Backstage developer portal (Software Catalog + API docs +
+# TechDocs). No HPA/canary — see templates/backstage/deployment.yaml.
+# Disable with `--set backstage.enabled=false` on clusters that don't need
+# it (e.g. a minimal KIND smoke-test install).
+backstage:
+  enabled: true
+  replicas: 1
+  nodeSelector: {}
+  service:
+    type: ClusterIP
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
 
 # One order-consumer-worker Deployment/Rollout + ScaledObject and one
 # fulfillment-consumer-worker Deployment/Rollout + ScaledObject are rendered

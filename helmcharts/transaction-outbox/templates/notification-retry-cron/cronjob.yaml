@@ -1,0 +1,67 @@
+# notification-retry-cron (a Kubernetes CronJob, not a "-consumer-worker" —
+# it never consumes from RabbitMQ, so the company's -consumer-worker naming
+# convention for RabbitMQ consumers doesn't apply here): wakes up on
+# .Values.notificationRetryCron.schedule, retries any ticket_notifications
+# row still missing email_sent_timestamp whose backoff window has passed,
+# then exits. concurrencyPolicy Forbid: FetchPendingForRetry's FOR UPDATE
+# SKIP LOCKED already makes overlapping runs safe, but there's no benefit to
+# letting two runs race over the same rows. restartPolicy OnFailure: a
+# transient DB-connect failure is worth a k8s-level retry; individual send
+# failures inside a run are tracked in the table itself (email_sent_error),
+# not a job failure — see cmd/notification-retry-cron/main.go.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: notification-retry-cron
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: notification-retry-cron
+    {{- include "transaction-outbox.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.notificationRetryCron.schedule | quote }}
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: notification-retry-cron
+        spec:
+          restartPolicy: OnFailure
+          {{- with .Values.notificationRetryCron.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: notification-retry-cron
+              image: {{ .Values.image.notificationRetryCron }}
+              envFrom:
+                - configMapRef:
+                    name: transaction-outbox-config
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: transaction-outbox-secrets
+                      key: EVENTS_DATABASE_URL
+                - name: RABBITMQ_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: transaction-outbox-secrets
+                      key: RABBITMQ_URL
+                - name: SMTP_USERNAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: transaction-outbox-secrets
+                      key: SMTP_USERNAME
+                - name: SMTP_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: transaction-outbox-secrets
+                      key: SMTP_PASSWORD
+                - name: NOTIFICATION_RETRY_BATCH_SIZE
+                  value: {{ .Values.notificationRetryCron.batchSize | quote }}
+                - name: OTEL_SERVICE_NAME
+                  value: notification-retry-cron
+              resources:
+                {{- toYaml .Values.notificationRetryCron.resources | nindent 16 }}

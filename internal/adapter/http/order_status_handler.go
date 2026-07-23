@@ -26,7 +26,7 @@ func NewOrderStatusHandler(orderRepo domain.OrderRepository, chargeRepo domain.C
 //	@Summary		Get order status
 //	@Description	Returns the order's status and checkout URL. checkoutUrl is empty until
 //	@Description	order-consumer-worker has opened a checkout for this order — keep polling, not an error.
-//	@Tags			orders
+//	@Tags			order-status
 //	@Produce		json
 //	@Param			id	path		string	true	"Order ID"
 //	@Success		200	{object}	OrderStatusResponseDTO

@@ -2,16 +2,17 @@ package domain
 
 // EmailSender is the outbound port for delivering an issued ticket by
 // email — the only place the domain touches email at all.
-// notification-consumer-worker calls Send once per
-// ticket_notification_outbox message. Unlike PaymentGateway, there is no
-// inbound/webhook half: email delivery has no confirmation callback in
+// usecase/notification.SendTicketNotification calls Send once per ticket,
+// either synchronously right after issuance (fulfillment-consumer-worker)
+// or from a retry (notification-retry-cron). Unlike PaymentGateway, there is
+// no inbound/webhook half: email delivery has no confirmation callback in
 // this system's scope, it's outbound-only.
 type EmailSender interface {
 	Send(req EmailRequest) (*EmailResult, error)
 }
 
-// EmailRequest is what notification-consumer-worker asks the sender to
-// deliver. Attachment is the rendered QR PNG.
+// EmailRequest is what SendTicketNotification asks the sender to deliver.
+// Attachment is the rendered QR PNG.
 type EmailRequest struct {
 	ToEmail               string
 	ToName                string

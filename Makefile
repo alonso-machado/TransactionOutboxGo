@@ -3,7 +3,7 @@ COMPOSE_FILE := docker-compose.yml
 COMPOSE      := podman compose -f $(COMPOSE_FILE)
 GO           := podman run --rm -v "$(CURDIR):/app" -w /app golang:1.26-alpine
 
-.PHONY: up down logs build test tidy seed seed-order seed-order-sports seed-webhook-confirm lint swag test-unit test-integration coverage coverage-all observability-up migrate migrate-down replay-dead drain-dlq purge-loadtest-dlq
+.PHONY: up down logs build test tidy seed seed-order seed-order-sports seed-webhook-confirm notification-retry-cron lint swag test-unit test-integration coverage coverage-all observability-up migrate migrate-down replay-dead drain-dlq purge-loadtest-dlq backstage-build backstage-up
 
 ## ── Docker Compose ────────────────────────────────────────────────────────────
 
@@ -90,6 +90,16 @@ observability-up:
 logs:
 	$(COMPOSE) logs -f
 
+# Build/run the Backstage developer portal on its own (backstage/Dockerfile
+# is a heavier multi-stage Node build than the rest of this repo's `make
+# up`, so these are split out rather than only reachable via the full
+# stack). http://localhost:7007 once up — see catalog-info.yaml.
+backstage-build:
+	$(COMPOSE) build backstage
+
+backstage-up:
+	$(COMPOSE) up --build -d backstage
+
 ## ── Local Go ──────────────────────────────────────────────────────────────────
 
 build:
@@ -143,9 +153,25 @@ tidy:
 lint:
 	podman run --rm -v "$(CURDIR):/app" -w /app golangci/golangci-lint:latest golangci-lint run ./...
 
-# Regenerate docs/swagger.json, docs/swagger.yaml, docs/docs.go from swaggo annotations.
+# Regenerate each API service's swagger.json/swagger.yaml/docs.go from swaggo
+# annotations, into its own docs/<service> package — one per service with a
+# real HTTP surface (ingestion-api, tickets-api), not a single shared docs/
+# (two `-g` entrypoints would otherwise both generate `package docs` into the
+# same directory and collide). Both cmd/*/main.go import the SAME
+# internal/adapter/http package, and swag's --parseDependency walks that
+# whole package's annotations regardless of which handlers a given main.go
+# actually wires into its router — without filtering, ingestion-api's spec
+# would also pick up tickets-api's order-status/checkin/ticket-holder
+# routes (and vice versa; confirmed empirically — swag's --exclude flag
+# does NOT prune routes discovered via --parseDependency in this shared-
+# package setup, even though its --help text implies it should). --tags
+# filters by the swaggo @Tags annotation instead, which IS respected —
+# each handler's @Tags value is unique per service (order_status_handler.go
+# was retagged order-status, distinct from order_handler.go's orders, so
+# the two don't collide).
 swag:
-	$(GO) sh -c "go run github.com/swaggo/swag/cmd/swag init -g cmd/ingestion-api/main.go -o docs --parseDependency"
+	$(GO) sh -c "go run github.com/swaggo/swag/cmd/swag init -g cmd/ingestion-api/main.go -o docs/ingestion-api --parseDependency --tags orders,webhooks,health"
+	$(GO) sh -c "go run github.com/swaggo/swag/cmd/swag init -g cmd/tickets-api/main.go -o docs/tickets-api --parseDependency --tags order-status,checkin,tickets,health"
 
 ## ── Dev helpers ───────────────────────────────────────────────────────────────
 
@@ -175,6 +201,12 @@ seed-webhook-confirm:
 	curl -i -X POST http://localhost:8080/api/v1/webhooks/payments/fake \
 		-H "Content-Type: application/json" \
 		-d '{"provider_ref":"$(PROVIDER_REF)","event_id":"seed-webhook-$(shell date +%s)","outcome":"CONFIRMED","event_type":"CONCERT","event_subtype":"ROCK"}'
+
+# One-shot retry pass over ticket_notifications (mirrors the
+# notification-retry-cron Kubernetes CronJob locally — see
+# docker-compose.yml's comment on why this can't just loop in the container).
+notification-retry-cron:
+	$(COMPOSE) --profile tools run --rm notification-retry-cron
 
 # Tail a single service: make service=ingestion-api tail
 tail:

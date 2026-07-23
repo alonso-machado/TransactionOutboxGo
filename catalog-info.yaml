@@ -1,0 +1,761 @@
+# Backstage Software Catalog entities for this repo — see
+# .claude/plan-phase9-backstage.md (Part B) for the design rationale.
+# One root file, not one per service directory, matching this repo's
+# existing "centralize under one root artifact" habit (docs/, helmcharts/).
+---
+apiVersion: backstage.io/v1alpha1
+kind: Group
+metadata:
+  name: platform-team
+  description: Owns the Transaction Outbox / Event Ticket System monorepo.
+spec:
+  type: team
+  children: []
+---
+apiVersion: backstage.io/v1alpha1
+kind: System
+metadata:
+  name: event-ticket-system
+  description: >-
+    Transactional-outbox-backed Event Ticket System: order intake, payment
+    confirmation, ticket fulfillment, staff check-in, and ticket-holder
+    notifications.
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+  links:
+    - url: https://github.com/alonsomachado/transaction-outbox-go
+      title: Repository
+      icon: github
+spec:
+  owner: group:default/platform-team
+
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: ingestion-api
+  description: >-
+    Accepts POST /api/v1/orders and POST /api/v1/webhooks/payments/{provider},
+    writes durably to the order_outbox / payment_event_outbox tables. Never
+    touches RabbitMQ or the events database.
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+  tags: [go, gin, http-api]
+spec:
+  type: service
+  lifecycle: production
+  owner: group:default/platform-team
+  system: event-ticket-system
+  providesApis: [ingestion-api]
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: outbox-worker
+  description: >-
+    The Transactional Outbox relay (DispatchOutbox), run twice in one
+    process — once per outbox table (order_outbox with LISTEN/NOTIFY,
+    payment_event_outbox poll-only). The only RabbitMQ publisher.
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+  tags: [go, rabbitmq, outbox-pattern]
+spec:
+  type: service
+  lifecycle: production
+  owner: group:default/platform-team
+  system: event-ticket-system
+  dependsOn: [component:default/ingestion-api]
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: order-consumer-worker
+  description: >-
+    Consumes order_outbox messages, upserts Location/Event, reserves
+    Tickets, opens a checkout with the configured PaymentGateway, persists
+    a Charge.
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+  tags: [go, rabbitmq, consumer-worker]
+spec:
+  type: service
+  lifecycle: production
+  owner: group:default/platform-team
+  system: event-ticket-system
+  dependsOn: [component:default/outbox-worker]
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: fulfillment-consumer-worker
+  description: >-
+    Consumes payment_event_outbox messages, marks Charge/Order PAID and
+    issues Tickets (QR + HMAC) on CONFIRMED, or FAILED/VOID on FAILED.
+    Sends ticket-notification emails synchronously.
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+  tags: [go, rabbitmq, consumer-worker]
+spec:
+  type: service
+  lifecycle: production
+  owner: group:default/platform-team
+  system: event-ticket-system
+  dependsOn: [component:default/outbox-worker]
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: tickets-api
+  description: >-
+    Synchronous REST service reading/writing the events database directly:
+    GET /api/v1/orders/{id}, POST /api/v1/checkin (staff-authenticated),
+    PATCH /api/v1/tickets/{id}/holder. Never touches RabbitMQ or the
+    outbox database.
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+  tags: [go, gin, http-api]
+spec:
+  type: service
+  lifecycle: production
+  owner: group:default/platform-team
+  system: event-ticket-system
+  providesApis: [tickets-api]
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: notification-retry-cron
+  description: >-
+    Kubernetes CronJob (not a -consumer-worker — never touches RabbitMQ).
+    Wakes on a schedule, retries any ticket_notifications row still missing
+    email_sent_timestamp whose backoff window has passed.
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+  tags: [go, cronjob]
+spec:
+  type: service
+  lifecycle: production
+  owner: group:default/platform-team
+  system: event-ticket-system
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: outbox-admin
+  description: >-
+    One-shot maintenance CLI for DLQ replay/drain (--outbox/--stream/
+    --event-type/--event-subtype flags). Never binds an HTTP port.
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+  tags: [go, cli]
+spec:
+  type: tool
+  lifecycle: production
+  owner: group:default/platform-team
+  system: event-ticket-system
+
+---
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: ingestion-api
+  description: Order intake + payment-gateway webhook API.
+spec:
+  type: openapi
+  lifecycle: production
+  owner: group:default/platform-team
+  system: event-ticket-system
+  # Embedded inline, not $text-referenced — Backstage's default UrlReaderService
+  # has no registered reader for the file: scheme at all (confirmed via
+  # node_modules/@backstage/backend-defaults/dist/entrypoints/urlReader), so
+  # $text against a `type: file` catalog location can never resolve, config
+  # or no config. Keep this in sync with docs/ingestion-api/swagger.json —
+  # regenerate both via `make swag`, then paste the new content here.
+  definition: |
+    {
+        "swagger": "2.0",
+        "info": {
+            "description": "Accepts ticket orders and payment-gateway webhook confirmations, durably storing\nboth in the transactional outbox for asynchronous relay to RabbitMQ.",
+            "title": "Transaction Outbox — Event Ticket System Ingestion API",
+            "contact": {},
+            "version": "1.0"
+        },
+        "basePath": "/",
+        "paths": {
+            "/api/v1/orders": {
+                "post": {
+                    "description": "Accepts a request for tickets to an Event, durably stores it in the order outbox\nfor asynchronous relay to RabbitMQ (routed by eventType/eventSubtype). Idempotent on\nthe derived idempotency key (sourceOrderId + optional Idempotency-Key header).",
+                    "consumes": [
+                        "application/json"
+                    ],
+                    "produces": [
+                        "application/json"
+                    ],
+                    "tags": [
+                        "orders"
+                    ],
+                    "summary": "Place a ticket order",
+                    "parameters": [
+                        {
+                            "type": "string",
+                            "description": "Optional client-supplied idempotency key",
+                            "name": "Idempotency-Key",
+                            "in": "header"
+                        },
+                        {
+                            "description": "Ticket order payload",
+                            "name": "order",
+                            "in": "body",
+                            "required": true,
+                            "schema": {
+                                "$ref": "#/definitions/internal_adapter_http.OrderRequestDTO"
+                            }
+                        }
+                    ],
+                    "responses": {
+                        "201": {
+                            "description": "Created",
+                            "schema": {
+                                "$ref": "#/definitions/internal_adapter_http.OrderResponseDTO"
+                            }
+                        },
+                        "400": {
+                            "description": "Bad Request",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal Server Error",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/webhooks/payments/{provider}": {
+                "post": {
+                    "description": "Verifies the gateway's signature and lands the confirmation in payment_event_outbox\nfor asynchronous relay to fulfillment-consumer-worker. Idempotent on the gateway's own event id.",
+                    "consumes": [
+                        "application/json"
+                    ],
+                    "produces": [
+                        "application/json"
+                    ],
+                    "tags": [
+                        "webhooks"
+                    ],
+                    "summary": "Receive a payment-gateway webhook",
+                    "parameters": [
+                        {
+                            "type": "string",
+                            "description": "Configured gateway provider name (e.g. stripe, fake)",
+                            "name": "provider",
+                            "in": "path",
+                            "required": true
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "OK",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Bad Request",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Not Found",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal Server Error",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/healthz": {
+                "get": {
+                    "produces": [
+                        "application/json"
+                    ],
+                    "tags": [
+                        "health"
+                    ],
+                    "summary": "Health check",
+                    "responses": {
+                        "200": {
+                            "description": "OK",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "definitions": {
+            "internal_adapter_http.CustomerDTO": {
+                "type": "object",
+                "properties": {
+                    "document": {
+                        "type": "string"
+                    },
+                    "email": {
+                        "type": "string"
+                    },
+                    "name": {
+                        "type": "string"
+                    }
+                }
+            },
+            "internal_adapter_http.OrderRequestDTO": {
+                "type": "object",
+                "properties": {
+                    "customer": {
+                        "$ref": "#/definitions/internal_adapter_http.CustomerDTO"
+                    },
+                    "eventId": {
+                        "type": "string"
+                    },
+                    "eventName": {
+                        "type": "string"
+                    },
+                    "eventSubtype": {
+                        "type": "string"
+                    },
+                    "eventType": {
+                        "type": "string"
+                    },
+                    "sourceOrderId": {
+                        "type": "string"
+                    },
+                    "tickets": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/definitions/internal_adapter_http.TicketItemDTO"
+                        }
+                    },
+                    "venue": {
+                        "$ref": "#/definitions/internal_adapter_http.VenueDTO"
+                    }
+                }
+            },
+            "internal_adapter_http.OrderResponseDTO": {
+                "type": "object",
+                "properties": {
+                    "idempotencyKey": {
+                        "type": "string"
+                    },
+                    "orderId": {
+                        "type": "string"
+                    },
+                    "status": {
+                        "description": "\"accepted\" | \"duplicate\"",
+                        "type": "string"
+                    }
+                }
+            },
+            "internal_adapter_http.TicketItemDTO": {
+                "type": "object",
+                "properties": {
+                    "currency": {
+                        "type": "string"
+                    },
+                    "id": {
+                        "type": "string"
+                    },
+                    "price": {
+                        "type": "number"
+                    },
+                    "row": {
+                        "type": "string"
+                    },
+                    "seat": {
+                        "type": "string"
+                    },
+                    "section": {
+                        "type": "string"
+                    }
+                }
+            },
+            "internal_adapter_http.VenueDTO": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string"
+                    },
+                    "id": {
+                        "type": "string"
+                    },
+                    "name": {
+                        "type": "string"
+                    }
+                }
+            }
+        }
+    }
+---
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: tickets-api
+  description: Order-status polling, staff check-in, ticket-holder update API.
+spec:
+  type: openapi
+  lifecycle: production
+  owner: group:default/platform-team
+  system: event-ticket-system
+  # Embedded inline — see the ingestion-api API entity above for why.
+  # Keep in sync with docs/tickets-api/swagger.json (`make swag`).
+  definition: |
+    {
+        "swagger": "2.0",
+        "info": {
+            "description": "Order-status lookup, staff-authenticated ticket check-in, and ticket-holder\nname correction, reading/writing the events database directly.",
+            "title": "Transaction Outbox — Event Ticket System Tickets API",
+            "contact": {},
+            "version": "1.0"
+        },
+        "basePath": "/",
+        "paths": {
+            "/api/v1/checkin": {
+                "post": {
+                    "security": [
+                        {
+                            "BearerAuth": []
+                        }
+                    ],
+                    "description": "Verifies the ticket's HMAC signature and flips it VALID -> CHECKED_IN. Requires a\nstaff Bearer token. Idempotent: checking in an already-checked-in ticket returns\nALREADY_CHECKED_IN, not an error.",
+                    "consumes": [
+                        "application/json"
+                    ],
+                    "produces": [
+                        "application/json"
+                    ],
+                    "tags": [
+                        "checkin"
+                    ],
+                    "summary": "Check in a ticket",
+                    "parameters": [
+                        {
+                            "description": "Scanned ticket QR fields",
+                            "name": "checkin",
+                            "in": "body",
+                            "required": true,
+                            "schema": {
+                                "$ref": "#/definitions/internal_adapter_http.CheckinRequestDTO"
+                            }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "OK",
+                            "schema": {
+                                "$ref": "#/definitions/internal_adapter_http.CheckinResponseDTO"
+                            }
+                        },
+                        "400": {
+                            "description": "Bad Request",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "401": {
+                            "description": "Unauthorized",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "403": {
+                            "description": "Forbidden",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Not Found",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "409": {
+                            "description": "Conflict",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/orders/{id}": {
+                "get": {
+                    "description": "Returns the order's status and checkout URL. checkoutUrl is empty until\norder-consumer-worker has opened a checkout for this order — keep polling, not an error.",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "tags": [
+                        "order-status"
+                    ],
+                    "summary": "Get order status",
+                    "parameters": [
+                        {
+                            "type": "string",
+                            "description": "Order ID",
+                            "name": "id",
+                            "in": "path",
+                            "required": true
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "OK",
+                            "schema": {
+                                "$ref": "#/definitions/internal_adapter_http.OrderStatusResponseDTO"
+                            }
+                        },
+                        "400": {
+                            "description": "Bad Request",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Not Found",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/tickets/{id}/holder": {
+                "patch": {
+                    "description": "Updates the buyer name on a VALID or CHECKED_IN ticket. Rate-limited per source IP.",
+                    "consumes": [
+                        "application/json"
+                    ],
+                    "produces": [
+                        "application/json"
+                    ],
+                    "tags": [
+                        "tickets"
+                    ],
+                    "summary": "Correct a ticket holder's name",
+                    "parameters": [
+                        {
+                            "type": "string",
+                            "description": "Ticket ID",
+                            "name": "id",
+                            "in": "path",
+                            "required": true
+                        },
+                        {
+                            "description": "New holder name",
+                            "name": "holder",
+                            "in": "body",
+                            "required": true,
+                            "schema": {
+                                "$ref": "#/definitions/internal_adapter_http.UpdateHolderRequestDTO"
+                            }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "OK",
+                            "schema": {
+                                "$ref": "#/definitions/internal_adapter_http.UpdateHolderResponseDTO"
+                            }
+                        },
+                        "400": {
+                            "description": "Bad Request",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Not Found",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "409": {
+                            "description": "Conflict",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "429": {
+                            "description": "Too Many Requests",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/healthz": {
+                "get": {
+                    "produces": [
+                        "application/json"
+                    ],
+                    "tags": [
+                        "health"
+                    ],
+                    "summary": "Health check",
+                    "responses": {
+                        "200": {
+                            "description": "OK",
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "definitions": {
+            "internal_adapter_http.CheckinRequestDTO": {
+                "type": "object",
+                "properties": {
+                    "signature": {
+                        "type": "string"
+                    },
+                    "ticketId": {
+                        "type": "string"
+                    },
+                    "validationCode": {
+                        "type": "string"
+                    }
+                }
+            },
+            "internal_adapter_http.CheckinResponseDTO": {
+                "type": "object",
+                "properties": {
+                    "outcome": {
+                        "type": "string"
+                    },
+                    "ticket": {
+                        "$ref": "#/definitions/internal_adapter_http.CheckinTicketDTO"
+                    }
+                }
+            },
+            "internal_adapter_http.CheckinTicketDTO": {
+                "type": "object",
+                "properties": {
+                    "buyerName": {
+                        "type": "string"
+                    },
+                    "row": {
+                        "type": "string"
+                    },
+                    "seat": {
+                        "type": "string"
+                    },
+                    "section": {
+                        "type": "string"
+                    }
+                }
+            },
+            "internal_adapter_http.OrderStatusResponseDTO": {
+                "type": "object",
+                "properties": {
+                    "checkoutUrl": {
+                        "type": "string"
+                    },
+                    "orderId": {
+                        "type": "string"
+                    },
+                    "status": {
+                        "type": "string"
+                    }
+                }
+            },
+            "internal_adapter_http.UpdateHolderRequestDTO": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string"
+                    }
+                }
+            },
+            "internal_adapter_http.UpdateHolderResponseDTO": {
+                "type": "object",
+                "properties": {
+                    "buyerName": {
+                        "type": "string"
+                    },
+                    "ticketId": {
+                        "type": "string"
+                    }
+                }
+            }
+        }
+    }

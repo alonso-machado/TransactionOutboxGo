@@ -1,0 +1,11 @@
+# Applies to every image built from this repo's root as build context —
+# the root Dockerfile (ARG SERVICE, Go services) and backstage/Dockerfile
+# (build context is the repo root so it can reach the sibling
+# catalog-info.yaml/mkdocs.yml/docs/ — see backstage/Dockerfile).
+.git
+backstage/node_modules
+backstage/packages/*/node_modules
+backstage/packages/*/dist
+backstage/.yarn/cache
+backstage/.yarn/install-state.gz
+backstage/*.local.yaml

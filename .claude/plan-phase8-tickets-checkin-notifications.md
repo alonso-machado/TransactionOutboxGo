@@ -1,5 +1,15 @@
 # Plan — Phase 8: order-status polling, tickets-api, staff-authenticated check-in, ticket-holder update, email delivery, govulncheck
 
+> **Notification-delivery design superseded (2026-07-09).** Parts D/E/F
+> below (RabbitMQ `NotificationStream`, `ticket_notification_outbox`,
+> `notification-consumer-worker`) were replaced by a simpler design: ticket
+> email now sends synchronously from `fulfillment-consumer-worker`, tracked
+> in the `events`-DB `ticket_notifications` table (inserted atomically with
+> `MarkIssued`), retried by the `notification-retry-cron` Kubernetes CronJob
+> — no RabbitMQ involved. See `CLAUDE.md` and `README.md` for the current
+> design; this section is kept only as the historical record of the
+> original decision.
+
 > **Phase 8 — fully implemented (as of 2026-07-08).** This is the plan that
 > was executed; kept as the historical record of the decisions made and the
 > order they shipped in, not a forward-looking TODO list anymore. Two real

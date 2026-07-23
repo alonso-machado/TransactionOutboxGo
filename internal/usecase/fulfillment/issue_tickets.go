@@ -2,8 +2,8 @@
 // consumer-side handling of a payment_event_outbox message. It resolves the
 // Charge the gateway confirmation belongs to (via ProviderRef), and on
 // CONFIRMED issues every RESERVED ticket for the order (QR PNG + HMAC
-// signature via domain.TicketQR); on FAILED it voids the reservation. It
-// implements messaging.MessageProcessor.
+// signature via domain.TicketQR) and emails it; on FAILED it voids the
+// reservation. It implements messaging.MessageProcessor.
 package fulfillment
 
 import (
@@ -16,7 +16,6 @@ import (
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain"
 	"github.com/alonsomachado/transaction-outbox-go/internal/domain/pii"
 	"github.com/alonsomachado/transaction-outbox-go/internal/observability"
-	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -27,24 +26,15 @@ import (
 var tracer = otel.Tracer("usecase/fulfillment")
 
 type IssueTickets struct {
-	chargeRepo             domain.ChargeRepository
-	ticketRepo             domain.TicketRepository
-	orderRepo              domain.OrderRepository
-	qr                     domain.TicketQR
-	notificationOutboxRepo domain.OutboxRepository
-	uow                    domain.UnitOfWork
-	// eventType/eventSubtype are this process's own shard (parsed once at
-	// startup from CONSUMER_QUEUE, see cmd/fulfillment-consumer-worker) —
-	// constant for the whole process's lifetime, unlike checkout.ProcessOrder
-	// which reads them per-message from the order payload itself.
-	// payment_event_outbox's payload carries no event_type/event_subtype
-	// (only OutboxMessage's own columns do), so this is the only place
-	// IssueTickets can get them from to stamp onto a new notification outbox
-	// row.
-	eventType      string
-	eventSubtype   string
-	eventsTotal    metric.Int64Counter
-	duplicateTotal metric.Int64Counter
+	chargeRepo       domain.ChargeRepository
+	ticketRepo       domain.TicketRepository
+	orderRepo        domain.OrderRepository
+	qr               domain.TicketQR
+	notificationRepo domain.TicketNotificationRepository
+	sender           domain.EmailSender
+	uow              domain.UnitOfWork
+	eventsTotal      metric.Int64Counter
+	duplicateTotal   metric.Int64Counter
 }
 
 func New(
@@ -52,22 +42,21 @@ func New(
 	ticketRepo domain.TicketRepository,
 	orderRepo domain.OrderRepository,
 	qr domain.TicketQR,
-	notificationOutboxRepo domain.OutboxRepository,
+	notificationRepo domain.TicketNotificationRepository,
+	sender domain.EmailSender,
 	uow domain.UnitOfWork,
-	eventType, eventSubtype string,
 ) *IssueTickets {
 	meter := otel.GetMeterProvider().Meter("usecase/fulfillment")
 	return &IssueTickets{
-		chargeRepo:             chargeRepo,
-		ticketRepo:             ticketRepo,
-		orderRepo:              orderRepo,
-		qr:                     qr,
-		notificationOutboxRepo: notificationOutboxRepo,
-		uow:                    uow,
-		eventType:              eventType,
-		eventSubtype:           eventSubtype,
-		eventsTotal:            observability.Int64Counter(meter, "fulfillment.events_processed_total"),
-		duplicateTotal:         observability.Int64Counter(meter, "fulfillment.duplicate_total"),
+		chargeRepo:       chargeRepo,
+		ticketRepo:       ticketRepo,
+		orderRepo:        orderRepo,
+		qr:               qr,
+		notificationRepo: notificationRepo,
+		sender:           sender,
+		uow:              uow,
+		eventsTotal:      observability.Int64Counter(meter, "fulfillment.events_processed_total"),
+		duplicateTotal:   observability.Int64Counter(meter, "fulfillment.duplicate_total"),
 	}
 }
 
@@ -133,22 +122,18 @@ func (uc *IssueTickets) Execute(ctx context.Context, _ string, body []byte) (boo
 		return false, recordRedactedError(span, "error", txErr)
 	}
 
-	// Notification enqueue happens AFTER the events-DB transaction above has
-	// committed, as its own separate write against the outbox database —
-	// order_outbox/payment_event_outbox/ticket_notification_outbox all live
-	// in a different logical database than charges/orders/tickets, and
-	// Postgres has no cross-database transactions, so this write can never
-	// be made atomic with MarkIssued the way a same-database outbox write
-	// normally would be (see CLAUDE.md's "no transaction spans the two
-	// [outbox and events] databases" invariant). Best-effort: log and move
-	// on rather than fail the whole message, since the payment confirmation
-	// itself already succeeded and must not be undone or redelivered just
-	// because the notification enqueue failed — a real, documented gap (a
-	// ticket can end up issued with no notification enqueued if this write
-	// fails), not silently papered over.
+	// The email is sent AFTER the transaction above has committed — a send
+	// failure must never undo the payment confirmation that already
+	// succeeded, so this stays best-effort/log-only. Unlike the old
+	// cross-database ticket_notification_outbox enqueue, the
+	// ticket_notifications ROW itself was already created atomically with
+	// MarkIssued inside confirmAndIssue (same events-DB transaction) — only
+	// the act of sending happens outside it, since an SMTP call can't be
+	// part of a DB transaction anyway. A send failure here just leaves the
+	// row's email_sent_timestamp NULL for notification-retry-cron to retry.
 	for _, t := range issuedTickets {
-		if err := uc.enqueueNotification(ctx, t); err != nil {
-			slog.ErrorContext(ctx, "enqueue ticket notification failed", "ticket_id", t.ID.String(), "err", err.Error())
+		if err := uc.sendNotification(ctx, t); err != nil {
+			slog.ErrorContext(ctx, "send ticket notification failed", "ticket_id", t.ID.String(), "err", pii.Redact(err.Error()))
 		}
 	}
 
@@ -162,9 +147,10 @@ func (uc *IssueTickets) Execute(ctx context.Context, _ string, body []byte) (boo
 
 // confirmAndIssue marks charge/order PAID and every RESERVED ticket for the
 // order VALID (QR PNG + HMAC signature), all inside the caller's events-DB
-// transaction. Returns the tickets it just issued so the caller can enqueue
-// their notifications after this transaction commits (see Execute) — that
-// enqueue can't happen in here, since it targets a different database.
+// transaction — including the ticket_notifications row created right after
+// MarkIssued, so a ticket can never end up issued without one (or vice
+// versa). Returns the tickets it just issued so the caller can email them
+// once this transaction has committed (see Execute).
 func (uc *IssueTickets) confirmAndIssue(ctx context.Context, charge *domain.Charge) ([]*domain.Ticket, error) {
 	if err := uc.chargeRepo.UpdateStatus(ctx, uc.uow, charge.ID, domain.ChargeStatusPaid); err != nil {
 		return nil, fmt.Errorf("mark charge paid: %w", err)
@@ -192,82 +178,42 @@ func (uc *IssueTickets) confirmAndIssue(ctx context.Context, charge *domain.Char
 		if err := uc.ticketRepo.MarkIssued(ctx, uc.uow, t); err != nil {
 			return nil, fmt.Errorf("mark ticket issued %s: %w", t.ID, err)
 		}
+		if err := uc.notificationRepo.Create(ctx, uc.uow, t.ID); err != nil {
+			return nil, fmt.Errorf("create ticket notification %s: %w", t.ID, err)
+		}
 		issued = append(issued, t)
 	}
 	return issued, nil
 }
 
-// notificationOutboxEventType/Subtype are the fixed sentinel pair
-// notification-consumer-worker's single unsharded queue is bound to (see
-// rmq.NotificationSentinelType/NotificationSentinelSubtype's doc comment in
-// internal/infrastructure/rabbitmq/rabbitmq.go — duplicated here as a bare
-// literal, not an import, since usecase must never import infrastructure,
-// same convention OutboxMessage.AggregateType's string values already
-// follow). AMQPPublisher.fire computes the routing key from
-// OutboxMessage.EventType/EventSubtype directly — stamping the ticket's
-// REAL event type/subtype here instead would route the message to
-// "notification.<real-type>.<real-subtype>", which nothing is bound to (a
-// topic-exchange black hole), since only "notification._all._all" has a
-// queue. The real event type/subtype are still carried in
-// notificationPayload below, for reporting.
-const (
-	notificationOutboxEventType    = "_ALL"
-	notificationOutboxEventSubtype = "_ALL"
-)
-
-// notificationPayload is the JSON body landed on ticket_notification_outbox.
-type notificationPayload struct {
-	SchemaVersion string `json:"schemaVersion"`
-	TicketID      string `json:"ticketId"`
-	BuyerName     string `json:"buyerName"`
-	BuyerEmail    string `json:"buyerEmail"`
-	EventType     string `json:"eventType"`
-	EventSubtype  string `json:"eventSubtype"`
-	Section       string `json:"section"`
-	Row           string `json:"row"`
-	Seat          string `json:"seat"`
-	QRPNG         []byte `json:"qrPng"`
-	QRContent     string `json:"qrContent"`
-}
-
-func (uc *IssueTickets) enqueueNotification(ctx context.Context, t *domain.Ticket) error {
-	id, err := uuid.NewV7()
-	if err != nil {
-		return fmt.Errorf("generate notification id: %w", err)
-	}
-	payload, err := json.Marshal(notificationPayload{
-		SchemaVersion: domain.SchemaVersion,
-		TicketID:      t.ID.String(),
-		BuyerName:     t.BuyerName,
-		BuyerEmail:    t.BuyerEmail,
-		EventType:     uc.eventType,
-		EventSubtype:  uc.eventSubtype,
-		Section:       t.Section,
-		Row:           t.Row,
-		Seat:          t.Seat,
-		QRPNG:         t.QRPNG,
-		QRContent:     t.QRContent,
+// sendNotification emails ticket t's QR code and records the outcome on its
+// ticket_notifications row (MarkSent/MarkFailed). Deliberately
+// self-contained rather than calling into usecase/notification directly —
+// use-cases must not depend on one another (see payloadDTO's doc comment
+// above); usecase/notification.SendTicketNotification.Send duplicates this
+// same logic for notification-retry-cron's retry path.
+func (uc *IssueTickets) sendNotification(ctx context.Context, t *domain.Ticket) error {
+	bodyText := fmt.Sprintf("Hi %s,\n\nYour ticket (Section %s, Row %s, Seat %s) is attached as a QR code.\n",
+		t.BuyerName, t.Section, t.Row, t.Seat)
+	_, sendErr := uc.sender.Send(domain.EmailRequest{
+		ToEmail:               t.BuyerEmail,
+		ToName:                t.BuyerName,
+		Subject:               "Your ticket is ready",
+		BodyText:              bodyText,
+		AttachmentName:        "ticket.png",
+		AttachmentContentType: "image/png",
+		Attachment:            t.QRPNG,
 	})
-	if err != nil {
-		return fmt.Errorf("marshal notification payload: %w", err)
+	if sendErr != nil {
+		if markErr := uc.notificationRepo.MarkFailed(ctx, t.ID, sendErr.Error()); markErr != nil {
+			slog.ErrorContext(ctx, "mark notification failed error", "ticket_id", t.ID.String(), "err", markErr.Error())
+		}
+		return fmt.Errorf("send email: %w", sendErr)
 	}
-	// nil, not uc.uow: this Enqueue targets the outbox database, a
-	// different one than uc.uow's events-DB transaction — see the doc
-	// comment on the enqueueNotification call site in Execute.
-	_, err = uc.notificationOutboxRepo.Enqueue(ctx, nil, &domain.OutboxMessage{
-		ID:             id,
-		IdempotencyKey: t.ID.String(), // one notification per issued ticket
-		AggregateType:  "ticket_notification",
-		HTTPMethod:     "",
-		Route:          "",
-		Payload:        payload,
-		Headers:        map[string]string{"schemaVersion": domain.SchemaVersion},
-		Status:         domain.OutboxStatusNew,
-		CreatedAt:      time.Now().UTC(),
-		EventType:      notificationOutboxEventType,
-		EventSubtype:   notificationOutboxEventSubtype,
-	})
-	return err
+	if markErr := uc.notificationRepo.MarkSent(ctx, t.ID, time.Now().UTC()); markErr != nil {
+		slog.ErrorContext(ctx, "mark notification sent error", "ticket_id", t.ID.String(), "err", markErr.Error())
+	}
+	return nil
 }
 
 func (uc *IssueTickets) failAndVoid(ctx context.Context, charge *domain.Charge) error {
